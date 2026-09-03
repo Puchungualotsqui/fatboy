@@ -7,31 +7,40 @@ import "core:mem"
 import "core:thread"
 import "core:os"
 import "base:runtime"
+
 import curl "vendor:curl"
+import jpegpng "jpegpng"
 import orui "orui"
 import rl "vendor:raylib"
 
-WINDOW_WIDTH :: 1280
+
+WINDOW_WIDTH  :: 1280
 WINDOW_HEIGHT :: 800
-WINDOW_TITLE :: "FitDeck"
+WINDOW_TITLE  :: "FitDeck"
+
 FITGIRL_API_URL :: "https://fitgirl-repacks.site/wp-json/wp/v2/posts?per_page=30"
 
 RELEASE_ROW_HEIGHT :: 96
 RELEASE_ROW_EXTENT :: 106
 
-// --- Sober / Professional Monochrome Palette ---
-APP_BACKGROUND       :: rl.Color{24, 24, 24, 255}
-HEADER_BACKGROUND    :: rl.Color{32, 32, 32, 255}
-LIST_BACKGROUND      :: rl.Color{24, 24, 24, 255}
-ROW_BACKGROUND       :: rl.Color{38, 38, 38, 255}
-ROW_HOVER_BACKGROUND :: rl.Color{48, 48, 48, 255}
-ROW_FOCUS_BACKGROUND :: rl.Color{75, 75, 75, 255}
-ACCENT_COLOR         :: rl.Color{180, 180, 180, 255}
-TEXT_PRIMARY         :: rl.Color{225, 225, 225, 255}
-TEXT_MUTED           :: rl.Color{140, 140, 140, 255}
-BORDER_COLOR         :: rl.Color{55, 55, 55, 255}
-STATUS_OK            :: rl.Color{120, 175, 135, 255}
-STATUS_ERR           :: rl.Color{175, 120, 120, 255}
+
+// ---------------------------------------------------------
+// Palette
+// ---------------------------------------------------------
+
+APP_BACKGROUND        :: rl.Color{24, 24, 24, 255}
+HEADER_BACKGROUND     :: rl.Color{32, 32, 32, 255}
+LIST_BACKGROUND       :: rl.Color{24, 24, 24, 255}
+ROW_BACKGROUND        :: rl.Color{38, 38, 38, 255}
+ROW_HOVER_BACKGROUND  :: rl.Color{48, 48, 48, 255}
+ROW_FOCUS_BACKGROUND  :: rl.Color{75, 75, 75, 255}
+ACCENT_COLOR          :: rl.Color{180, 180, 180, 255}
+TEXT_PRIMARY          :: rl.Color{225, 225, 225, 255}
+TEXT_MUTED            :: rl.Color{140, 140, 140, 255}
+BORDER_COLOR          :: rl.Color{55, 55, 55, 255}
+STATUS_OK             :: rl.Color{120, 175, 135, 255}
+STATUS_ERR            :: rl.Color{175, 120, 120, 255}
+
 
 // ---------------------------------------------------------
 // 1. App State & Data Structures
@@ -43,6 +52,7 @@ AppScreen :: enum {
     Library,
 }
 
+
 GameRelease :: struct {
     title:      string,
     magnetLink: string,
@@ -51,515 +61,2624 @@ GameRelease :: struct {
     coverTex:   rl.Texture2D,
 }
 
-App :: struct {
-    screen:         AppScreen,
-    rd_key:         string,
-    rd_key_input:   strings.Builder,
-
-    // Background Loading State
-    load_status:    string,
-    load_done:      bool,
-    games:          [dynamic]GameRelease,
-
-    // Library State
-    selected_game:  int,
-    status_message: string,
-}
 
 DownloadTask :: struct {
     game_ptr: ^GameRelease,
 }
 
+
+// IMPORTANT:
+// LoaderData is exclusively owned by the loader thread until the
+// loader thread finishes. The main thread only reads it after
+// thread.is_done() + thread.destroy(), avoiding App data races.
 LoaderData :: struct {
-    app: ^App,
+    games:         [dynamic]GameRelease,
+    success:       bool,
+    error_message: string,
 }
 
-sanitize_filename :: proc(name: string, alloc := context.allocator) -> string {
+
+App :: struct {
+    screen:       AppScreen,
+    rd_key:       string,
+    rd_key_input: strings.Builder,
+
+    load_status: string,
+    games:       [dynamic]GameRelease,
+
+    loader_thread: ^thread.Thread,
+    loader_data:   ^LoaderData,
+
+    selected_game:  int,
+    status_message: string,
+}
+
+
+// ---------------------------------------------------------
+// 2. Utility / Lifetime Functions
+// ---------------------------------------------------------
+
+sanitize_filename :: proc(
+    name: string,
+    alloc := context.allocator,
+) -> string {
     b: strings.Builder
     strings.builder_init(&b, alloc)
+
     for r in name {
-        if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+        if (r >= 'A' && r <= 'Z') ||
+           (r >= 'a' && r <= 'z') ||
+           (r >= '0' && r <= '9') {
             strings.write_rune(&b, r)
         } else if r == ' ' || r == '-' {
             strings.write_rune(&b, '_')
         }
     }
+
+    // Ownership of the builder's backing buffer is intentionally
+    // transferred to the returned string.
     return strings.to_string(b)
 }
 
-// ---------------------------------------------------------
-// 2. Thread Workers (No Temp Allocators to prevent leaks)
-// ---------------------------------------------------------
 
-download_worker :: proc(task: thread.Task) {
-    t_data := cast(^DownloadTask)task.data
-    game := t_data.game_ptr
-
-    if os.exists(game.coverPath) do return
-
-    url_lower := strings.to_lower(game.coverUrl, context.allocator)
-    defer delete(url_lower)
-
-    if !strings.contains(url_lower, ".webp") && !strings.contains(url_lower, ".avif") {
-        builder: strings.Builder
-        strings.builder_init(&builder, context.allocator)
-        defer strings.builder_destroy(&builder)
-
-        handle := curl.easy_init()
-        if handle != nil {
-            cstrUrl := strings.clone_to_cstring(game.coverUrl, context.allocator)
-            defer delete(cstrUrl)
-
-            curl.easy_setopt(handle, .URL, cstrUrl)
-            curl.easy_setopt(handle, .FOLLOWLOCATION, 1)
-            curl.easy_setopt(handle, .REFERER, "https://fitgirl-repacks.site/")
-            curl.easy_setopt(handle, .USERAGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-            curl.easy_setopt(handle, .TIMEOUT, 10)
-            curl.easy_setopt(handle, .WRITEFUNCTION, CurlWriteCallback)
-            curl.easy_setopt(handle, .WRITEDATA, &builder)
-
-            if curl.easy_perform(handle) == .E_OK {
-                if len(builder.buf) > 10 {
-                    header := string(builder.buf[:10])
-                    if !strings.contains(header, "<!DOCTYPE") && !strings.contains(header, "<html") {
-                        _ = os.write_entire_file(game.coverPath, builder.buf[:])
-                    }
-                }
-            }
-            curl.easy_cleanup(handle)
-        }
-    }
-}
-
-loader_proc :: proc(t: ^thread.Thread) {
-    data := cast(^LoaderData)t.data
-    app := data.app
-
-    app.load_status = "Syncing with FitGirl API..."
-
-    json_data := FetchLiveCatalog()
-    if len(json_data) == 0 {
-        app.load_status = "Error: Could not reach catalog."
+DestroyGame :: proc(game: ^GameRelease) {
+    if game == nil {
         return
     }
 
-    games := ParseGames(transmute([]byte)json_data)
-    delete(json_data)
-
-    app.load_status = "Caching Library Assets..."
-
-    if !os.exists("covers") {
-        os.make_directory("covers")
+    if game.coverTex.id != 0 {
+        rl.UnloadTexture(game.coverTex)
+        game.coverTex = {}
     }
 
-    pool: thread.Pool
-    thread.pool_init(&pool, context.allocator, 8)
-    thread.pool_start(&pool)
-
-    tasks := make([]DownloadTask, len(games))
-    for i in 0..<len(games) {
-        if len(games[i].coverUrl) > 0 {
-            tasks[i].game_ptr = &games[i]
-            thread.pool_add_task(&pool, context.allocator, download_worker, &tasks[i], i)
-        }
+    if len(game.title) > 0 {
+        delete(game.title)
+        game.title = ""
     }
 
-    thread.pool_finish(&pool)
-    thread.pool_destroy(&pool)
-    delete(tasks)
+    if len(game.magnetLink) > 0 {
+        delete(game.magnetLink)
+        game.magnetLink = ""
+    }
 
-    app.games = games
-    app.load_status = "Finalizing..."
-    app.load_done = true
+    if len(game.coverUrl) > 0 {
+        delete(game.coverUrl)
+        game.coverUrl = ""
+    }
+
+    if len(game.coverPath) > 0 {
+        delete(game.coverPath)
+        game.coverPath = ""
+    }
 }
 
+
+DestroyGames :: proc(games: [dynamic]GameRelease) {
+    for &game in games {
+        DestroyGame(&game)
+    }
+
+    delete(games)
+}
+
+
 // ---------------------------------------------------------
-// 3. Base API Functions
+// 3. CURL Callback
 // ---------------------------------------------------------
 
-CurlWriteCallback :: proc "c" (ptr: rawptr, elementSize, elementCount: uint, userData: rawptr) -> uint {
+CurlWriteCallback :: proc "c" (
+    ptr: rawptr,
+    elementSize, elementCount: uint,
+    userData: rawptr,
+) -> uint {
+    // curl invokes this callback from whichever thread owns the
+    // easy handle, so establish a valid Odin context here.
     context = runtime.default_context()
+
     actualSize := elementSize * elementCount
+
+    if ptr == nil || userData == nil || actualSize == 0 {
+        return 0
+    }
+
     builder := cast(^strings.Builder)userData
-    data := mem.slice_ptr(cast(^byte)ptr, int(actualSize))
+
+    data := mem.slice_ptr(
+        cast(^byte)ptr,
+        int(actualSize),
+    )
+
     strings.write_bytes(builder, data)
+
     return actualSize
 }
+
+
+// ---------------------------------------------------------
+// 4. HTTP Catalog
+// ---------------------------------------------------------
 
 FetchLiveCatalog :: proc() -> string {
     builder: strings.Builder
     strings.builder_init(&builder, context.allocator)
     defer strings.builder_destroy(&builder)
 
-    curl.global_init(curl.GLOBAL_DEFAULT)
-    defer curl.global_cleanup()
+    fmt.printf(
+        "[HTTP] Catalog URL: %s\n",
+        FITGIRL_API_URL,
+    )
+
+    fmt.println("[HTTP] curl.easy_init()...")
 
     handle := curl.easy_init()
-    if handle == nil do return ""
+
+    if handle == nil {
+        fmt.println("[HTTP] ERROR: curl.easy_init returned nil")
+        return ""
+    }
+
     defer curl.easy_cleanup(handle)
 
-    cstrUrl := strings.clone_to_cstring(FITGIRL_API_URL, context.allocator)
+    cstrUrl := strings.clone_to_cstring(
+        FITGIRL_API_URL,
+        context.allocator,
+    )
     defer delete(cstrUrl)
 
     curl.easy_setopt(handle, .URL, cstrUrl)
     curl.easy_setopt(handle, .FOLLOWLOCATION, 1)
-    curl.easy_setopt(handle, .USERAGENT, "Mozilla/5.0 (X11; Linux x86_64)")
+    curl.easy_setopt(
+        handle,
+        .USERAGENT,
+        "Mozilla/5.0 (X11; Linux x86_64) FitDeck/1.0",
+    )
+    curl.easy_setopt(handle, .TIMEOUT, 20)
+    curl.easy_setopt(handle, .ACCEPT_ENCODING, "")
     curl.easy_setopt(handle, .WRITEFUNCTION, CurlWriteCallback)
     curl.easy_setopt(handle, .WRITEDATA, &builder)
 
-    _ = curl.easy_perform(handle)
-    return strings.clone(strings.to_string(builder), context.allocator)
+    fmt.println("[HTTP] Performing catalog request...")
+
+    result := curl.easy_perform(handle)
+
+    fmt.printf(
+        "[HTTP] Catalog result=%v bytes=%d\n",
+        result,
+        len(builder.buf),
+    )
+
+    if result != .E_OK {
+        fmt.printf(
+            "[HTTP] ERROR: Catalog request failed: %v\n",
+            result,
+        )
+        return ""
+    }
+
+    if len(builder.buf) == 0 {
+        fmt.println("[HTTP] ERROR: Catalog response was empty")
+        return ""
+    }
+
+    // Detect obvious HTML error/challenge pages before giving the
+    // response to the JSON parser.
+    check_len := min(len(builder.buf), 256)
+    response_head := string(builder.buf[:check_len])
+
+    if strings.contains(response_head, "<!DOCTYPE") ||
+       strings.contains(response_head, "<html") ||
+       strings.contains(response_head, "<HTML") {
+        fmt.println(
+            "[HTTP] ERROR: Catalog endpoint returned HTML instead of JSON",
+        )
+        return ""
+    }
+
+    fmt.println("[HTTP] Catalog download completed successfully")
+
+    return strings.clone(
+        strings.to_string(builder),
+        context.allocator,
+    )
 }
+
+
+// ---------------------------------------------------------
+// 5. HTML Extraction
+// ---------------------------------------------------------
 
 ExtractMagnet :: proc(html: string) -> string {
     prefix := "magnet:?xt=urn:btih:"
+
     index := strings.index(html, prefix)
-    if index == -1 do return ""
+
+    if index == -1 {
+        return ""
+    }
 
     rest := html[index:]
-    endIndex := strings.index_any(rest, "\"'> \t")
-    if endIndex == -1 do return rest
+
+    endIndex := strings.index_any(
+        rest,
+        "\"'> \t\r\n",
+    )
+
+    if endIndex == -1 {
+        return rest
+    }
 
     return rest[:endIndex]
 }
 
+
 ExtractImageURL :: proc(html: string) -> string {
     img_idx := strings.index(html, "<img")
-    if img_idx == -1 do return ""
+
+    if img_idx == -1 {
+        return ""
+    }
+
     rest := html[img_idx:]
 
     src_prefix := "src=\""
-    src_idx := strings.index(rest, src_prefix)
-    if src_idx == -1 do return ""
+
+    src_idx := strings.index(
+        rest,
+        src_prefix,
+    )
+
+    if src_idx == -1 {
+        return ""
+    }
 
     start_idx := src_idx + len(src_prefix)
-    end_idx := strings.index(rest[start_idx:], "\"")
-    if end_idx == -1 do return ""
 
-    return rest[start_idx : start_idx+end_idx]
+    end_idx := strings.index(
+        rest[start_idx:],
+        "\"",
+    )
+
+    if end_idx == -1 {
+        return ""
+    }
+
+    return rest[start_idx:start_idx + end_idx]
 }
+
+
+// ---------------------------------------------------------
+// 6. JSON Parser
+// ---------------------------------------------------------
 
 ParseGames :: proc(data: []byte) -> [dynamic]GameRelease {
     games := make([dynamic]GameRelease)
+
+    fmt.printf(
+        "[PARSE] Enter ParseGames, bytes=%d\n",
+        len(data),
+    )
+
+    if len(data) == 0 {
+        fmt.println("[PARSE] ERROR: Empty JSON buffer")
+        return games
+    }
+
+    fmt.println("[PARSE] Validating JSON...")
+
+    valid := json.is_valid(data)
+
+    fmt.printf(
+        "[PARSE] json.is_valid=%v\n",
+        valid,
+    )
+
+    if !valid {
+        fmt.println(
+            "[PARSE] ERROR: Server response is not valid JSON",
+        )
+        return games
+    }
+
+    fmt.println("[PARSE] Calling json.parse...")
+
     value, err := json.parse(data)
-    if err != .None do return games
+
+    if err != .None {
+        fmt.printf(
+            "[PARSE] ERROR: json.parse failed: %v\n",
+            err,
+        )
+        return games
+    }
+
+    fmt.println("[PARSE] json.parse succeeded")
+
     defer json.destroy_value(value)
 
     rootArray, ok := value.(json.Array)
-    if !ok do return games
 
-    for item in rootArray {
-        post, _ := item.(json.Object)
-        titleObject, _ := post["title"].(json.Object)
-        titleString, _ := titleObject["rendered"].(json.String)
-        contentObject, _ := post["content"].(json.Object)
-        contentString, _ := contentObject["rendered"].(json.String)
+    if !ok {
+        fmt.println(
+            "[PARSE] ERROR: Root JSON value is not an array",
+        )
+        return games
+    }
 
-        clean1, _ := strings.replace_all(string(titleString), "&#8211;", "-", context.allocator)
-        cleanTitle, _ := strings.replace_all(clean1, "&#8217;", "'", context.allocator)
-        delete(clean1)
+    fmt.printf(
+        "[PARSE] Root contains %d posts\n",
+        len(rootArray),
+    )
+
+    for item, index in rootArray {
+        fmt.printf(
+            "[PARSE] ---- post %d/%d ----\n",
+            index + 1,
+            len(rootArray),
+        )
+
+        post, is_obj := item.(json.Object)
+
+        if !is_obj {
+            fmt.printf(
+                "[PARSE] post %d: not an object, skipping\n",
+                index,
+            )
+            continue
+        }
+
+
+        // -------------------------------------------------
+        // Title
+        // -------------------------------------------------
+
+        titleVal, has_title := post["title"]
+
+        if !has_title {
+            fmt.printf(
+                "[PARSE] post %d: missing title\n",
+                index,
+            )
+            continue
+        }
+
+        titleObj, is_title_obj := titleVal.(json.Object)
+
+        if !is_title_obj {
+            fmt.printf(
+                "[PARSE] post %d: title isn't an object\n",
+                index,
+            )
+            continue
+        }
+
+        renderedTitleVal, has_rt := titleObj["rendered"]
+
+        if !has_rt {
+            fmt.printf(
+                "[PARSE] post %d: title.rendered missing\n",
+                index,
+            )
+            continue
+        }
+
+        titleString, is_title_str := renderedTitleVal.(json.String)
+
+        if !is_title_str {
+            fmt.printf(
+                "[PARSE] post %d: title.rendered isn't a string\n",
+                index,
+            )
+            continue
+        }
+
+        raw_title := string(titleString)
+
+        fmt.printf(
+            "[PARSE] post %d: title bytes=%d\n",
+            index,
+            len(raw_title),
+        )
+
+
+        // -------------------------------------------------
+        // Content
+        // -------------------------------------------------
+
+        contentVal, has_content := post["content"]
+
+        if !has_content {
+            fmt.printf(
+                "[PARSE] post %d: missing content\n",
+                index,
+            )
+            continue
+        }
+
+        contentObj, is_content_obj := contentVal.(json.Object)
+
+        if !is_content_obj {
+            fmt.printf(
+                "[PARSE] post %d: content isn't an object\n",
+                index,
+            )
+            continue
+        }
+
+        renderedContentVal, has_rc := contentObj["rendered"]
+
+        if !has_rc {
+            fmt.printf(
+                "[PARSE] post %d: content.rendered missing\n",
+                index,
+            )
+            continue
+        }
+
+        contentString, is_content_str :=
+            renderedContentVal.(json.String)
+
+        if !is_content_str {
+            fmt.printf(
+                "[PARSE] post %d: content.rendered isn't a string\n",
+                index,
+            )
+            continue
+        }
+
+
+        // -------------------------------------------------
+        // TITLE OWNERSHIP FIX
+        //
+        // strings.replace_all may return the original string
+        // when no allocation was necessary.
+        //
+        // Start with our own clone and only free the previous
+        // string when replace_all explicitly allocated a new one.
+        // -------------------------------------------------
+
+        cleanTitle := strings.clone(
+            raw_title,
+            context.allocator,
+        )
+
+        tmp1, allocated1 := strings.replace_all(
+            cleanTitle,
+            "&#8211;",
+            "-",
+            context.allocator,
+        )
+
+        if allocated1 {
+            delete(cleanTitle)
+            cleanTitle = tmp1
+        }
+
+        tmp2, allocated2 := strings.replace_all(
+            cleanTitle,
+            "&#8217;",
+            "'",
+            context.allocator,
+        )
+
+        if allocated2 {
+            delete(cleanTitle)
+            cleanTitle = tmp2
+        }
+
+        tmp3, allocated3 := strings.replace_all(
+            cleanTitle,
+            "&#038;",
+            "&",
+            context.allocator,
+        )
+
+        if allocated3 {
+            delete(cleanTitle)
+            cleanTitle = tmp3
+        }
+
+        tmp4, allocated4 := strings.replace_all(
+            cleanTitle,
+            "&amp;",
+            "&",
+            context.allocator,
+        )
+
+        if allocated4 {
+            delete(cleanTitle)
+            cleanTitle = tmp4
+        }
+
+        fmt.printf(
+            "[PARSE] post %d: normalized title OK\n",
+            index,
+        )
+
+
+        // -------------------------------------------------
+        // Extract links
+        // -------------------------------------------------
 
         htmlContent := string(contentString)
+
         magnetLink := ExtractMagnet(htmlContent)
         coverUrl := ExtractImageURL(htmlContent)
 
+        fmt.printf(
+            "[PARSE] post %d: magnet=%v cover=%v content_bytes=%d\n",
+            index,
+            len(magnetLink) > 0,
+            len(coverUrl) > 0,
+            len(htmlContent),
+        )
+
         if len(magnetLink) == 0 {
+            fmt.printf(
+                "[PARSE] post %d: no magnet, skipping\n",
+                index,
+            )
+
             delete(cleanTitle)
             continue
         }
 
-        lowerTitle := strings.to_lower(cleanTitle, context.allocator)
-        if strings.contains(lowerTitle, "upcoming repacks") || strings.contains(lowerTitle, "updates digest") {
-            delete(cleanTitle)
-            delete(lowerTitle)
-            continue
-        }
+
+        // -------------------------------------------------
+        // Filter non-game catalog posts
+        // -------------------------------------------------
+
+        lowerTitle := strings.to_lower(
+            cleanTitle,
+            context.allocator,
+        )
+
+        excluded :=
+            strings.contains(
+                lowerTitle,
+                "upcoming repacks",
+            ) ||
+            strings.contains(
+                lowerTitle,
+                "updates digest",
+            )
+
         delete(lowerTitle)
 
-        safeName := sanitize_filename(cleanTitle, context.allocator)
-        ext := ".jpg"
+        if excluded {
+            fmt.printf(
+                "[PARSE] post %d: excluded catalog post\n",
+                index,
+            )
 
-        urlLower := strings.to_lower(coverUrl, context.allocator)
-        if strings.contains(urlLower, ".png") do ext = ".png"
-        delete(urlLower)
+            delete(cleanTitle)
+            continue
+        }
 
-        coverPath := fmt.tprintf("covers/%s%s", safeName, ext)
 
-        append(&games, GameRelease{
-            title      = strings.clone(cleanTitle),
-            magnetLink = strings.clone(magnetLink),
-            coverUrl   = strings.clone(coverUrl),
-            coverPath  = strings.clone(coverPath),
-        })
-        delete(cleanTitle)
-        delete(safeName)
+        // -------------------------------------------------
+        // Build cover cache path
+        // -------------------------------------------------
+
+        fmt.printf(
+            "[PARSE] post %d: sanitizing filename\n",
+            index,
+        )
+
+        safeName := sanitize_filename(
+            cleanTitle,
+            context.allocator,
+        )
+
+        // All rendered covers use PNG as the canonical cache format.
+        // JPEG downloads and legacy JPEG cache files are converted before
+        // raylib sees them.
+        if len(safeName) == 0 {
+            safeName = fmt.aprintf(
+                "release_%d",
+                index,
+            )
+        }
+
+        coverPath := fmt.aprintf(
+            "covers/%s.png",
+            safeName,
+        )
+
+        if len(safeName) > 0 {
+            delete(safeName)
+        }
+
+        fmt.printf(
+            "[PARSE] post %d: cover path=%s\n",
+            index,
+            coverPath,
+        )
+
+
+        // -------------------------------------------------
+        // Clone everything that currently points into the
+        // JSON parser's owned memory.
+        // -------------------------------------------------
+
+        fmt.printf(
+            "[PARSE] post %d: cloning magnet\n",
+            index,
+        )
+
+        ownedMagnet := strings.clone(
+            magnetLink,
+            context.allocator,
+        )
+
+        fmt.printf(
+            "[PARSE] post %d: cloning cover URL\n",
+            index,
+        )
+
+        ownedCover := strings.clone(
+            coverUrl,
+            context.allocator,
+        )
+
+        fmt.printf(
+            "[PARSE] post %d: appending game\n",
+            index,
+        )
+
+        append(
+            &games,
+            GameRelease{
+                title      = cleanTitle,
+                magnetLink = ownedMagnet,
+                coverUrl   = ownedCover,
+                coverPath  = coverPath,
+            },
+        )
+
+        fmt.printf(
+            "[PARSE] post %d: appended successfully; games=%d\n",
+            index,
+            len(games),
+        )
     }
+
+    fmt.printf(
+        "[PARSE] Complete: %d valid games\n",
+        len(games),
+    )
+
     return games
 }
 
+
 // ---------------------------------------------------------
-// 4. UI Screens
+// 7. Cover Download Worker
 // ---------------------------------------------------------
 
-RenderSetupScreen :: proc(app: ^App, theme: orui.Theme) {
-    {orui.container(orui.id("setup_root"), {
-        layout = .Flex, direction = .TopToBottom, width = orui.grow(), height = orui.grow(),
-        align_main = .Center, align_cross = .Center, background_color = APP_BACKGROUND,
-    })
-        {orui.container(orui.id("setup_panel"), {
-            layout = .Flex, direction = .TopToBottom, width = orui.fixed(460), height = orui.fit(),
-            padding = orui.padding(32), gap = 16, background_color = ROW_BACKGROUND,
-            border = orui.border(1), border_color = BORDER_COLOR, corner_radius = orui.corner(8),
-        })
-            orui.label(orui.id("setup_title"), "Real-Debrid Configuration", { font_size = 24, color = TEXT_PRIMARY })
-            orui.label(orui.id("setup_desc"), "Please provide your API token to unrestrict FitGirl downloads automatically.", {
-                font_size = 14, color = TEXT_MUTED, overflow = .Wrap
-            })
+download_worker :: proc(task: thread.Task) {
+    index := task.user_index
 
-            orui.text_input(orui.id("rd_key_input"), &app.rd_key_input, {
-                width = orui.grow(), height = orui.fixed(42),
-                padding = orui.padding(12, 0), background_color = APP_BACKGROUND,
-                border = orui.border(1), border_color = BORDER_COLOR, corner_radius = orui.corner(6),
-                placeholder = "API Token...",
-            })
+    fmt.printf(
+        "[COVER %d] Worker started\n",
+        index,
+    )
+
+    t_data := cast(^DownloadTask)task.data
+
+    if t_data == nil {
+        fmt.printf(
+            "[COVER %d] ERROR: task.data=nil\n",
+            index,
+        )
+        return
+    }
+
+    if t_data.game_ptr == nil {
+        fmt.printf(
+            "[COVER %d] ERROR: game_ptr=nil\n",
+            index,
+        )
+        return
+    }
+
+    game := t_data.game_ptr
+
+    fmt.printf(
+        "[COVER %d] Title: %s\n",
+        index,
+        game.title,
+    )
+
+    fmt.printf(
+        "[COVER %d] Path: %s\n",
+        index,
+        game.coverPath,
+    )
+
+    if len(game.coverPath) == 0 {
+        fmt.printf(
+            "[COVER %d] ERROR: empty cover path\n",
+            index,
+        )
+        return
+    }
+
+    if os.exists(game.coverPath) {
+        fmt.printf(
+            "[COVER %d] PNG cache hit; skipping download\n",
+            index,
+        )
+        return
+    }
+
+    // Migrate covers cached by the previous JPEG-based implementation.
+    // Keep the legacy file until conversion succeeds so a failed conversion
+    // can be retried on the next run.
+    legacyCoverPath := ""
+    if len(game.coverPath) >= len(".png") {
+        legacyCoverPath = fmt.aprintf(
+            "%s.jpg",
+            game.coverPath[:len(game.coverPath)-len(".png")],
+        )
+        defer delete(legacyCoverPath)
+    }
+
+    if len(legacyCoverPath) > 0 && os.exists(legacyCoverPath) {
+        fmt.printf(
+            "[COVER %d] Legacy JPEG cache hit; converting to %s\n",
+            index,
+            game.coverPath,
+        )
+
+        conversion_err := jpegpng.Convert_File(
+            legacyCoverPath,
+            game.coverPath,
+        )
+
+        if conversion_err != .None {
+            fmt.printf(
+                "[COVER %d] ERROR: cached JPEG conversion failed: %v\n",
+                index,
+                conversion_err,
+            )
+            return
+        }
+
+        remove_err := os.remove(legacyCoverPath)
+        if remove_err != nil {
+            fmt.printf(
+                "[COVER %d] WARNING: could not remove legacy JPEG cache: %v\n",
+                index,
+                remove_err,
+            )
+        } else {
+            fmt.printf(
+                "[COVER %d] Legacy JPEG cache removed\n",
+                index,
+            )
+        }
+        return
+    }
+
+    if len(game.coverUrl) == 0 {
+        fmt.printf(
+            "[COVER %d] No cover URL; skipping\n",
+            index,
+        )
+        return
+    }
+
+    url_lower := strings.to_lower(
+        game.coverUrl,
+        context.allocator,
+    )
+    defer delete(url_lower)
+
+    if strings.contains(url_lower, ".webp") {
+        fmt.printf(
+            "[COVER %d] WEBP skipped\n",
+            index,
+        )
+        return
+    }
+
+    if strings.contains(url_lower, ".avif") {
+        fmt.printf(
+            "[COVER %d] AVIF skipped\n",
+            index,
+        )
+        return
+    }
+
+    builder: strings.Builder
+    strings.builder_init(
+        &builder,
+        context.allocator,
+    )
+    defer strings.builder_destroy(&builder)
+
+    fmt.printf(
+        "[COVER %d] curl.easy_init()...\n",
+        index,
+    )
+
+    handle := curl.easy_init()
+
+    if handle == nil {
+        fmt.printf(
+            "[COVER %d] ERROR: curl.easy_init returned nil\n",
+            index,
+        )
+        return
+    }
+
+    defer curl.easy_cleanup(handle)
+
+    cstrUrl := strings.clone_to_cstring(
+        game.coverUrl,
+        context.allocator,
+    )
+    defer delete(cstrUrl)
+
+    curl.easy_setopt(handle, .URL, cstrUrl)
+    curl.easy_setopt(handle, .FOLLOWLOCATION, 1)
+    curl.easy_setopt(
+        handle,
+        .REFERER,
+        "https://fitgirl-repacks.site/",
+    )
+    curl.easy_setopt(
+        handle,
+        .USERAGENT,
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FitDeck/1.0",
+    )
+    curl.easy_setopt(handle, .TIMEOUT, 15)
+    curl.easy_setopt(handle, .ACCEPT_ENCODING, "")
+    curl.easy_setopt(handle, .WRITEFUNCTION, CurlWriteCallback)
+    curl.easy_setopt(handle, .WRITEDATA, &builder)
+
+    fmt.printf(
+        "[COVER %d] Performing HTTP request...\n",
+        index,
+    )
+
+    result := curl.easy_perform(handle)
+
+    fmt.printf(
+        "[COVER %d] HTTP result=%v bytes=%d\n",
+        index,
+        result,
+        len(builder.buf),
+    )
+
+    if result != .E_OK {
+        fmt.printf(
+            "[COVER %d] ERROR: curl request failed: %v\n",
+            index,
+            result,
+        )
+        return
+    }
+
+    if len(builder.buf) <= 10 {
+        fmt.printf(
+            "[COVER %d] ERROR: response too small\n",
+            index,
+        )
+        return
+    }
+
+    header_len := min(
+        len(builder.buf),
+        256,
+    )
+
+    header := string(
+        builder.buf[:header_len],
+    )
+
+    if strings.contains(header, "<!DOCTYPE") ||
+       strings.contains(header, "<html") ||
+       strings.contains(header, "<HTML") {
+        fmt.printf(
+            "[COVER %d] ERROR: received HTML instead of image\n",
+            index,
+        )
+        return
+    }
+
+    // The API normally returns JPEG bytes even when the URL has a .png
+    // suffix. Convert those bytes before putting them in the canonical PNG
+    // cache. Preserve an actual PNG response as-is.
+    png_data: []byte
+    is_jpeg :=
+        len(builder.buf) >= 2 &&
+        builder.buf[0] == 0xff &&
+        builder.buf[1] == 0xd8
+
+    if is_jpeg {
+        converted, conversion_err := jpegpng.Convert_Bytes(
+            builder.buf[:],
+        )
+
+        if conversion_err != .None {
+            fmt.printf(
+                "[COVER %d] ERROR: downloaded JPEG conversion failed: %v\n",
+                index,
+                conversion_err,
+            )
+            return
+        }
+
+        png_data = converted
+    } else {
+        is_png :=
+            len(builder.buf) >= 8 &&
+            builder.buf[0] == 0x89 &&
+            builder.buf[1] == 0x50 &&
+            builder.buf[2] == 0x4e &&
+            builder.buf[3] == 0x47 &&
+            builder.buf[4] == 0x0d &&
+            builder.buf[5] == 0x0a &&
+            builder.buf[6] == 0x1a &&
+            builder.buf[7] == 0x0a
+
+        if !is_png {
+            fmt.printf(
+                "[COVER %d] ERROR: response is neither JPEG nor PNG\n",
+                index,
+            )
+            return
+        }
+
+        png_data, alloc_err := make(
+            []byte,
+            len(builder.buf),
+            context.allocator,
+        )
+
+        if alloc_err != nil {
+            fmt.printf(
+                "[COVER %d] ERROR: PNG response allocation failed: %v\n",
+                index,
+                alloc_err,
+            )
+            return
+        }
+
+        copy(png_data, builder.buf[:])
+    }
+
+    defer delete(png_data, context.allocator)
+
+    fmt.printf(
+        "[COVER %d] Writing converted PNG (%d bytes) to %s\n",
+        index,
+        len(png_data),
+        game.coverPath,
+    )
+
+    write_err := os.write_entire_file(
+        game.coverPath,
+        png_data,
+    )
+
+    if write_err != nil {
+        fmt.printf(
+            "[COVER %d] ERROR: file write failed: %v\n",
+            index,
+            write_err,
+        )
+        return
+    }
+
+    fmt.printf(
+        "[COVER %d] Download and PNG conversion completed\n",
+        index,
+    )
+}
+
+
+// ---------------------------------------------------------
+// 8. Background Loader
+// ---------------------------------------------------------
+
+loader_proc :: proc(t: ^thread.Thread) {
+    fmt.println("[LOADER] Thread entered loader_proc")
+
+    if t == nil {
+        fmt.println("[LOADER] FATAL: thread pointer is nil")
+        return
+    }
+
+    data := cast(^LoaderData)t.data
+
+    if data == nil {
+        fmt.println("[LOADER] FATAL: LoaderData pointer is nil")
+        return
+    }
+
+    data.success = false
+    data.error_message = ""
+
+    fmt.println("[LOADER] Syncing with FitGirl API...")
+
+    json_data := FetchLiveCatalog()
+
+    if len(json_data) == 0 {
+        data.error_message = "Error: Could not reach catalog."
+
+        fmt.println(
+            "[LOADER] ERROR: Failed to fetch catalog JSON.",
+        )
+
+        return
+    }
+
+    fmt.printf(
+        "[LOADER] Received %d JSON bytes\n",
+        len(json_data),
+    )
+
+    fmt.println(
+        "[LOADER] Parsing JSON data safely...",
+    )
+
+    games := ParseGames(
+        transmute([]byte)json_data,
+    )
+
+    fmt.printf(
+        "[LOADER] ParseGames returned %d games\n",
+        len(games),
+    )
+
+    fmt.println(
+        "[LOADER] Releasing raw JSON buffer...",
+    )
+
+    delete(json_data)
+
+    fmt.println(
+        "[LOADER] Raw JSON buffer released",
+    )
+
+    if len(games) == 0 {
+        data.games = games
+        data.error_message = "No valid releases found."
+
+        fmt.println(
+            "[LOADER] ERROR: parser returned zero games",
+        )
+
+        return
+    }
+
+    fmt.printf(
+        "[LOADER] Parsed %d valid games\n",
+        len(games),
+    )
+
+
+    // -----------------------------------------------------
+    // Cover directory
+    // -----------------------------------------------------
+
+    if !os.exists("covers") {
+        fmt.println(
+            "[LOADER] Creating covers directory...",
+        )
+
+        mkdir_err := os.make_directory("covers")
+
+        if mkdir_err != nil {
+            fmt.printf(
+                "[LOADER] WARNING: covers directory creation failed: %v\n",
+                mkdir_err,
+            )
+        } else {
+            fmt.println(
+                "[LOADER] Covers directory created",
+            )
+        }
+    } else {
+        fmt.println(
+            "[LOADER] Covers directory already exists",
+        )
+    }
+
+
+    // -----------------------------------------------------
+    // Cover pool
+    // -----------------------------------------------------
+
+    fmt.println(
+        "[LOADER] Initializing cover thread pool...",
+    )
+
+    pool: thread.Pool
+
+    thread.pool_init(
+        &pool,
+        context.allocator,
+        8,
+    )
+
+    fmt.println(
+        "[LOADER] Starting cover thread pool...",
+    )
+
+    thread.pool_start(&pool)
+
+    tasks := make(
+        []DownloadTask,
+        len(games),
+    )
+
+    queued := 0
+
+    fmt.println(
+        "[LOADER] Queueing cover jobs...",
+    )
+
+    for i in 0..<len(games) {
+        if len(games[i].coverUrl) == 0 {
+            fmt.printf(
+                "[LOADER] Cover %d: no URL, not queued\n",
+                i,
+            )
+            continue
+        }
+
+        tasks[i].game_ptr = &games[i]
+
+        thread.pool_add_task(
+            &pool,
+            context.allocator,
+            download_worker,
+            &tasks[i],
+            i,
+        )
+
+        queued += 1
+    }
+
+    fmt.printf(
+        "[LOADER] Queued %d cover jobs\n",
+        queued,
+    )
+
+    fmt.println(
+        "[LOADER] Waiting for cover workers...",
+    )
+
+    thread.pool_finish(&pool)
+
+    fmt.println(
+        "[LOADER] All cover workers finished",
+    )
+
+    fmt.println(
+        "[LOADER] Destroying cover thread pool...",
+    )
+
+    thread.pool_destroy(&pool)
+
+    fmt.println(
+        "[LOADER] Cover thread pool destroyed",
+    )
+
+    delete(tasks)
+
+    fmt.println(
+        "[LOADER] Cover task array released",
+    )
+
+
+    // -----------------------------------------------------
+    // Hand result to main thread.
+    //
+    // Main will not access LoaderData until this thread has
+    // completely finished.
+    // -----------------------------------------------------
+
+    data.games = games
+    data.success = true
+
+    fmt.printf(
+        "[LOADER] SUCCESS: %d games ready for main thread\n",
+        len(data.games),
+    )
+
+    fmt.println("[LOADER] Thread exiting normally")
+}
+
+
+// ---------------------------------------------------------
+// 9. Loader Control - MAIN THREAD ONLY
+// ---------------------------------------------------------
+
+StartLoader :: proc(app: ^App) {
+    if app == nil {
+        fmt.println("[MAIN] ERROR: StartLoader app=nil")
+        return
+    }
+
+    if app.loader_thread != nil {
+        fmt.println("[MAIN] WARNING: loader already running")
+        return
+    }
+
+    fmt.println("[MAIN] Allocating LoaderData...")
+
+    data := new(LoaderData)
+
+    fmt.println("[MAIN] Creating loader thread...")
+
+    t := thread.create(loader_proc)
+
+    if t == nil {
+        fmt.println("[MAIN] ERROR: thread.create returned nil")
+
+        free(data)
+
+        app.load_status = "Error: Could not create loader thread."
+        return
+    }
+
+    t.data = data
+
+    app.loader_data = data
+    app.loader_thread = t
+
+    app.load_status = "Syncing with FitGirl API..."
+
+    fmt.println("[MAIN] Starting loader thread...")
+
+    thread.start(t)
+
+    fmt.println("[MAIN] Loader thread started")
+}
+
+
+// ---------------------------------------------------------
+// 10. GPU Texture Loading - MAIN THREAD ONLY
+// ---------------------------------------------------------
+
+LoadGameTextures :: proc(app: ^App) {
+    fmt.printf(
+        "[TEXTURE] Beginning GPU texture load for %d games\n",
+        len(app.games),
+    )
+
+    for &game, index in app.games {
+        fmt.printf(
+            "[TEXTURE %d] Checking: %s\n",
+            index,
+            game.coverPath,
+        )
+
+        if len(game.coverPath) == 0 {
+            fmt.printf(
+                "[TEXTURE %d] Empty path; skipping\n",
+                index,
+            )
+            continue
+        }
+
+        if !os.exists(game.coverPath) {
+            fmt.printf(
+                "[TEXTURE %d] File does not exist\n",
+                index,
+            )
+            continue
+        }
+
+        //
+        // Let raylib decode the image itself.
+        //
+        path_cstr := strings.clone_to_cstring(
+            game.coverPath,
+            context.temp_allocator,
+        )
+
+        fmt.printf(
+            "[TEXTURE %d] Calling raylib LoadImage...\n",
+            index,
+        )
+
+        img := rl.LoadImage(path_cstr)
+
+        fmt.printf(
+            "[TEXTURE %d] LoadImage result: data=%v width=%d height=%d format=%v\n",
+            index,
+            img.data != nil,
+            img.width,
+            img.height,
+            img.format,
+        )
+
+        if img.data == nil ||
+           img.width <= 0 ||
+           img.height <= 0 {
+
+            fmt.printf(
+                "[TEXTURE %d] ERROR: raylib could not decode %s\n",
+                index,
+                game.coverPath,
+            )
+
+            // Do not leave a corrupt/unsupported PNG in the cache. The
+            // loader will download and convert it again on the next launch.
+            remove_err := os.remove(game.coverPath)
+            if remove_err != nil {
+                fmt.printf(
+                    "[TEXTURE %d] WARNING: could not remove invalid cache: %v\n",
+                    index,
+                    remove_err,
+                )
+            } else {
+                fmt.printf(
+                    "[TEXTURE %d] Invalid PNG cache removed; retrying next launch\n",
+                    index,
+                )
+            }
+
+            continue
+        }
+
+        fmt.printf(
+            "[TEXTURE %d] Raylib decoded %dx%d\n",
+            index,
+            img.width,
+            img.height,
+        )
+
+        fmt.printf(
+            "[TEXTURE %d] Uploading image to GPU...\n",
+            index,
+        )
+
+        game.coverTex = rl.LoadTextureFromImage(
+            img,
+        )
+
+        //
+        // CPU-side decoded image is no longer needed after
+        // LoadTextureFromImage().
+        //
+        rl.UnloadImage(img)
+
+        if game.coverTex.id == 0 {
+            fmt.printf(
+                "[TEXTURE %d] ERROR: GPU texture creation failed\n",
+                index,
+            )
+            continue
+        }
+
+        rl.SetTextureFilter(
+            game.coverTex,
+            .BILINEAR,
+        )
+
+        fmt.printf(
+            "[TEXTURE %d] SUCCESS: texture=%d\n",
+            index,
+            game.coverTex.id,
+        )
+    }
+
+    fmt.println(
+        "[TEXTURE] GPU texture loading complete",
+    )
+}
+
+
+// ---------------------------------------------------------
+// 11. Poll Completed Loader - MAIN THREAD ONLY
+// ---------------------------------------------------------
+
+ProcessFinishedLoader :: proc(app: ^App) {
+    if app == nil {
+        return
+    }
+
+    if app.loader_thread == nil {
+        return
+    }
+
+    if !thread.is_done(app.loader_thread) {
+        return
+    }
+
+    fmt.println(
+        "[MAIN] Loader reports completion",
+    )
+
+    // Save the result pointer first because thread.destroy()
+    // frees the Thread object itself.
+    loader_data := app.loader_data
+
+    fmt.println(
+        "[MAIN] Destroying/joining completed loader thread...",
+    )
+
+    thread.destroy(app.loader_thread)
+
+    app.loader_thread = nil
+    app.loader_data = nil
+
+    fmt.println(
+        "[MAIN] Loader thread destroyed safely",
+    )
+
+    if loader_data == nil {
+        fmt.println(
+            "[MAIN] ERROR: loader completed without LoaderData",
+        )
+
+        app.load_status =
+            "Error: Loader returned invalid state."
+
+        return
+    }
+
+    if !loader_data.success {
+        fmt.printf(
+            "[MAIN] Loader failed: %s\n",
+            loader_data.error_message,
+        )
+
+        if len(loader_data.games) > 0 {
+            DestroyGames(loader_data.games)
+        }
+
+        if len(loader_data.error_message) > 0 {
+            app.load_status = loader_data.error_message
+        } else {
+            app.load_status = "Error loading catalog."
+        }
+
+        free(loader_data)
+        return
+    }
+
+    fmt.printf(
+        "[MAIN] Taking ownership of %d games\n",
+        len(loader_data.games),
+    )
+
+    app.games = loader_data.games
+
+    // Free only the LoaderData struct. app.games now owns the
+    // dynamic array and all GameRelease allocations.
+    free(loader_data)
+
+    app.load_status = "Loading cover textures..."
+
+    LoadGameTextures(app)
+
+    app.screen = .Library
+    app.status_message = "READY"
+
+    fmt.println(
+        "[MAIN] Library ready",
+    )
+}
+
+
+// ---------------------------------------------------------
+// 12. Shutdown Loader Safely
+// ---------------------------------------------------------
+
+ShutdownLoader :: proc(app: ^App) {
+    if app == nil {
+        return
+    }
+
+    if app.loader_thread == nil {
+        return
+    }
+
+    fmt.println(
+        "[SHUTDOWN] Loader is still running; waiting for it...",
+    )
+
+    loader_data := app.loader_data
+
+    // destroy() waits for the worker to complete and releases
+    // the Thread object.
+    thread.destroy(app.loader_thread)
+
+    app.loader_thread = nil
+    app.loader_data = nil
+
+    fmt.println(
+        "[SHUTDOWN] Loader thread stopped",
+    )
+
+    if loader_data != nil {
+        if len(loader_data.games) > 0 {
+            DestroyGames(loader_data.games)
+        }
+
+        free(loader_data)
+    }
+}
+
+
+// ---------------------------------------------------------
+// 13. UI - Setup
+// ---------------------------------------------------------
+
+RenderSetupScreen :: proc(
+    app: ^App,
+    theme: orui.Theme,
+) {
+    {
+        orui.container(
+            orui.id("setup_root"),
+            {
+                layout = .Flex,
+                direction = .TopToBottom,
+                width = orui.grow(),
+                height = orui.grow(),
+                align_main = .Center,
+                align_cross = .Center,
+                background_color = APP_BACKGROUND,
+            },
+        )
+
+        {
+            orui.container(
+                orui.id("setup_panel"),
+                {
+                    layout = .Flex,
+                    direction = .TopToBottom,
+                    width = orui.fixed(560),
+                    height = orui.fit(),
+
+                    padding = orui.Edges{
+                        top = 32,
+                        right = 32,
+                        bottom = 32,
+                        left = 32,
+                    },
+
+                    gap = 16,
+                    background_color = ROW_BACKGROUND,
+                    border = orui.border(1),
+                    border_color = BORDER_COLOR,
+                    corner_radius = orui.corner(8),
+                },
+            )
+
+            orui.label(
+                orui.id("setup_title"),
+                "Real-Debrid Configuration",
+                {
+                    font_size = 24,
+                    color = TEXT_PRIMARY,
+                },
+            )
+
+            orui.label(
+                orui.id("setup_desc"),
+                "Please provide your API token to unrestrict downloads automatically. You only need to do this once.",
+                {
+                    font_size = 14,
+                    color = TEXT_MUTED,
+                    overflow = .Wrap,
+                },
+            )
+
+            {
+                orui.container(
+                    orui.id("input_row"),
+                    {
+                        layout = .Flex,
+                        direction = .LeftToRight,
+                        width = orui.grow(),
+                        height = orui.fixed(42),
+                        gap = 8,
+                    },
+                )
+
+                orui.text_input(
+                    orui.id("rd_key_input"),
+                    &app.rd_key_input,
+                    {
+                        width = orui.grow(),
+                        height = orui.grow(),
+
+                        padding = orui.Edges{
+                            top = 0,
+                            right = 12,
+                            bottom = 0,
+                            left = 12,
+                        },
+
+                        background_color = LIST_BACKGROUND,
+                        border = orui.border(1),
+                        border_color = BORDER_COLOR,
+                        corner_radius = orui.corner(6),
+                        color = rl.WHITE,
+                        font_size = 20,
+                        placeholder = "Paste API Token Here...",
+                    },
+                )
+
+                if orui.button(
+                    orui.id("btn_paste"),
+                    "Paste",
+                    {
+                        width = orui.fixed(80),
+                        height = orui.grow(),
+                        background_color = ROW_HOVER_BACKGROUND,
+                        color = TEXT_PRIMARY,
+                        corner_radius = orui.corner(6),
+                    },
+                ) {
+                    cb := rl.GetClipboardText()
+
+                    if cb != nil {
+                        strings.builder_reset(
+                            &app.rd_key_input,
+                        )
+
+                        strings.write_string(
+                            &app.rd_key_input,
+                            string(cb),
+                        )
+
+                        // Never log the actual API token.
+                        fmt.printf(
+                            "[UI] Pasted API key, length=%d\n",
+                            len(app.rd_key_input.buf),
+                        )
+                    }
+                }
+            }
 
             if len(app.rd_key_input.buf) == 0 {
-                orui.label(orui.id("setup_warn"), "API Key is required to continue.", { font_size = 12, color = STATUS_ERR })
+                orui.label(
+                    orui.id("setup_warn"),
+                    "API Key is required to continue.",
+                    {
+                        font_size = 12,
+                        color = STATUS_ERR,
+                    },
+                )
             } else {
-                if orui.button(orui.id("btn_save"), "Save & Continue", {
-                    width = orui.grow(), height = orui.fixed(44),
-                    background_color = ACCENT_COLOR, color = APP_BACKGROUND, corner_radius = orui.corner(6),
-                }) {
-                    app.rd_key = strings.clone(strings.to_string(app.rd_key_input))
-                    _ = os.write_entire_file("rd_key.txt", app.rd_key_input.buf[:])
+                if orui.button(
+                    orui.id("btn_save"),
+                    "Save & Launch",
+                    {
+                        width = orui.grow(),
+                        height = orui.fixed(44),
+                        background_color = ACCENT_COLOR,
+                        color = APP_BACKGROUND,
+                        corner_radius = orui.corner(6),
+                    },
+                ) {
+                    if len(app.rd_key) > 0 {
+                        delete(app.rd_key)
+                    }
 
-                    // Route to Loading state
-                    app.screen = .Loading
+                    app.rd_key = strings.clone(
+                        strings.to_string(
+                            app.rd_key_input,
+                        ),
+                    )
 
-                    // Spawn loader thread
-                    t_data := new(LoaderData)
-                    t_data.app = app
-                    t := thread.create(loader_proc)
-                    t.data = t_data
-                    thread.start(t)
+                    write_err := os.write_entire_file(
+                        "rd_key.txt",
+                        app.rd_key_input.buf[:],
+                    )
+
+                    if write_err != nil {
+                        fmt.printf(
+                            "[UI] WARNING: Failed writing rd_key.txt: %v\n",
+                            write_err,
+                        )
+
+                        app.status_message =
+                            "Warning: API key could not be saved."
+                    } else {
+                        fmt.println(
+                            "[UI] API key saved to disk",
+                        )
+                    }
+
+                    if len(app.games) > 0 {
+                        fmt.println(
+                            "[UI] Existing library present; returning to library",
+                        )
+
+                        app.screen = .Library
+                    } else {
+                        fmt.println(
+                            "[UI] Starting loader after API key setup",
+                        )
+
+                        app.screen = .Loading
+                        StartLoader(app)
+                    }
                 }
             }
         }
     }
 }
 
-RenderLoadingScreen :: proc(app: ^App, theme: orui.Theme) {
-    {orui.container(orui.id("load_root"), {
-        layout = .Flex, direction = .TopToBottom, width = orui.grow(), height = orui.grow(),
-        align_main = .Center, align_cross = .Center, background_color = APP_BACKGROUND, gap = 16,
-    })
-        orui.label(orui.id("load_title"), "Booting Library", { font_size = 24, color = TEXT_PRIMARY })
-        orui.label(orui.id("load_status"), app.load_status, { font_size = 14, color = ACCENT_COLOR })
+
+// ---------------------------------------------------------
+// 14. UI - Loading
+// ---------------------------------------------------------
+
+RenderLoadingScreen :: proc(
+    app: ^App,
+    theme: orui.Theme,
+) {
+    {
+        orui.container(
+            orui.id("load_root"),
+            {
+                layout = .Flex,
+                direction = .TopToBottom,
+                width = orui.grow(),
+                height = orui.grow(),
+                align_main = .Center,
+                align_cross = .Center,
+                background_color = APP_BACKGROUND,
+                gap = 16,
+            },
+        )
+
+        orui.label(
+            orui.id("load_title"),
+            "Booting Library",
+            {
+                font_size = 24,
+                color = TEXT_PRIMARY,
+            },
+        )
+
+        orui.label(
+            orui.id("load_status"),
+            app.load_status,
+            {
+                font_size = 14,
+                color = ACCENT_COLOR,
+            },
+        )
     }
 }
 
-RenderLibraryScreen :: proc(app: ^App, theme: orui.Theme) {
-    {orui.container(orui.id("app"), {
-        layout = .Flex, direction = .TopToBottom, width = orui.grow(), height = orui.grow(),
-        background_color = APP_BACKGROUND,
-    })
-        {orui.container(orui.id("top_nav"), {
-            layout = .Flex, direction = .LeftToRight, width = orui.grow(), height = orui.fixed(80),
-            align_cross = .Center, align_main = .SpaceBetween, padding = orui.Edges{top = 0, right = 32, bottom = 0, left = 32},
-            background_color = HEADER_BACKGROUND, border = orui.Edges{top = 0, right = 0, bottom = 1, left = 0}, border_color = BORDER_COLOR,
-        })
-            {orui.container(orui.id("brand_wrap"), { layout = .Flex, direction = .TopToBottom, width = orui.fit(), height = orui.fit() })
-                orui.label(orui.id("title"), "FitDeck", { font_size = 28, color = TEXT_PRIMARY })
-                orui.label(orui.id("subtitle"), "Real-Debrid Library Integration", { font_size = 13, color = ACCENT_COLOR })
+
+// ---------------------------------------------------------
+// 15. UI - Library
+// ---------------------------------------------------------
+
+RenderLibraryScreen :: proc(
+    app: ^App,
+    theme: orui.Theme,
+) {
+    {
+        orui.container(
+            orui.id("app"),
+            {
+                layout = .Flex,
+                direction = .TopToBottom,
+                width = orui.grow(),
+                height = orui.grow(),
+                background_color = APP_BACKGROUND,
+            },
+        )
+
+        // -------------------------------------------------
+        // Top nav
+        // -------------------------------------------------
+
+        {
+            orui.container(
+                orui.id("top_nav"),
+                {
+                    layout = .Flex,
+                    direction = .LeftToRight,
+                    width = orui.grow(),
+                    height = orui.fixed(80),
+
+                    align_cross = .Center,
+                    align_main = .SpaceBetween,
+
+                    padding = orui.Edges{
+                        top = 0,
+                        right = 32,
+                        bottom = 0,
+                        left = 32,
+                    },
+
+                    background_color = HEADER_BACKGROUND,
+
+                    border = orui.Edges{
+                        top = 0,
+                        right = 0,
+                        bottom = 1,
+                        left = 0,
+                    },
+
+                    border_color = BORDER_COLOR,
+                },
+            )
+
+            {
+                orui.container(
+                    orui.id("brand_wrap"),
+                    {
+                        layout = .Flex,
+                        direction = .TopToBottom,
+                        width = orui.fit(),
+                        height = orui.fit(),
+                    },
+                )
+
+                orui.label(
+                    orui.id("title"),
+                    "FitDeck",
+                    {
+                        font_size = 28,
+                        color = TEXT_PRIMARY,
+                    },
+                )
+
+                orui.label(
+                    orui.id("subtitle"),
+                    "Real-Debrid Library Integration",
+                    {
+                        font_size = 13,
+                        color = ACCENT_COLOR,
+                    },
+                )
             }
-            {orui.container(orui.id("status_wrap"), { layout = .Flex, direction = .TopToBottom, width = orui.fit(), height = orui.fit(), align_cross = .End, gap = 4 })
-                orui.label(orui.id("catalog count"), fmt.tprintf("%d Games Found", len(app.games)), { font_size = 14, color = TEXT_PRIMARY })
-                if orui.button(orui.id("btn_settings"), "Reset API Key", { height = orui.fixed(24), padding = orui.padding(8, 0) }) {
+
+            {
+                orui.container(
+                    orui.id("status_wrap"),
+                    {
+                        layout = .Flex,
+                        direction = .TopToBottom,
+                        width = orui.fit(),
+                        height = orui.fit(),
+                        align_cross = .End,
+                        gap = 4,
+                    },
+                )
+
+                orui.label(
+                    orui.id("catalog count"),
+                    fmt.tprintf(
+                        "%d Games Found",
+                        len(app.games),
+                    ),
+                    {
+                        font_size = 14,
+                        color = TEXT_PRIMARY,
+                    },
+                )
+
+                if orui.button(
+                    orui.id("btn_settings"),
+                    "⚙ Settings",
+                    {
+                        height = orui.fixed(24),
+
+                        padding = orui.Edges{
+                            top = 0,
+                            right = 8,
+                            bottom = 0,
+                            left = 8,
+                        },
+
+                        color = TEXT_MUTED,
+                    },
+                ) {
+                    fmt.println(
+                        "[UI] Opening settings screen",
+                    )
+
                     app.screen = .SetupKey
                 }
             }
         }
 
-        {orui.container(orui.id("main_content"), {
-            layout = .Flex, direction = .TopToBottom, width = orui.grow(), height = orui.grow(),
-            padding = orui.Edges{top = 24, right = 32, bottom = 24, left = 32}, gap = 12,
-        })
-            {orui.container(orui.id("release heading"), {
-                layout = .Flex, direction = .LeftToRight, width = orui.grow(), height = orui.fit(),
-                align_cross = .Center, align_main = .SpaceBetween, padding = orui.Edges{top = 0, right = 4, bottom = 8, left = 4},
-            })
-                orui.label(orui.id("release heading title"), "AVAILABLE RELEASES", { font_size = 14, color = TEXT_MUTED, letter_spacing = 1 })
+
+        // -------------------------------------------------
+        // Main content
+        // -------------------------------------------------
+
+        {
+            orui.container(
+                orui.id("main_content"),
+                {
+                    layout = .Flex,
+                    direction = .TopToBottom,
+                    width = orui.grow(),
+                    height = orui.grow(),
+
+                    padding = orui.Edges{
+                        top = 24,
+                        right = 32,
+                        bottom = 24,
+                        left = 32,
+                    },
+
+                    gap = 12,
+                },
+            )
+
+            {
+                orui.container(
+                    orui.id("release heading"),
+                    {
+                        layout = .Flex,
+                        direction = .LeftToRight,
+                        width = orui.grow(),
+                        height = orui.fit(),
+                        align_cross = .Center,
+                        align_main = .SpaceBetween,
+
+                        padding = orui.Edges{
+                            top = 0,
+                            right = 4,
+                            bottom = 8,
+                            left = 4,
+                        },
+                    },
+                )
+
+                orui.label(
+                    orui.id("release heading title"),
+                    "AVAILABLE RELEASES",
+                    {
+                        font_size = 14,
+                        color = TEXT_MUTED,
+                        letter_spacing = 1,
+                    },
+                )
             }
 
             if len(app.games) > 0 {
-                list := orui.begin_virtual_list(orui.id("releases"), {
-                    width = orui.grow(), height = orui.grow(), scroll = orui.scroll(.Vertical),
-                    clip = {.Self, {}}, background_color = LIST_BACKGROUND,
-                }, {
-                    direction = .Vertical, item_count = len(app.games), item_extent = RELEASE_ROW_EXTENT, overscan = 2,
-                })
+                list := orui.begin_virtual_list(
+                    orui.id("releases"),
+                    {
+                        width = orui.grow(),
+                        height = orui.grow(),
+                        scroll = orui.scroll(.Vertical),
+                        clip = {.Self, {}},
+                        background_color = LIST_BACKGROUND,
+                    },
+                    {
+                        direction = .Vertical,
+                        item_count = len(app.games),
+                        item_extent = RELEASE_ROW_EXTENT,
+                        overscan = 2,
+                    },
+                )
 
-                for index := list.first; index < list.last; index += 1 {
+                for index := list.first;
+                    index < list.last;
+                    index += 1 {
+
                     game := app.games[index]
-                    rowId := orui.virtual_list_item_id(list.id, index)
 
-                    isFocused := index == app.selected_game || orui.focused(rowId) || orui.active(rowId)
+                    rowId := orui.virtual_list_item_id(
+                        list.id,
+                        index,
+                    )
+
+                    isFocused :=
+                        index == app.selected_game ||
+                        orui.focused(rowId) ||
+                        orui.active(rowId)
+
                     isHovered := orui.hovered(rowId)
 
                     rowBg := ROW_BACKGROUND
-                    if isFocused do rowBg = ROW_FOCUS_BACKGROUND
-                    else if isHovered do rowBg = ROW_HOVER_BACKGROUND
+
+                    if isFocused {
+                        rowBg = ROW_FOCUS_BACKGROUND
+                    } else if isHovered {
+                        rowBg = ROW_HOVER_BACKGROUND
+                    }
 
                     rowBorder := isFocused ? ACCENT_COLOR : BORDER_COLOR
                     titleColor := isFocused ? rl.WHITE : TEXT_PRIMARY
                     badgeTextColor := isFocused ? rl.WHITE : STATUS_OK
 
-                    {orui.container(orui.id(rowId), orui.virtual_list_item_config(list, index, {
-                        layout = .Flex, direction = .LeftToRight, width = orui.percent(1), height = orui.fixed(RELEASE_ROW_HEIGHT),
-                        padding = orui.Edges{top = 0, right = 20, bottom = 0, left = 12},
-                        align_cross = .Center, align_main = .SpaceBetween,
-                        background_color = rowBg, border = orui.border(1), border_color = rowBorder, corner_radius = orui.corner(6),
-                        focusable = true, block = .True, cursor = .Pointing_Hand,
-                    }))
+                    {
+                        orui.container(
+                            orui.id(rowId),
+                            orui.virtual_list_item_config(
+                                list,
+                                index,
+                                {
+                                    layout = .Flex,
+                                    direction = .LeftToRight,
+                                    width = orui.percent(1),
+                                    height = orui.fixed(
+                                        RELEASE_ROW_HEIGHT,
+                                    ),
 
-                        {orui.container(orui.id(fmt.tprintf("info_wrap_%d", index)), {
-                            layout = .Flex, direction = .LeftToRight, height = orui.grow(), align_cross = .Center, gap = 16,
-                        })
+                                    padding = orui.Edges{
+                                        top = 0,
+                                        right = 20,
+                                        bottom = 0,
+                                        left = 12,
+                                    },
+
+                                    align_cross = .Center,
+                                    align_main = .SpaceBetween,
+                                    background_color = rowBg,
+                                    border = orui.border(1),
+                                    border_color = rowBorder,
+                                    corner_radius = orui.corner(6),
+                                    focusable = true,
+                                    block = .True,
+                                    cursor = .Pointing_Hand,
+                                },
+                            ),
+                        )
+
+                        {
+                            orui.container(
+                                orui.id(
+                                    fmt.tprintf(
+                                        "info_wrap_%d",
+                                        index,
+                                    ),
+                                ),
+                                {
+                                    layout = .Flex,
+                                    direction = .LeftToRight,
+                                    height = orui.grow(),
+                                    align_cross = .Center,
+                                    gap = 16,
+                                },
+                            )
+
                             if game.coverTex.id != 0 {
-                                orui.image(orui.id(fmt.tprintf("cover_%d", index)), &app.games[index].coverTex, {
-                                    width = orui.fixed(56), height = orui.fixed(76),
-                                    texture_fit = .Cover, corner_radius = orui.corner(4), border = orui.border(1), border_color = BORDER_COLOR,
-                                })
+                                orui.image(
+                                    orui.id(
+                                        fmt.tprintf(
+                                            "cover_%d",
+                                            index,
+                                        ),
+                                    ),
+                                    &app.games[index].coverTex,
+                                    {
+                                        width = orui.fixed(56),
+                                        height = orui.fixed(76),
+                                        texture_fit = .Cover,
+                                        corner_radius = orui.corner(4),
+                                        border = orui.border(1),
+                                        border_color = BORDER_COLOR,
+                                    },
+                                )
                             } else {
-                                {orui.container(orui.id(fmt.tprintf("cover_ph_%d", index)), {
-                                    width = orui.fixed(56), height = orui.fixed(76),
-                                    background_color = HEADER_BACKGROUND, corner_radius = orui.corner(4),
-                                })}
+                                {
+                                    orui.container(
+                                        orui.id(
+                                            fmt.tprintf(
+                                                "cover_ph_%d",
+                                                index,
+                                            ),
+                                        ),
+                                        {
+                                            width = orui.fixed(56),
+                                            height = orui.fixed(76),
+                                            background_color = HEADER_BACKGROUND,
+                                            corner_radius = orui.corner(4),
+                                        },
+                                    )
+                                }
                             }
 
-                            orui.label(orui.id(fmt.tprintf("title_%d", index)), game.title, { font_size = 18, color = titleColor, disabled = .True })
+                            orui.label(
+                                orui.id(
+                                    fmt.tprintf(
+                                        "title_%d",
+                                        index,
+                                    ),
+                                ),
+                                game.title,
+                                {
+                                    font_size = 18,
+                                    color = titleColor,
+                                    disabled = .True,
+                                },
+                            )
                         }
 
-                        {orui.container(orui.id(fmt.tprintf("badge_%d", index)), {
-                            layout = .Flex, direction = .LeftToRight, width = orui.fixed(120), height = orui.fixed(26),
-                            align_main = .Center, align_cross = .Center, background_color = rl.Color{0, 0, 0, 40}, corner_radius = orui.corner(13),
-                        })
-                            orui.label(orui.id(fmt.tprintf("badgetext_%d", index)), "MAGNET READY", { font_size = 11, color = badgeTextColor, disabled = .True })
+                        {
+                            orui.container(
+                                orui.id(
+                                    fmt.tprintf(
+                                        "badge_%d",
+                                        index,
+                                    ),
+                                ),
+                                {
+                                    layout = .Flex,
+                                    direction = .LeftToRight,
+                                    width = orui.fixed(120),
+                                    height = orui.fixed(26),
+                                    align_main = .Center,
+                                    align_cross = .Center,
+                                    background_color = rl.Color{
+                                        0,
+                                        0,
+                                        0,
+                                        40,
+                                    },
+                                    corner_radius = orui.corner(13),
+                                },
+                            )
+
+                            orui.label(
+                                orui.id(
+                                    fmt.tprintf(
+                                        "badgetext_%d",
+                                        index,
+                                    ),
+                                ),
+                                "MAGNET READY",
+                                {
+                                    font_size = 11,
+                                    color = badgeTextColor,
+                                    disabled = .True,
+                                },
+                            )
                         }
                     }
 
-                    if orui.clicked(rowId) || orui.activated(rowId) {
+                    if orui.clicked(rowId) ||
+                       orui.activated(rowId) {
+
                         app.selected_game = index
-                        app.status_message = "Handing off to Real-Debrid API..."
-                        // TODO: Fire Real Debrid Pipeline here!
+
+                        app.status_message =
+                            "Handing off to Real-Debrid API..."
+
+                        // Magnet is intentionally not printed here.
+                        // It can be very long and isn't needed for
+                        // crash diagnostics.
+                        fmt.printf(
+                            "[UI] Selected game index=%d title=%s magnet_length=%d\n",
+                            index,
+                            game.title,
+                            len(game.magnetLink),
+                        )
                     }
                 }
+
                 orui.end_virtual_list()
             }
-            {orui.container(orui.id("footer"), {
-                layout = .Flex, direction = .LeftToRight, width = orui.grow(), height = orui.fit(),
-                align_cross = .Center, align_main = .SpaceBetween, padding = orui.Edges{top = 12, right = 0, bottom = 0, left = 0},
-            })
-                orui.label(orui.id("footer source"), "SOURCE: FITGIRL-REPACKS.SITE", { font_size = 11, color = TEXT_MUTED })
-                orui.label(orui.id("footer msg"), app.status_message, { font_size = 11, color = ACCENT_COLOR })
+
+
+            // -------------------------------------------------
+            // Footer
+            // -------------------------------------------------
+
+            {
+                orui.container(
+                    orui.id("footer"),
+                    {
+                        layout = .Flex,
+                        direction = .LeftToRight,
+                        width = orui.grow(),
+                        height = orui.fit(),
+                        align_cross = .Center,
+                        align_main = .SpaceBetween,
+
+                        padding = orui.Edges{
+                            top = 12,
+                            right = 0,
+                            bottom = 0,
+                            left = 0,
+                        },
+                    },
+                )
+
+                orui.label(
+                    orui.id("footer source"),
+                    "SOURCE: FITGIRL-REPACKS.SITE",
+                    {
+                        font_size = 11,
+                        color = TEXT_MUTED,
+                    },
+                )
+
+                orui.label(
+                    orui.id("footer msg"),
+                    app.status_message,
+                    {
+                        font_size = 11,
+                        color = ACCENT_COLOR,
+                    },
+                )
             }
         }
     }
 }
 
+
 // ---------------------------------------------------------
-// 5. Execution Core
+// 16. Execution Core
 // ---------------------------------------------------------
 
 main :: proc() {
-    app: App
-    strings.builder_init(&app.rd_key_input)
-    defer strings.builder_destroy(&app.rd_key_input)
-    app.status_message = "READY"
+    fmt.println("========================================")
+    fmt.println("--- Starting FitDeck ---")
+    fmt.println("========================================")
 
-    // Check if key exists
-    data, err := os.read_entire_file_from_path("rd_key.txt", context.allocator)
-    if err == nil {
-        app.rd_key = strings.clone(string(data))
-        strings.write_string(&app.rd_key_input, app.rd_key)
-        delete(data)
 
-        // Start Loader
-        app.screen = .Loading
-        t_data := new(LoaderData)
-        t_data.app = &app
-        t := thread.create(loader_proc)
-        t.data = t_data
-        thread.start(t)
-    } else {
-        app.screen = .SetupKey
+    // -----------------------------------------------------
+    // libcurl global lifetime
+    //
+    // Initialize ONCE before any worker threads can touch
+    // libcurl. Cleanup happens after all loader workers have
+    // been joined during shutdown.
+    // -----------------------------------------------------
+
+    fmt.println(
+        "[BOOT] Initializing global libcurl state...",
+    )
+
+    curl_init_result :=
+        curl.global_init(curl.GLOBAL_DEFAULT)
+
+    if curl_init_result != .E_OK {
+        fmt.printf(
+            "[BOOT] FATAL: curl.global_init failed: %v\n",
+            curl_init_result,
+        )
+
+        return
     }
 
-    // --- GUI Init ---
-    rl.SetTraceLogLevel(.FATAL) // KILL TERMINAL SPAM!
+    defer curl.global_cleanup()
+
+    fmt.println(
+        "[BOOT] libcurl initialized successfully",
+    )
+
+
+    // -----------------------------------------------------
+    // App
+    // -----------------------------------------------------
+
+    app: App
+
+    strings.builder_init(
+        &app.rd_key_input,
+    )
+    defer strings.builder_destroy(
+        &app.rd_key_input,
+    )
+
+    app.status_message = "READY"
+    app.load_status = "Initializing..."
+    app.selected_game = 0
+
+
+    // -----------------------------------------------------
+    // Raylib
+    // -----------------------------------------------------
+
+    fmt.println(
+        "[BOOT] Initializing raylib window...",
+    )
+
+    rl.SetTraceLogLevel(.FATAL)
     rl.SetConfigFlags({.MSAA_4X_HINT})
-    rl.InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, WINDOW_TITLE)
+
+    rl.InitWindow(
+        WINDOW_WIDTH,
+        WINDOW_HEIGHT,
+        WINDOW_TITLE,
+    )
+
     defer rl.CloseWindow()
+
     rl.SetTargetFPS(60)
+
+    fmt.println(
+        "[BOOT] raylib window initialized",
+    )
+
+
+    // -----------------------------------------------------
+    // ORUI
+    // -----------------------------------------------------
+
+    fmt.println(
+        "[BOOT] Initializing ORUI...",
+    )
 
     ctx := new(orui.Context)
     defer free(ctx)
+
     orui.init(ctx)
     defer orui.destroy(ctx)
-    orui.set_input_trace(ctx, false)
+
+    orui.set_input_trace(
+        ctx,
+        false,
+    )
+
+    fmt.println(
+        "[BOOT] ORUI initialized",
+    )
+
+
+    // -----------------------------------------------------
+    // Font
+    // -----------------------------------------------------
 
     if rl.FileExists("font.ttf") {
-        customFont := rl.LoadFontEx("font.ttf", 36, nil, 0)
-        rl.SetTextureFilter(customFont.texture, .BILINEAR)
-        ctx.default_font = customFont
+        fmt.println(
+            "[BOOT] Loading custom font.ttf...",
+        )
+
+        customFont := rl.LoadFontEx(
+            "font.ttf",
+            36,
+            nil,
+            0,
+        )
+
+        if customFont.texture.id != 0 {
+            rl.SetTextureFilter(
+                customFont.texture,
+                .BILINEAR,
+            )
+
+            ctx.default_font = customFont
+
+            fmt.printf(
+                "[BOOT] Custom font loaded, texture=%d\n",
+                customFont.texture.id,
+            )
+        } else {
+            fmt.println(
+                "[BOOT] WARNING: custom font load failed; using default font",
+            )
+
+            ctx.default_font =
+                rl.GetFontDefault()
+        }
     } else {
-        ctx.default_font = rl.GetFontDefault()
+        fmt.println(
+            "[BOOT] font.ttf not found; using default font",
+        )
+
+        ctx.default_font =
+            rl.GetFontDefault()
     }
 
+
+    // -----------------------------------------------------
+    // Theme
+    // -----------------------------------------------------
+
     theme := orui.default_theme()
-    theme.button_background = ROW_BACKGROUND
-    theme.button_hover = ROW_HOVER_BACKGROUND
-    theme.button_focused = ROW_FOCUS_BACKGROUND
-    theme.selected = ROW_FOCUS_BACKGROUND
-    theme.focus_border = rl.BLANK
-    theme.border = BORDER_COLOR
-    theme.text = TEXT_PRIMARY
-    orui.set_theme(ctx, theme)
+
+    theme.button_background =
+        ROW_BACKGROUND
+
+    theme.button_hover =
+        ROW_HOVER_BACKGROUND
+
+    theme.button_focused =
+        ROW_FOCUS_BACKGROUND
+
+    theme.selected =
+        ROW_FOCUS_BACKGROUND
+
+    theme.focus_border =
+        rl.BLANK
+
+    theme.border =
+        BORDER_COLOR
+
+    theme.text =
+        TEXT_PRIMARY
+
+    orui.set_theme(
+        ctx,
+        theme,
+    )
+
+
+    // -----------------------------------------------------
+    // API Key
+    //
+    // Loader starts only after curl, raylib and ORUI have
+    // all been initialized.
+    // -----------------------------------------------------
+
+    fmt.println(
+        "[BOOT] Checking rd_key.txt...",
+    )
+
+    key_data, key_err :=
+        os.read_entire_file_from_path(
+            "rd_key.txt",
+            context.allocator,
+        )
+
+    if key_err == nil {
+        fmt.printf(
+            "[BOOT] Existing API key found, bytes=%d\n",
+            len(key_data),
+        )
+
+        app.rd_key = strings.clone(
+            string(key_data),
+        )
+
+        strings.write_string(
+            &app.rd_key_input,
+            app.rd_key,
+        )
+
+        delete(key_data)
+
+        app.screen = .Loading
+        app.load_status =
+            "Syncing with FitGirl API..."
+
+        StartLoader(&app)
+    } else {
+        fmt.println(
+            "[BOOT] No API key found. Launching setup screen.",
+        )
+
+        app.screen = .SetupKey
+    }
+
+
+    // -----------------------------------------------------
+    // Main Loop
+    // -----------------------------------------------------
+
+    fmt.println(
+        "[MAIN] Entering render loop",
+    )
+
+    frame_number: u64 = 0
 
     for !rl.WindowShouldClose() {
-        // Safe context checking - when the thread finishes, we convert the disk caches to GPU textures
-        if app.screen == .Loading && app.load_done {
-            for &game in app.games {
-                if os.exists(game.coverPath) {
-                    path_cstr := strings.clone_to_cstring(game.coverPath, context.temp_allocator)
-                    game.coverTex = rl.LoadTexture(path_cstr)
-                    if game.coverTex.id != 0 {
-                        rl.SetTextureFilter(game.coverTex, .BILINEAR)
-                    }
-                }
-            }
-            app.screen = .Library
-            app.load_done = false
+        frame_number += 1
+
+
+        // -------------------------------------------------
+        // Background loader completion
+        // -------------------------------------------------
+
+        if app.screen == .Loading {
+            ProcessFinishedLoader(&app)
         }
+
+
+        // -------------------------------------------------
+        // Drawing
+        // -------------------------------------------------
 
         rl.BeginDrawing()
-        rl.ClearBackground(APP_BACKGROUND)
+        rl.ClearBackground(
+            APP_BACKGROUND,
+        )
 
-        input := orui.input_from_raylib()
-        orui.begin_responsive_with_input(ctx, rl.GetScreenWidth(), rl.GetScreenHeight(), input)
+        input :=
+            orui.input_from_raylib()
+
+        orui.begin_responsive_with_input(
+            ctx,
+            rl.GetScreenWidth(),
+            rl.GetScreenHeight(),
+            input,
+        )
 
         switch app.screen {
-        case .SetupKey: RenderSetupScreen(&app, theme)
-        case .Loading:  RenderLoadingScreen(&app, theme)
-        case .Library:  RenderLibraryScreen(&app, theme)
+        case .SetupKey:
+            RenderSetupScreen(
+                &app,
+                theme,
+            )
+
+        case .Loading:
+            RenderLoadingScreen(
+                &app,
+                theme,
+            )
+
+        case .Library:
+            RenderLibraryScreen(
+                &app,
+                theme,
+            )
         }
 
-        renderCommands := orui.end()
+        renderCommands :=
+            orui.end()
+
         for command in renderCommands {
-            orui.render_command(command)
+            orui.render_command(
+                command,
+            )
         }
 
         rl.EndDrawing()
-        free_all(context.temp_allocator)
+
+        // All temp strings generated by fmt.tprintf,
+        // clone_to_cstring, etc. are no longer needed after
+        // the frame has rendered.
+        free_all(
+            context.temp_allocator,
+        )
     }
+
+
+    // -----------------------------------------------------
+    // Shutdown
+    // -----------------------------------------------------
+
+    fmt.printf(
+        "[SHUTDOWN] Window requested close after %d frames\n",
+        frame_number,
+    )
+
+    // Most important shutdown rule:
+    // finish every curl-using worker BEFORE curl.global_cleanup().
+    ShutdownLoader(&app)
+
+    fmt.println(
+        "[SHUTDOWN] Background loader stopped",
+    )
+
+
+    // -----------------------------------------------------
+    // Release game-owned CPU/GPU resources while raylib is
+    // still alive.
+    // -----------------------------------------------------
+
+    if len(app.games) > 0 {
+        fmt.printf(
+            "[SHUTDOWN] Releasing %d games\n",
+            len(app.games),
+        )
+
+        DestroyGames(app.games)
+
+        fmt.println(
+            "[SHUTDOWN] Game resources released",
+        )
+    }
+
+    if len(app.rd_key) > 0 {
+        fmt.println(
+            "[SHUTDOWN] Releasing API key memory",
+        )
+
+        delete(app.rd_key)
+        app.rd_key = ""
+    }
+
+    fmt.println(
+        "[SHUTDOWN] FitDeck shutdown complete",
+    )
+
+    fmt.println("========================================")
 }
