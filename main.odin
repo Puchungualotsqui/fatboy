@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "core:strings"
 import "core:encoding/json"
+import endian "core:encoding/endian"
 import "core:mem"
 import "core:thread"
 import "core:os"
@@ -11,6 +12,7 @@ import "base:runtime"
 import curl "vendor:curl"
 import jpegpng "jpegpng"
 import orui "orui"
+import tinyfd "tinyfiledialogs"
 import rl "vendor:raylib"
 
 
@@ -19,6 +21,9 @@ WINDOW_HEIGHT :: 800
 WINDOW_TITLE  :: "FitDeck"
 
 FITGIRL_API_URL :: "https://fitgirl-repacks.site/wp-json/wp/v2/posts?per_page=30"
+
+SETTINGS_FILE    :: "settings.bin"
+SETTINGS_VERSION :: u32(1)
 
 RELEASE_ROW_HEIGHT :: 96
 RELEASE_ROW_EXTENT :: 106
@@ -79,9 +84,10 @@ LoaderData :: struct {
 
 
 App :: struct {
-    screen:       AppScreen,
-    rd_key:       string,
+    screen:               AppScreen,
+    rd_key:               string,
     rd_key_input: strings.Builder,
+    download_path: string,
 
     load_status: string,
     games:       [dynamic]GameRelease,
@@ -159,6 +165,232 @@ DestroyGames :: proc(games: [dynamic]GameRelease) {
     }
 
     delete(games)
+}
+
+
+// ---------------------------------------------------------
+// Settings
+// ---------------------------------------------------------
+
+// The settings file is deliberately a small, explicit binary format:
+//
+//   bytes 0..3   magic (FDS1)
+//   bytes 4..7   little-endian format version
+//   bytes 8..11  little-endian API key byte length
+//   bytes 12..15 little-endian download path byte length
+//   remaining    API key followed by download path
+//
+// Length-prefixed strings keep the format unambiguous and leave room for
+// future versions without relying on Odin's in-memory struct layout.
+EnsureDownloadDirectory :: proc(path: string) -> bool {
+    if len(path) == 0 {
+        return false
+    }
+
+    if !os.exists(path) {
+        mkdir_err := os.make_directory_all(path)
+        if mkdir_err != nil {
+            fmt.printf(
+                "[SETTINGS] ERROR: failed creating download folder: %v\n",
+                mkdir_err,
+            )
+            return false
+        }
+    }
+
+    return os.is_directory(path)
+}
+
+
+SaveSettings :: proc(app: ^App) -> bool {
+    if app == nil || len(app.rd_key) == 0 || len(app.download_path) == 0 {
+        return false
+    }
+
+    settings_size := 16 + len(app.rd_key) + len(app.download_path)
+    settings_data, alloc_err := make(
+        []byte,
+        settings_size,
+        context.allocator,
+    )
+
+    if alloc_err != nil {
+        fmt.printf(
+            "[SETTINGS] ERROR: could not allocate settings buffer: %v\n",
+            alloc_err,
+        )
+        return false
+    }
+    defer delete(settings_data)
+
+    settings_data[0] = 'F'
+    settings_data[1] = 'D'
+    settings_data[2] = 'S'
+    settings_data[3] = '1'
+
+    endian.put_u32(
+        settings_data[4:8],
+        .Little,
+        SETTINGS_VERSION,
+    )
+    endian.put_u32(
+        settings_data[8:12],
+        .Little,
+        u32(len(app.rd_key)),
+    )
+    endian.put_u32(
+        settings_data[12:16],
+        .Little,
+        u32(len(app.download_path)),
+    )
+
+    offset := 16
+    copy(
+        settings_data[offset:offset+len(app.rd_key)],
+        transmute([]byte)app.rd_key,
+    )
+    offset += len(app.rd_key)
+    copy(
+        settings_data[offset:offset+len(app.download_path)],
+        transmute([]byte)app.download_path,
+    )
+
+    write_err := os.write_entire_file(
+        SETTINGS_FILE,
+        settings_data,
+    )
+
+    if write_err != nil {
+        fmt.printf(
+            "[SETTINGS] ERROR: failed writing %s: %v\n",
+            SETTINGS_FILE,
+            write_err,
+        )
+        return false
+    }
+
+    fmt.printf(
+        "[SETTINGS] Saved version %d to %s\n",
+        SETTINGS_VERSION,
+        SETTINGS_FILE,
+    )
+    return true
+}
+
+
+LoadSettings :: proc(app: ^App) -> bool {
+    if app == nil {
+        return false
+    }
+
+    settings_data, read_err := os.read_entire_file_from_path(
+        SETTINGS_FILE,
+        context.allocator,
+    )
+
+    if read_err != nil {
+        return false
+    }
+    defer delete(settings_data)
+
+    if len(settings_data) < 16 {
+        fmt.printf(
+            "[SETTINGS] Ignoring truncated %s\n",
+            SETTINGS_FILE,
+        )
+        return false
+    }
+
+    if string(settings_data[0:4]) != "FDS1" {
+        fmt.printf(
+            "[SETTINGS] Ignoring %s with an invalid header\n",
+            SETTINGS_FILE,
+        )
+        return false
+    }
+
+    version, version_ok := endian.get_u32(
+        settings_data[4:8],
+        .Little,
+    )
+    if !version_ok || version != SETTINGS_VERSION {
+        fmt.printf(
+            "[SETTINGS] Unsupported settings version %d (expected %d)\n",
+            version,
+            SETTINGS_VERSION,
+        )
+        return false
+    }
+
+    key_len_u32, key_len_ok := endian.get_u32(
+        settings_data[8:12],
+        .Little,
+    )
+    path_len_u32, path_len_ok := endian.get_u32(
+        settings_data[12:16],
+        .Little,
+    )
+
+    payload_len := len(settings_data) - 16
+    if !key_len_ok || !path_len_ok ||
+       u64(key_len_u32) + u64(path_len_u32) > u64(payload_len) {
+        fmt.printf(
+            "[SETTINGS] Ignoring %s with invalid string lengths\n",
+            SETTINGS_FILE,
+        )
+        return false
+    }
+
+    key_len := int(key_len_u32)
+    path_len := int(path_len_u32)
+    key_start := 16
+    path_start := key_start + key_len
+
+    loaded_key := strings.clone(
+        string(settings_data[key_start:path_start]),
+        context.allocator,
+    )
+    loaded_path := strings.clone(
+        string(settings_data[path_start:path_start+path_len]),
+        context.allocator,
+    )
+
+    if len(loaded_key) == 0 || len(loaded_path) == 0 {
+        delete(loaded_key)
+        delete(loaded_path)
+        fmt.printf(
+            "[SETTINGS] Ignoring %s with missing required values\n",
+            SETTINGS_FILE,
+        )
+        return false
+    }
+
+    if !EnsureDownloadDirectory(loaded_path) {
+        delete(loaded_key)
+        delete(loaded_path)
+        fmt.printf(
+            "[SETTINGS] Ignoring %s with unusable download folder\n",
+            SETTINGS_FILE,
+        )
+        return false
+    }
+
+    if len(app.rd_key) > 0 {
+        delete(app.rd_key)
+    }
+    if len(app.download_path) > 0 {
+        delete(app.download_path)
+    }
+
+    app.rd_key = loaded_key
+    app.download_path = loaded_path
+
+    fmt.printf(
+        "[SETTINGS] Loaded version %d from %s\n",
+        version,
+        SETTINGS_FILE,
+    )
+    return true
 }
 
 
@@ -1656,7 +1888,7 @@ RenderSetupScreen :: proc(
 
             orui.label(
                 orui.id("setup_title"),
-                "Real-Debrid Configuration",
+                "FitDeck Configuration",
                 {
                     font_size = 24,
                     color = TEXT_PRIMARY,
@@ -1665,11 +1897,20 @@ RenderSetupScreen :: proc(
 
             orui.label(
                 orui.id("setup_desc"),
-                "Please provide your API token to unrestrict downloads automatically. You only need to do this once.",
+                "Provide your API token and choose the default folder for downloaded games. You only need to do this once.",
                 {
                     font_size = 14,
                     color = TEXT_MUTED,
                     overflow = .Wrap,
+                },
+            )
+
+            orui.label(
+                orui.id("api_key_label"),
+                "Real-Debrid API token",
+                {
+                    font_size = 12,
+                    color = TEXT_MUTED,
                 },
             )
 
@@ -1741,10 +1982,108 @@ RenderSetupScreen :: proc(
                 }
             }
 
-            if len(app.rd_key_input.buf) == 0 {
+            orui.label(
+                orui.id("download_path_label"),
+                "Default game download folder",
+                {
+                    font_size = 12,
+                    color = TEXT_MUTED,
+                },
+            )
+
+            {
+                orui.container(
+                    orui.id("download_path_row"),
+                    {
+                        layout = .Flex,
+                        direction = .LeftToRight,
+                        width = orui.grow(),
+                        height = orui.fixed(42),
+                        gap = 8,
+                    },
+                )
+
+                download_path_display := app.download_path
+                if len(download_path_display) == 0 {
+                    download_path_display = "No folder selected"
+                }
+
+                orui.label(
+                    orui.id("download_path_value"),
+                    download_path_display,
+                    {
+                        width = orui.grow(),
+                        height = orui.grow(),
+                        padding = orui.Edges{
+                            top = 0,
+                            right = 12,
+                            bottom = 0,
+                            left = 12,
+                        },
+                        background_color = LIST_BACKGROUND,
+                        border = orui.border(1),
+                        border_color = BORDER_COLOR,
+                        corner_radius = orui.corner(6),
+                        color = TEXT_PRIMARY,
+                        font_size = 14,
+                        overflow = .Wrap,
+                    },
+                )
+
+                if orui.button(
+                    orui.id("btn_choose_download_path"),
+                    "Choose Folder",
+                    {
+                        width = orui.fixed(132),
+                        height = orui.grow(),
+                        background_color = ROW_HOVER_BACKGROUND,
+                        color = TEXT_PRIMARY,
+                        corner_radius = orui.corner(6),
+                    },
+                ) {
+                    dialog_default_path := ""
+                    if os.is_directory(app.download_path) {
+                        dialog_default_path = app.download_path
+                    }
+
+                    dialog_default_cstr := strings.clone_to_cstring(
+                        dialog_default_path,
+                        context.temp_allocator,
+                    )
+                    selected_path_cstr := tinyfd.selectFolderDialog(
+                        "Select default game download folder",
+                        dialog_default_cstr,
+                    )
+
+                    if selected_path_cstr != nil {
+                        selected_path := strings.clone(
+                            string(selected_path_cstr),
+                            context.allocator,
+                        )
+
+                        if len(selected_path) > 0 {
+                            if len(app.download_path) > 0 {
+                                delete(app.download_path)
+                            }
+                            app.download_path = selected_path
+                            app.status_message =
+                                "Download folder selected."
+                        } else {
+                            delete(selected_path)
+                        }
+                    }
+                }
+            }
+
+            key_text := strings.to_string(app.rd_key_input)
+            download_path_text := strings.trim_space(app.download_path)
+            key_ready := len(strings.trim_space(key_text)) > 0
+            path_ready := len(download_path_text) > 0
+
+            if !key_ready || !path_ready {
                 orui.label(
                     orui.id("setup_warn"),
-                    "API Key is required to continue.",
+                    "API key and download folder are required to continue.",
                     {
                         font_size = 12,
                         color = STATUS_ERR,
@@ -1762,34 +2101,48 @@ RenderSetupScreen :: proc(
                         corner_radius = orui.corner(6),
                     },
                 ) {
+                    key_text = strings.trim_space(key_text)
+                    download_path_text = strings.trim_space(download_path_text)
+
+                    if len(key_text) == 0 || len(download_path_text) == 0 {
+                        app.status_message =
+                            "API key and download folder are required."
+                        return
+                    }
+
+                    if !EnsureDownloadDirectory(download_path_text) {
+                        app.status_message =
+                            "Warning: Download path is not a usable folder."
+                        return
+                    }
+
+                    normalized_download_path := strings.clone(
+                        download_path_text,
+                        context.allocator,
+                    )
+
                     if len(app.rd_key) > 0 {
                         delete(app.rd_key)
                     }
+                    if len(app.download_path) > 0 {
+                        delete(app.download_path)
+                    }
 
                     app.rd_key = strings.clone(
-                        strings.to_string(
-                            app.rd_key_input,
-                        ),
+                        key_text,
+                        context.allocator,
                     )
+                    app.download_path = normalized_download_path
 
-                    write_err := os.write_entire_file(
-                        "rd_key.txt",
-                        app.rd_key_input.buf[:],
-                    )
-
-                    if write_err != nil {
-                        fmt.printf(
-                            "[UI] WARNING: Failed writing rd_key.txt: %v\n",
-                            write_err,
-                        )
-
+                    if !SaveSettings(app) {
                         app.status_message =
-                            "Warning: API key could not be saved."
-                    } else {
-                        fmt.println(
-                            "[UI] API key saved to disk",
-                        )
+                            "Warning: Settings could not be saved."
+                        return
                     }
+
+                    fmt.println(
+                        "[UI] Settings saved to disk",
+                    )
 
                     if len(app.games) > 0 {
                         fmt.println(
@@ -2502,38 +2855,29 @@ main :: proc() {
 
 
     // -----------------------------------------------------
-    // API Key
+    // Settings
     //
     // Loader starts only after curl, raylib and ORUI have
-    // all been initialized.
+    // all been initialized. A missing or incompatible settings
+    // file deliberately returns to setup so new settings can
+    // be collected before the first catalog sync.
     // -----------------------------------------------------
 
-    fmt.println(
-        "[BOOT] Checking rd_key.txt...",
+    fmt.printf(
+        "[BOOT] Checking %s (version %d)...\n",
+        SETTINGS_FILE,
+        SETTINGS_VERSION,
     )
 
-    key_data, key_err :=
-        os.read_entire_file_from_path(
-            "rd_key.txt",
-            context.allocator,
-        )
-
-    if key_err == nil {
-        fmt.printf(
-            "[BOOT] Existing API key found, bytes=%d\n",
-            len(key_data),
-        )
-
-        app.rd_key = strings.clone(
-            string(key_data),
-        )
-
+    if LoadSettings(&app) {
         strings.write_string(
             &app.rd_key_input,
             app.rd_key,
         )
-
-        delete(key_data)
+        fmt.printf(
+            "[BOOT] Existing settings found; download folder=%s\n",
+            app.download_path,
+        )
 
         app.screen = .Loading
         app.load_status =
@@ -2541,8 +2885,13 @@ main :: proc() {
 
         StartLoader(&app)
     } else {
+        if len(app.download_path) > 0 {
+            delete(app.download_path)
+            app.download_path = ""
+        }
+
         fmt.println(
-            "[BOOT] No API key found. Launching setup screen.",
+            "[BOOT] Settings unavailable. Launching setup screen.",
         )
 
         app.screen = .SetupKey
@@ -2674,6 +3023,15 @@ main :: proc() {
 
         delete(app.rd_key)
         app.rd_key = ""
+    }
+
+    if len(app.download_path) > 0 {
+        fmt.println(
+            "[SHUTDOWN] Releasing download path memory",
+        )
+
+        delete(app.download_path)
+        app.download_path = ""
     }
 
     fmt.println(
