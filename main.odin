@@ -2616,6 +2616,25 @@ RenderLibraryScreen :: proc(
                 }
 
                 orui.end_virtual_list()
+
+                orui.scrollbar(
+                    orui.id("releases"),
+                    {
+                        position = {.Absolute, {-5, 0}},
+                        placement = orui.placement(.Right, .Right),
+                        width = orui.fixed(theme.metrics.scrollbar_width),
+                        height = orui.grow(),
+                        margin = orui.margin(2, 18),
+                        background_color = HEADER_BACKGROUND,
+                        corner_radius = orui.corner(4),
+                    },
+                    {
+                        direction = .TopToBottom,
+                        width = orui.percent(1),
+                        background_color = ACCENT_COLOR,
+                        corner_radius = orui.corner(4),
+                    },
+                )
             }
 
 
