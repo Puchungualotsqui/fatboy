@@ -6,6 +6,7 @@ import "core:testing"
 @(test)
 format_detection_and_rejection_test :: proc(t: ^testing.T) {
 	testing.expect_value(t, Detect([]byte{'R', 'a', 'r', '!', 0x1a, 0x07, 0x00}), Format.RAR4)
+	testing.expect_value(t, Detect([]byte{'R', 'a', 'r', '!', 0x1a, 0x07, 0x01, 0x00}), Format.RAR5)
 	testing.expect_value(t, Detect([]byte{0x50, 0x4b, 0x03, 0x04}), Format.ZIP)
 	testing.expect_value(t, Detect([]byte{'n', 'o', 't', ' ', 'a', 'r', 'c', 'h'}), Format.Unknown)
 	_, err := Open_Bytes([]byte{'n', 'o', 't', ' ', 'a', 'n', ' ', 'a', 'r', 'c', 'h', 'i', 'v', 'e'})
@@ -138,6 +139,26 @@ rar4_corpus_compressed_test :: proc(t: ^testing.T) {
 		}
 		Destroy_Archive(&archive)
 	}
+}
+
+@(test)
+rar5_stored_test :: proc(t: ^testing.T) {
+	payload := []byte{'r', 'a', 'r', '5', ' ', 'p', 'a', 'y', 'l', 'o', 'a', 'd'}
+	archive_data := make_test_rar5("rar5.txt", payload)
+	defer delete(archive_data)
+
+	archive, err := Open_Bytes(archive_data)
+	testing.expect_value(t, err, Error.None)
+	defer Destroy_Archive(&archive)
+	testing.expect_value(t, archive.Format, Format.RAR5)
+	entry, entry_err := Next(&archive)
+	testing.expect_value(t, entry_err, Error.None)
+	testing.expect_value(t, entry.Name, "rar5.txt")
+	testing.expect_value(t, entry.Size, u64(len(payload)))
+	output, output_err := Extract_Current(&archive)
+	testing.expect_value(t, output_err, Error.None)
+	defer delete(output)
+	testing.expect(t, bytes_equal_orar(output, payload))
 }
 
 @(test)
@@ -346,5 +367,66 @@ make_test_rar :: proc(name: string, payload: []byte) -> []byte {
 	result[end_start+2] = RAR_TYPE_END_HEADER
 	set_u16le_test(result[:], end_start+5, 7)
 	set_u16le_test(result[:], end_start, u16(crc32(0, result[end_start+2:end_start+7])&0xffff))
+	return result[:]
+}
+
+append_vint_test :: proc(data: ^[dynamic]byte, value: u64) {
+	remaining := value
+	for {
+		part := byte(remaining & 0x7f)
+		remaining >>= 7
+		if remaining != 0 {
+			part |= 0x80
+		}
+		append(data, part)
+		if remaining == 0 {
+			break
+		}
+	}
+}
+
+append_rar5_header_test :: proc(result: ^[dynamic]byte, body: []byte, payload: []byte) {
+	tail: [dynamic]byte
+	append_vint_test(&tail, u64(len(body)))
+	append(&tail, ..body)
+	append_u32le_test(result, crc32(0, tail[:]))
+	append(result, ..tail[:])
+	append(result, ..payload)
+	delete(tail)
+}
+
+make_test_rar5 :: proc(name: string, payload: []byte) -> []byte {
+	result: [dynamic]byte
+	append(&result, ..[]byte{'R', 'a', 'r', '!', 0x1a, 0x07, 0x01, 0x00})
+
+	main_body: [dynamic]byte
+	append_vint_test(&main_body, RAR5_TYPE_MAIN)
+	append_vint_test(&main_body, 0)
+	append_vint_test(&main_body, 0)
+	append_rar5_header_test(&result, main_body[:], nil)
+	delete(main_body)
+
+	file_body: [dynamic]byte
+	name_bytes := transmute([]byte)name
+	append_vint_test(&file_body, RAR5_TYPE_FILE)
+	append_vint_test(&file_body, RAR5_HEADER_DATA)
+	append_vint_test(&file_body, u64(len(payload)))
+	append_vint_test(&file_body, 1 << 2)
+	append_vint_test(&file_body, u64(len(payload)))
+	append_vint_test(&file_body, 0)
+	append_u32le_test(&file_body, crc32(0, payload))
+	append_vint_test(&file_body, 0)
+	append_vint_test(&file_body, 0)
+	append_vint_test(&file_body, u64(len(name_bytes)))
+	append(&file_body, ..name_bytes)
+	append_rar5_header_test(&result, file_body[:], payload)
+	delete(file_body)
+
+	end_body: [dynamic]byte
+	append_vint_test(&end_body, RAR5_TYPE_END)
+	append_vint_test(&end_body, 0)
+	append_vint_test(&end_body, 0)
+	append_rar5_header_test(&result, end_body[:], nil)
+	delete(end_body)
 	return result[:]
 }

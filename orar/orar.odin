@@ -7,6 +7,7 @@ import "core:strings"
 Format :: enum {
 	Unknown,
 	RAR4,
+	RAR5,
 	ZIP,
 	TAR,
 }
@@ -79,6 +80,9 @@ Detect :: proc(data: []byte) -> Format {
 		data[4] == 0x1a && data[5] == 0x07 {
 		if data[6] == 0x00 {
 			return .RAR4
+		}
+		if len(data) >= 8 && data[6] == 0x01 && data[7] == 0x00 {
+			return .RAR5
 		}
 		return .Unknown
 	}
@@ -359,6 +363,8 @@ Format_Name :: proc(format: Format) -> string {
 	switch format {
 	case .RAR4:
 		return "RAR4"
+	case .RAR5:
+		return "RAR5"
 	case .ZIP:
 		return "ZIP"
 	case .TAR:
@@ -376,6 +382,12 @@ parse_archive :: proc(archive: ^Archive) -> Error {
 		err := parse_rar(archive)
 		if err == .None {
 			archive.Format = .RAR4
+		}
+		return err
+	case .RAR5:
+		err := parse_rar5(archive)
+		if err == .None {
+			archive.Format = .RAR5
 		}
 		return err
 	case .ZIP:
@@ -401,6 +413,8 @@ decode_entry :: proc(archive: ^Archive, index: int) -> ([]byte, Error) {
 	switch archive.Format {
 	case .RAR4:
 		return decode_rar_entry(archive, index)
+	case .RAR5:
+		return decode_rar5_entry(archive, index)
 	case .ZIP:
 		return decode_zip_entry(archive, index)
 	case .TAR:

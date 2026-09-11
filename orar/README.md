@@ -10,9 +10,12 @@ of the checked-in `unarr` reference implementation.
 ## Supported formats
 
 - **RAR4**: stored entries and RAR v2/v3 Huffman + LZSS entries, including
-  solid archives. RAR5, encrypted/password-protected archives, split volumes,
-  PPMd entries, audio blocks, and RAR virtual-machine filters return
-  `Error.Unsupported_Feature`.
+  solid archives.
+- **RAR5**: version-0 stored and Huffman/LZ entries, including solid
+  dictionary replay, UTF-8 names, header/data CRC validation, and optional
+  per-file CRC validation. Encrypted/password-protected archives, split
+  volumes, unknown unpacked sizes, filters, and unsupported service streams
+  return `Error.Unsupported_Feature`.
 - **TAR**: traditional and ustar headers, GNU long names, and PAX `path`,
   `size`, and `mtime` records.
 - **ZIP**: stored and raw Deflate entries, ZIP64 metadata, UTF-8 and CP437
@@ -88,7 +91,7 @@ odin check orar -no-entry-point
 odin test orar -debug
 ```
 
-The tests construct RAR4, TAR, ZIP-store, and ZIP-Deflate archives in memory.
+The tests construct RAR4, RAR5-store, TAR, ZIP-store, and ZIP-Deflate archives in memory.
 When the checked-in unarr corpus is available, they additionally exercise the
 real TAR, ZIP, and compressed RAR4 files.
 
