@@ -361,20 +361,114 @@ RenderLibraryScreen :: proc(
                                 }
                             }
 
-                            orui.label(
-                                orui.id(
-                                    fmt.tprintf(
-                                        "title_%d",
-                                        index,
+                            {
+                                orui.container(
+                                    orui.id(
+                                        fmt.tprintf(
+                                            "text_wrap_%d",
+                                            index,
+                                        ),
                                     ),
-                                ),
-                                game.title,
-                                {
-                                    font_size = 18,
-                                    color = titleColor,
-                                    disabled = .True,
-                                },
-                            )
+                                    {
+                                        layout = .Flex,
+                                        direction = .TopToBottom,
+                                        height = orui.fit(),
+                                        gap = 4,
+                                    },
+                                )
+
+                                orui.label(
+                                    orui.id(
+                                        fmt.tprintf(
+                                            "title_%d",
+                                            index,
+                                        ),
+                                    ),
+                                    game.title,
+                                    {
+                                        font_size = 18,
+                                        color = titleColor,
+                                        disabled = .True,
+                                    },
+                                )
+
+                                if download_snapshot.found &&
+                                   download_snapshot.state == .Downloading {
+                                    active_file_name := DownloadFileNameForGame(
+                                        &app.download_manager,
+                                        index,
+                                    )
+                                    progress_label := fmt.tprintf(
+                                        "Downloading %s  %d%%  %d/%d MiB",
+                                        len(active_file_name) > 0 ? active_file_name : "file",
+                                        int(download_snapshot.progress * 100),
+                                        download_snapshot.bytes_downloaded / (1024 * 1024),
+                                        download_snapshot.bytes_total / (1024 * 1024),
+                                    )
+                                    orui.label(
+                                        orui.id(
+                                            fmt.tprintf(
+                                                "progress_%d",
+                                                index,
+                                            ),
+                                        ),
+                                        progress_label,
+                                        {
+                                            font_size = 12,
+                                            color = STATUS_OK,
+                                            disabled = .True,
+                                        },
+                                    )
+                                } else if download_snapshot.found &&
+                                          download_snapshot.state == .Resolving {
+                                    orui.label(
+                                        orui.id(
+                                            fmt.tprintf(
+                                                "progress_%d",
+                                                index,
+                                            ),
+                                        ),
+                                        "Preparing Real-Debrid torrent...",
+                                        {
+                                            font_size = 12,
+                                            color = TEXT_MUTED,
+                                            disabled = .True,
+                                        },
+                                    )
+                                } else if download_snapshot.found &&
+                                          download_snapshot.state == .Extracting {
+                                    orui.label(
+                                        orui.id(
+                                            fmt.tprintf(
+                                                "progress_%d",
+                                                index,
+                                            ),
+                                        ),
+                                        "Extracting archive and launching installer...",
+                                        {
+                                            font_size = 12,
+                                            color = TEXT_MUTED,
+                                            disabled = .True,
+                                        },
+                                    )
+                                } else if download_snapshot.found &&
+                                          download_snapshot.state == .Installing {
+                                    orui.label(
+                                        orui.id(
+                                            fmt.tprintf(
+                                                "progress_%d",
+                                                index,
+                                            ),
+                                        ),
+                                        "Installer launched; follow its instructions.",
+                                        {
+                                            font_size = 12,
+                                            color = STATUS_OK,
+                                            disabled = .True,
+                                        },
+                                    )
+                                }
+                            }
                         }
 
                         {
@@ -436,15 +530,44 @@ RenderLibraryScreen :: proc(
                                 )
                             }
 
+                            can_pause :=
+                                download_snapshot.found &&
+                                (download_snapshot.state == .Resolving ||
+                                 download_snapshot.state == .Downloading ||
+                                 download_snapshot.state == .Extracting ||
+                                 download_snapshot.state == .Installing)
                             can_cancel :=
                                 download_snapshot.found &&
                                 (download_snapshot.state == .Queued ||
                                  download_snapshot.state == .Resolving ||
-                                 download_snapshot.state == .Downloading)
+                                 download_snapshot.state == .Downloading ||
+                                 download_snapshot.state == .Extracting ||
+                                 download_snapshot.state == .Installing)
                             can_queue :=
                                 !download_snapshot.found ||
                                 download_snapshot.state == .Cancelled ||
+                                download_snapshot.state == .Paused ||
                                 download_snapshot.state == .Failed
+
+                            if can_pause {
+                                if orui.button(
+                                    orui.id(
+                                        fmt.tprintf("pause_download_%d", index),
+                                    ),
+                                    "Pause",
+                                    {
+                                        width = orui.fixed(72),
+                                        height = orui.fixed(28),
+                                        background_color = ROW_HOVER_BACKGROUND,
+                                        color = TEXT_PRIMARY,
+                                        corner_radius = orui.corner(5),
+                                    },
+                                ) {
+                                    if DownloadPauseGame(&app.download_manager, index) {
+                                        app.status_message = "Pause requested. Partial data will be preserved."
+                                    }
+                                }
+                            }
 
                             if can_cancel {
                                 if orui.button(
@@ -472,6 +595,7 @@ RenderLibraryScreen :: proc(
                                     }
                                 }
                             } else if can_queue {
+                                queue_label := download_snapshot.state == .Paused ? "Resume" : "Download"
                                 if orui.button(
                                     orui.id(
                                         fmt.tprintf(
@@ -479,7 +603,7 @@ RenderLibraryScreen :: proc(
                                             index,
                                         ),
                                     ),
-                                    "Download",
+                                    queue_label,
                                     {
                                         width = orui.fixed(84),
                                         height = orui.fixed(28),

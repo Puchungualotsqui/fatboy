@@ -19,8 +19,11 @@ DownloadState :: enum {
     Queued,
     Resolving,
     Downloading,
+    Extracting,
+    Installing,
     Completed,
     Cancelled,
+    Paused,
     Failed,
 }
 
@@ -32,6 +35,7 @@ DownloadEntry :: struct {
     rd_torrent_id: string,
     output_path:   string,
     part_path:     string,
+    archive_path:  string,
 
     state:            DownloadState,
     progress:         f64,
@@ -40,6 +44,7 @@ DownloadEntry :: struct {
     error_message:    string,
 
     cancel_requested: bool,
+    pause_requested:  bool,
 }
 
 
@@ -108,6 +113,7 @@ DownloadManagerShutdown :: proc(manager: ^DownloadManager) {
         delete(entry.rd_torrent_id)
         delete(entry.output_path)
         delete(entry.part_path)
+        delete(entry.archive_path)
         delete(entry.error_message)
     }
     delete(manager.entries)
@@ -157,9 +163,9 @@ DownloadQueueGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
         }
 
         switch entry.state {
-        case .Queued, .Resolving, .Downloading, .Completed:
+        case .Queued, .Resolving, .Downloading, .Extracting, .Installing, .Completed:
             return false
-        case .Cancelled, .Failed, .NotDownloaded:
+        case .Cancelled, .Paused, .Failed, .NotDownloaded:
             delete(entry.error_message)
             entry.error_message = ""
             entry.state = .Queued
@@ -167,6 +173,7 @@ DownloadQueueGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
             entry.bytes_downloaded = 0
             entry.bytes_total = 0
             entry.cancel_requested = false
+            entry.pause_requested = false
             return true
         }
     }
@@ -198,15 +205,53 @@ DownloadCancelGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
             entry.state = .Cancelled
             entry.cancel_requested = true
             return true
-        case .Resolving, .Downloading:
+        case .Resolving, .Downloading, .Extracting, .Installing:
             entry.cancel_requested = true
+            entry.pause_requested = false
             return true
-        case .NotDownloaded, .Completed, .Cancelled, .Failed:
+        case .NotDownloaded, .Completed, .Cancelled, .Paused, .Failed:
             return false
         }
     }
 
     return false
+}
+
+
+DownloadPauseGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
+    if manager == nil {
+        return false
+    }
+
+    sync.mutex_lock(&manager.mutex)
+    defer sync.mutex_unlock(&manager.mutex)
+    for &entry in manager.entries {
+        if entry.game_index != game_index {
+            continue
+        }
+        if entry.state == .Resolving ||
+           entry.state == .Downloading ||
+           entry.state == .Extracting ||
+           entry.state == .Installing {
+            entry.pause_requested = true
+            entry.cancel_requested = false
+            return true
+        }
+    }
+    return false
+}
+
+
+download_should_pause :: proc(manager: ^DownloadManager, entry_index: int) -> bool {
+    if manager == nil {
+        return false
+    }
+    sync.mutex_lock(&manager.mutex)
+    defer sync.mutex_unlock(&manager.mutex)
+    if entry_index < 0 || entry_index >= len(manager.entries) {
+        return false
+    }
+    return manager.entries[entry_index].pause_requested
 }
 
 
@@ -238,6 +283,16 @@ DownloadSnapshotForGame :: proc(manager: ^DownloadManager, game_index: int) -> D
     }
     sync.mutex_unlock(&manager.mutex)
 
+    phase, manifest_archive, manifest_torrent := download_read_manifest_for_game(manager, game_index)
+    defer delete(phase)
+    defer delete(manifest_archive)
+    defer delete(manifest_torrent)
+    if len(phase) > 0 && phase != "completed" {
+        result.found = true
+        result.state = .Paused
+        return result
+    }
+
     // Completion markers make the catalog state survive application restarts.
     if game_index >= 0 && game_index < len(manager.app.games) {
         marker_path := download_marker_path(manager.app.download_path, info_hash)
@@ -254,6 +309,69 @@ DownloadSnapshotForGame :: proc(manager: ^DownloadManager, game_index: int) -> D
 }
 
 
+DownloadOutputPathForGame :: proc(manager: ^DownloadManager, game_index: int) -> string {
+    if manager == nil {
+        return ""
+    }
+
+    sync.mutex_lock(&manager.mutex)
+    for entry in manager.entries {
+        if entry.game_index == game_index {
+            if len(entry.archive_path) > 0 {
+                result := strings.clone(entry.archive_path, context.allocator)
+                sync.mutex_unlock(&manager.mutex)
+                return result
+            }
+            if len(entry.output_path) > 0 {
+                result := strings.clone(entry.output_path, context.allocator)
+                sync.mutex_unlock(&manager.mutex)
+                return result
+            }
+        }
+    }
+    sync.mutex_unlock(&manager.mutex)
+
+    app := manager.app
+    if app == nil || game_index < 0 || game_index >= len(app.games) {
+        return ""
+    }
+
+    info_hash := download_info_hash(app.games[game_index].magnetLink)
+    defer delete(info_hash)
+    marker_path := download_marker_path(app.download_path, info_hash)
+    defer delete(marker_path)
+    marker_data, read_err := os.read_entire_file_from_path(
+        marker_path,
+        context.allocator,
+    )
+    if read_err != nil || len(marker_data) == 0 {
+        delete(marker_data)
+        return ""
+    }
+    result := strings.clone(string(marker_data[:]), context.allocator)
+    delete(marker_data)
+    return result
+}
+
+
+DownloadFileNameForGame :: proc(manager: ^DownloadManager, game_index: int) -> string {
+    path := DownloadOutputPathForGame(manager, game_index)
+    defer delete(path)
+    if len(path) == 0 {
+        return ""
+    }
+
+    name := path
+    if slash := strings.last_index(name, "/"); slash >= 0 {
+        name = name[slash+1:]
+    }
+    if slash := strings.last_index(name, "\\"); slash >= 0 {
+        name = name[slash+1:]
+    }
+    return strings.clone(name, context.temp_allocator)
+}
+
+
 DownloadManagerHasActiveWork :: proc(manager: ^DownloadManager) -> bool {
     if manager == nil {
         return false
@@ -265,7 +383,9 @@ DownloadManagerHasActiveWork :: proc(manager: ^DownloadManager) -> bool {
     for entry in manager.entries {
         if entry.state == .Queued ||
            entry.state == .Resolving ||
-           entry.state == .Downloading {
+           entry.state == .Downloading ||
+           entry.state == .Extracting ||
+           entry.state == .Installing {
             return true
         }
     }
@@ -279,8 +399,11 @@ DownloadStateText :: proc(state: DownloadState) -> string {
     case .Queued:        return "QUEUED"
     case .Resolving:     return "PREPARING"
     case .Downloading:   return "DOWNLOADING"
+    case .Extracting:    return "EXTRACTING"
+    case .Installing:    return "INSTALLING"
     case .Completed:     return "DOWNLOADED"
     case .Cancelled:     return "CANCELLED"
+    case .Paused:        return "RESUME"
     case .Failed:        return "RETRY"
     }
     return "DOWNLOAD"
@@ -292,6 +415,10 @@ DownloadStateText :: proc(state: DownloadState) -> string {
 // ---------------------------------------------------------
 
 download_manager_proc :: proc(t: ^thread.Thread) {
+    // Worker threads do not inherit a valid Odin context. Initialize it
+    // before building strings or making Real-Debrid requests.
+    context = runtime.default_context()
+
     if t == nil {
         return
     }
@@ -323,6 +450,92 @@ download_manager_proc :: proc(t: ^thread.Thread) {
         } else {
             time.sleep(250 * time.Millisecond)
         }
+    }
+}
+
+
+download_resume_archive_entry :: proc(
+    manager: ^DownloadManager,
+    entry_index: int,
+    archive_path, torrent_id, phase: string,
+    client: ^RealDebridClient,
+) {
+    if !os.exists(archive_path) {
+        download_fail_entry(manager, entry_index, "Saved archive is missing; download it again.")
+        return
+    }
+
+    if phase == "installing" {
+        download_set_state(manager, entry_index, .Paused)
+        download_write_manifest(manager, entry_index, "paused", "Installer may still be running; it was not relaunched.")
+        return
+    }
+
+    if phase != "installing" {
+        download_set_state(manager, entry_index, .Extracting)
+        download_write_manifest(manager, entry_index, "extracting", "")
+        extracted, extraction_message := ExtractDownloadArchiveAndWait(
+            manager,
+            entry_index,
+            archive_path,
+        )
+        if !extracted {
+            if download_should_pause(manager, entry_index) {
+                download_pause_entry(manager, entry_index, nil)
+            } else if download_should_cancel(manager, entry_index) {
+                download_cancel_entry(manager, entry_index, nil)
+            } else {
+                download_fail_entry(manager, entry_index, extraction_message)
+            }
+            delete(extraction_message)
+            return
+        }
+        delete(extraction_message)
+    }
+
+    download_set_state(manager, entry_index, .Installing)
+    download_write_manifest(manager, entry_index, "installing", "")
+    launched, install_message := LaunchDownloadInstaller(
+        manager,
+        entry_index,
+        archive_path,
+    )
+    if !launched {
+        if download_should_pause(manager, entry_index) {
+            download_pause_entry(manager, entry_index, client)
+        } else if download_should_cancel(manager, entry_index) {
+            download_cancel_entry(manager, entry_index, client)
+        } else {
+            download_fail_entry(manager, entry_index, install_message)
+        }
+        delete(install_message)
+        return
+    }
+    delete(install_message)
+
+    sync.mutex_lock(&manager.mutex)
+    resume_info_hash := strings.clone(manager.entries[entry_index].info_hash, context.allocator)
+    resume_directory := strings.clone(manager.app.download_path, context.allocator)
+    sync.mutex_unlock(&manager.mutex)
+    defer delete(resume_info_hash)
+    defer delete(resume_directory)
+    marker_path := download_marker_path(resume_directory, resume_info_hash)
+    marked, marker_error := download_mark_entry_complete(
+        manager,
+        entry_index,
+        marker_path,
+        archive_path,
+        0,
+    )
+    delete(marker_path)
+    if !marked {
+        download_fail_entry(manager, entry_index, marker_error)
+        delete(marker_error)
+        return
+    }
+    delete(marker_error)
+    if client != nil && len(torrent_id) > 0 {
+        download_delete_remote_torrent(client, torrent_id)
     }
 }
 
@@ -375,12 +588,36 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
         return
     }
 
+    resume_phase, resume_archive, resume_torrent := download_read_manifest_for_game(manager, game_index)
+    defer delete(resume_phase)
+    defer delete(resume_archive)
+    defer delete(resume_torrent)
+    if (resume_phase == "archive_ready" ||
+        resume_phase == "extracting" ||
+        resume_phase == "installing") &&
+       len(resume_archive) > 0 && os.exists(resume_archive) {
+        client := NewRealDebridClient(token)
+        if len(resume_torrent) > 0 {
+            download_set_torrent_id(manager, entry_index, resume_torrent)
+        }
+        download_resume_archive_entry(
+            manager,
+            entry_index,
+            resume_archive,
+            resume_torrent,
+            resume_phase,
+            &client,
+        )
+        return
+    }
+
     if download_should_cancel(manager, entry_index) {
         download_cancel_entry(manager, entry_index, nil)
         return
     }
 
     download_set_state(manager, entry_index, .Resolving)
+    download_write_manifest(manager, entry_index, "resolving", "")
 
     if !EnsureDownloadDirectory(app.download_path) {
         download_fail_entry(manager, entry_index, "Download folder is not usable.")
@@ -405,6 +642,7 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
         return
     }
     defer delete(torrent_id)
+    download_write_manifest(manager, entry_index, "remote_downloading", "")
 
     if download_should_cancel(manager, entry_index) {
         download_cancel_entry(manager, entry_index, &client)
@@ -443,44 +681,12 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
                 )
             }
 
-            if len(conversion_info.files) > 0 {
-                largest_file := 0
-                for file, file_index in conversion_info.files {
-                    if file.bytes > conversion_info.files[largest_file].bytes {
-                        largest_file = file_index
-                    }
-                }
-                selected_files = fmt.aprintf(
-                    "%d",
-                    conversion_info.files[largest_file].id,
-                )
-                fmt.printf(
-                    "[DOWNLOAD] Selecting largest torrent file id=%d bytes=%d\n",
-                    conversion_info.files[largest_file].id,
-                    conversion_info.files[largest_file].bytes,
-                )
-            }
+            fmt.println("[DOWNLOAD] Selecting all torrent files")
         }
         DestroyRealDebridTorrentInfo(&conversion_info)
 
         if conversion_status == "waiting_files_selection" {
             rd_err = RDSelectTorrentFiles(&client, torrent_id, selected_files)
-            selection_rejected :=
-                rd_err.http_status == 404 ||
-                rd_err.api_code == 1 ||
-                rd_err.api_code == 2
-            if rd_err.message != "" && selected_files != "all" && selection_rejected {
-                fmt.printf(
-                    "[DOWNLOAD] Single-file selection rejected HTTP=%d API=%d; retrying with all files\n",
-                    rd_err.http_status,
-                    rd_err.api_code,
-                )
-                DestroyRealDebridError(&rd_err)
-                rd_err = RDSelectTorrentFiles(&client, torrent_id, "all")
-            }
-            if selected_files != "all" {
-                delete(selected_files)
-            }
             if rd_err.message != "" {
                 download_fail_entry_from_rd(manager, entry_index, &rd_err)
                 download_delete_remote_torrent(&client, torrent_id)
@@ -513,6 +719,7 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
     }
 
     info: RealDebridTorrentInfo
+    poll_count := 0
     for {
         if download_should_cancel(manager, entry_index) {
             download_cancel_entry(manager, entry_index, &client)
@@ -532,6 +739,15 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
             info.progress,
             info.bytes,
         )
+        poll_count += 1
+        if poll_count == 1 || poll_count % 5 == 0 || info.status == "downloaded" {
+            fmt.printf(
+                "[DOWNLOAD] Torrent status=%s progress=%.1f%% bytes=%d\n",
+                info.status,
+                info.progress,
+                info.bytes,
+            )
+        }
 
         if info.status == "downloaded" {
             break
@@ -565,106 +781,232 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
         return
     }
 
-    // This first milestone deliberately downloads one selected file. The
-    // queue can later be extended to process every selected file in order.
-    direct, direct_err := RDUnrestrictLink(&client, info.links[0], "")
-    DestroyRealDebridTorrentInfo(&info)
-    if direct_err.message != "" {
-        download_fail_entry_from_rd(manager, entry_index, &direct_err)
-        download_delete_remote_torrent(&client, torrent_id)
-        return
-    }
-
-    filename := download_safe_filename(direct.filename)
-    filename_owned := true
-    if len(filename) == 0 {
-        delete(filename)
-        filename = download_safe_filename(app.games[game_index].title)
-    }
-    if len(filename) == 0 {
-        delete(filename)
-        filename = "release.download"
-        filename_owned = false
-    }
-    if filename_owned {
-        defer delete(filename)
-    }
-
-    expected_size := direct.filesize
-    output_path := fmt.aprintf("%s/%s", app.download_path, filename)
-    part_path := fmt.aprintf("%s.part", output_path)
     info_hash := download_info_hash(magnet)
     defer delete(info_hash)
     marker_path := download_marker_path(app.download_path, info_hash)
+    defer delete(marker_path)
 
-    download_set_paths(manager, entry_index, output_path, part_path)
-    download_set_progress(manager, entry_index, 0, 0, direct.filesize)
+    total_bytes := info.bytes
+    completed_bytes: i64 = 0
+    first_output_path := ""
 
-    download_url := strings.clone(direct.download, context.allocator)
-    DestroyRealDebridUnrestrictedLink(&direct)
+    for link, link_index in info.links {
+        if download_should_cancel(manager, entry_index) {
+            DestroyRealDebridTorrentInfo(&info)
+            delete(first_output_path)
+            download_cancel_entry(manager, entry_index, &client)
+            return
+        }
 
-    if len(download_url) == 0 {
-        delete(output_path)
-        delete(part_path)
-        delete(marker_path)
+        fmt.printf(
+            "[DOWNLOAD] Preparing file %d/%d\n",
+            link_index + 1,
+            len(info.links),
+        )
+        direct, direct_err := RDUnrestrictLink(&client, link, "")
+        if direct_err.message != "" {
+            DestroyRealDebridUnrestrictedLink(&direct)
+            DestroyRealDebridTorrentInfo(&info)
+            delete(first_output_path)
+            download_fail_entry_from_rd(manager, entry_index, &direct_err)
+            download_delete_remote_torrent(&client, torrent_id)
+            return
+        }
+
+        filename := download_safe_filename(direct.filename)
+        if len(filename) == 0 {
+            delete(filename)
+            filename = fmt.aprintf("release-file-%d.download", link_index + 1)
+        }
+        output_path := fmt.aprintf("%s/%s", app.download_path, filename)
+        part_path := fmt.aprintf("%s.part", output_path)
+        if len(first_output_path) == 0 {
+            first_output_path = strings.clone(output_path, context.allocator)
+            download_set_archive_path(manager, entry_index, output_path)
+        }
+
+        expected_size := direct.filesize
+        download_set_paths(manager, entry_index, output_path, part_path)
+        download_write_manifest(manager, entry_index, "local_downloading", "")
+        download_set_progress(
+            manager,
+            entry_index,
+            total_bytes > 0 ? f64(completed_bytes) / f64(total_bytes) : 0,
+            completed_bytes,
+            total_bytes,
+        )
+
+        download_url := strings.clone(direct.download, context.allocator)
+        DestroyRealDebridUnrestrictedLink(&direct)
+
+        if len(download_url) == 0 {
+            delete(filename)
+            delete(output_path)
+            delete(part_path)
+            delete(download_url)
+            DestroyRealDebridTorrentInfo(&info)
+            delete(first_output_path)
+            download_fail_entry(manager, entry_index, "Real-Debrid returned an empty download URL.")
+            download_delete_remote_torrent(&client, torrent_id)
+            return
+        }
+
+        fmt.printf(
+            "[DOWNLOAD] Downloading file %d/%d name=%s bytes=%d\n",
+            link_index + 1,
+            len(info.links),
+            filename,
+            expected_size,
+        )
+        completed, cancelled, transfer_error := download_file(
+            manager,
+            entry_index,
+            download_url,
+            part_path,
+            filename,
+            expected_size,
+        )
         delete(download_url)
-        download_fail_entry(manager, entry_index, "Real-Debrid returned an empty download URL.")
+
+        if cancelled {
+            delete(filename)
+            delete(output_path)
+            delete(part_path)
+            DestroyRealDebridTorrentInfo(&info)
+            delete(first_output_path)
+            if download_should_pause(manager, entry_index) {
+                download_pause_entry(manager, entry_index, &client)
+            } else {
+                download_cancel_entry(manager, entry_index, &client)
+            }
+            return
+        }
+
+        if !completed {
+            delete(filename)
+            delete(output_path)
+            delete(part_path)
+            DestroyRealDebridTorrentInfo(&info)
+            delete(first_output_path)
+            download_fail_entry(manager, entry_index, transfer_error)
+            download_delete_remote_torrent(&client, torrent_id)
+            return
+        }
+
+        finalized, finalize_cancelled, finalize_error := download_finalize_file(
+            manager,
+            entry_index,
+            part_path,
+            output_path,
+            marker_path,
+            expected_size,
+            false,
+        )
+        delete(filename)
+        delete(output_path)
+        delete(part_path)
+
+        if finalize_cancelled {
+            delete(finalize_error)
+            DestroyRealDebridTorrentInfo(&info)
+            delete(first_output_path)
+            download_cancel_entry(manager, entry_index, &client)
+            return
+        }
+
+        if !finalized {
+            DestroyRealDebridTorrentInfo(&info)
+            delete(first_output_path)
+            download_fail_entry(manager, entry_index, finalize_error)
+            delete(finalize_error)
+            download_delete_remote_torrent(&client, torrent_id)
+            return
+        }
+        delete(finalize_error)
+
+        completed_bytes += expected_size
+        download_set_progress(
+            manager,
+            entry_index,
+            total_bytes > 0 ? f64(completed_bytes) / f64(total_bytes) : 0,
+            completed_bytes,
+            total_bytes,
+        )
+    }
+
+    DestroyRealDebridTorrentInfo(&info)
+    if len(first_output_path) == 0 {
+        download_fail_entry(manager, entry_index, "Real-Debrid returned no file paths.")
         download_delete_remote_torrent(&client, torrent_id)
         return
     }
 
-    completed, cancelled, transfer_error := download_file(
-        manager,
-        entry_index,
-        download_url,
-        part_path,
-        direct.filesize,
-    )
-    delete(download_url)
+    if DownloadPathIsArchive(first_output_path) {
+        download_write_manifest(manager, entry_index, "archive_ready", "")
+        download_set_state(manager, entry_index, .Extracting)
+        download_write_manifest(manager, entry_index, "extracting", "")
+        extracted, extraction_message := ExtractDownloadArchiveAndWait(
+            manager,
+            entry_index,
+            first_output_path,
+        )
+        if !extracted {
+            if download_should_pause(manager, entry_index) {
+                download_pause_entry(manager, entry_index, &client)
+            } else if download_should_cancel(manager, entry_index) {
+                download_cancel_entry(manager, entry_index, &client)
+            } else {
+                download_fail_entry(manager, entry_index, extraction_message)
+                download_delete_remote_torrent(&client, torrent_id)
+            }
+            delete(extraction_message)
+            delete(first_output_path)
+            return
+        }
+        delete(extraction_message)
 
-    if cancelled {
-        delete(output_path)
-        delete(part_path)
-        delete(marker_path)
-        download_cancel_entry(manager, entry_index, &client)
-        return
+        download_set_state(manager, entry_index, .Installing)
+        download_write_manifest(manager, entry_index, "installing", "")
+        launched, install_message := LaunchDownloadInstaller(
+            manager,
+            entry_index,
+            first_output_path,
+        )
+        if !launched {
+            if download_should_pause(manager, entry_index) {
+                download_pause_entry(manager, entry_index, &client)
+            } else if download_should_cancel(manager, entry_index) {
+                download_cancel_entry(manager, entry_index, &client)
+            } else {
+                download_fail_entry(manager, entry_index, install_message)
+                download_delete_remote_torrent(&client, torrent_id)
+            }
+            delete(install_message)
+            delete(first_output_path)
+            return
+        }
+        fmt.printf("[DOWNLOAD] Installer launched for %s\n", first_output_path)
+        delete(install_message)
     }
 
-    if !completed {
-        delete(output_path)
-        delete(part_path)
-        delete(marker_path)
-        download_fail_entry(manager, entry_index, transfer_error)
-        download_delete_remote_torrent(&client, torrent_id)
-        return
-    }
-
-    finalized, finalize_cancelled, finalize_error := download_finalize_file(
+    marked, marker_error := download_mark_entry_complete(
         manager,
         entry_index,
-        part_path,
-        output_path,
         marker_path,
-        expected_size,
+        first_output_path,
+        completed_bytes,
     )
-    delete(output_path)
-    delete(part_path)
-    delete(marker_path)
-
-    if finalize_cancelled {
-        delete(finalize_error)
-        download_cancel_entry(manager, entry_index, &client)
-        return
+    if marked {
+        download_write_manifest(manager, entry_index, "completed", "")
     }
-
-    if !finalized {
-        download_fail_entry(manager, entry_index, finalize_error)
-        delete(finalize_error)
+    delete(first_output_path)
+    if !marked {
+        download_fail_entry(manager, entry_index, marker_error)
+        delete(marker_error)
         download_delete_remote_torrent(&client, torrent_id)
         return
     }
-
-    delete(finalize_error)
+    delete(marker_error)
     download_delete_remote_torrent(&client, torrent_id)
 }
 
@@ -674,9 +1016,14 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
 // ---------------------------------------------------------
 
 DownloadFileContext :: struct {
-    manager:     ^DownloadManager,
-    entry_index: int,
-    file:        ^os.File,
+    manager:              ^DownloadManager,
+    entry_index:          int,
+    file:                 ^os.File,
+    file_name:            string,
+    expected_size:        i64,
+    resume_offset:        i64,
+    last_logged_percent:  int,
+    progress_overflow:    bool,
 }
 
 
@@ -693,7 +1040,8 @@ download_file_write_callback :: proc "c" (
     }
 
     transfer := cast(^DownloadFileContext)user_data
-    if download_should_cancel(transfer.manager, transfer.entry_index) {
+    if download_should_cancel(transfer.manager, transfer.entry_index) ||
+       download_should_pause(transfer.manager, transfer.entry_index) {
         return 0
     }
 
@@ -721,36 +1069,110 @@ download_file_progress_callback :: proc "c" (
     }
 
     transfer := cast(^DownloadFileContext)user_data
-    if download_should_cancel(transfer.manager, transfer.entry_index) {
+    if download_should_cancel(transfer.manager, transfer.entry_index) ||
+       download_should_pause(transfer.manager, transfer.entry_index) {
         return 1
     }
 
+    // libcurl reports the size of the current HTTP response here. For a
+    // resumed request that is the remaining range, not the complete file.
+    // Prefer the API's file size so the progress denominator stays stable.
+    total := transfer.expected_size
+    if total <= 0 {
+        total = transfer.resume_offset + i64(download_total)
+    }
+    now := transfer.resume_offset + i64(download_now)
+
+    // A server that ignores Range: will make now exceed the expected file
+    // size. Abort before appending the whole file to the partial file; the
+    // caller will remove it and retry once from byte zero.
+    if transfer.expected_size > 0 && now > transfer.expected_size {
+        if !transfer.progress_overflow {
+            transfer.progress_overflow = true
+            fmt.printf(
+                "\n[DOWNLOAD] Resume overflow name=%s resume_offset=%d now=%d expected=%d response_total=%d\n",
+                transfer.file_name,
+                transfer.resume_offset,
+                now,
+                transfer.expected_size,
+                i64(download_total),
+            )
+        }
+        return 1
+    }
+
+    progress := total > 0 ? f64(now) / f64(total) : 0
     download_set_progress(
         transfer.manager,
         transfer.entry_index,
-        download_total > 0 ? f64(download_now) / f64(download_total) : 0,
-        i64(download_now),
-        i64(download_total),
+        progress,
+        now,
+        total,
     )
+
+    if total > 0 {
+        percent := int((now * 100) / total)
+        if percent > 100 {
+            percent = 100
+        }
+        if percent != transfer.last_logged_percent {
+            transfer.last_logged_percent = percent
+            bar_width := 30
+            filled := percent * bar_width / 100
+            fmt.printf("\r[DOWNLOAD] %s [", transfer.file_name)
+            for bar_index in 0..<bar_width {
+                fmt.print(bar_index < filled ? "=" : " ")
+            }
+            fmt.printf("] %3d%% %d/%d MiB", percent, now / (1024 * 1024), total / (1024 * 1024))
+            if percent >= 100 {
+                fmt.println()
+            }
+        }
+    }
     return 0
 }
 
 
-download_file :: proc(
+download_file_once :: proc(
     manager: ^DownloadManager,
     entry_index: int,
-    url, part_path: string,
+    url, part_path, file_name: string,
     expected_size: i64,
-) -> (completed, cancelled: bool, error_message: string) {
-    file, file_err := os.create(part_path)
+) -> (completed, cancelled, restart: bool, error_message: string) {
+    file, file_err := os.open(part_path, os.O_RDWR|os.O_CREATE)
     if file_err != nil {
-        return false, false, fmt.aprintf("Could not create download file: %v", file_err)
+        return false, false, false, fmt.aprintf("Could not open partial download file: %v", file_err)
     }
     defer os.close(file)
 
+    partial_size, partial_err := os.file_size(file)
+    if partial_err != nil {
+        return false, false, false, fmt.aprintf("Could not inspect partial download file: %v", partial_err)
+    }
+    if expected_size > 0 && partial_size == expected_size {
+        fmt.printf(
+            "[DOWNLOAD] Partial file already complete name=%s bytes=%d\n",
+            file_name,
+            partial_size,
+        )
+        return true, false, false, ""
+    }
+    if expected_size > 0 && partial_size > expected_size {
+        fmt.printf(
+            "[DOWNLOAD] Oversized partial file name=%s bytes=%d expected=%d; restarting\n",
+            file_name,
+            partial_size,
+            expected_size,
+        )
+        return false, false, true, ""
+    }
+    if _, seek_err := os.seek(file, partial_size, .Start); seek_err != nil {
+        return false, false, false, fmt.aprintf("Could not seek partial download file: %v", seek_err)
+    }
+
     handle := curl.easy_init()
     if handle == nil {
-        return false, false, "Could not initialize libcurl for file download."
+        return false, false, false, "Could not initialize libcurl for file download."
     }
     defer curl.easy_cleanup(handle)
 
@@ -761,6 +1183,10 @@ download_file :: proc(
         manager = manager,
         entry_index = entry_index,
         file = file,
+        file_name = file_name,
+        expected_size = expected_size,
+        resume_offset = partial_size,
+        last_logged_percent = -1,
     }
 
     curl.easy_setopt(handle, .URL, download_url)
@@ -780,26 +1206,121 @@ download_file :: proc(
     curl.easy_setopt(handle, .WRITEDATA, &transfer)
 
     if expected_size > 0 {
-        download_set_progress(manager, entry_index, 0, 0, expected_size)
+        download_set_progress(
+            manager,
+            entry_index,
+            f64(partial_size) / f64(expected_size),
+            partial_size,
+            expected_size,
+        )
     }
+    if partial_size > 0 {
+        curl.easy_setopt(handle, .RESUME_FROM_LARGE, curl.off_t(partial_size))
+    }
+    fmt.printf(
+        "[DOWNLOAD] Starting local transfer name=%s resume_offset=%d expected_bytes=%d\n",
+        file_name,
+        partial_size,
+        expected_size,
+    )
 
     result := curl.easy_perform(handle)
 
-    if download_should_cancel(manager, entry_index) {
-        return false, true, ""
+    if download_should_pause(manager, entry_index) {
+        return false, true, false, ""
     }
-
-    if result != .E_OK {
-        return false, false, fmt.aprintf("File download failed: %v", result)
+    if download_should_cancel(manager, entry_index) {
+        return false, true, false, ""
     }
 
     status: libc.long = 0
     curl.easy_getinfo(handle, .RESPONSE_CODE, &status)
-    if status < 200 || status >= 300 {
-        return false, false, fmt.aprintf("File download returned HTTP %d", status)
+    final_size, final_size_err := os.file_size(file)
+    if final_size_err != nil {
+        return false, false, false, fmt.aprintf("Could not inspect completed partial download file: %v", final_size_err)
+    }
+    response_bytes := final_size - partial_size
+    fmt.printf(
+        "[DOWNLOAD] Transfer result name=%s curl=%v http=%d resume_offset=%d response_bytes=%d final_bytes=%d expected_bytes=%d overflow=%t\n",
+        file_name,
+        result,
+        status,
+        partial_size,
+        response_bytes,
+        final_size,
+        expected_size,
+        transfer.progress_overflow,
+    )
+
+    // A 200 response to a resumed request means the server ignored Range and
+    // sent the complete file. A 416 can mean the saved range is stale. In
+    // either case, discard the partial file and retry once from byte zero.
+    if partial_size > 0 && (status == 200 || status == 416 || transfer.progress_overflow) {
+        return false, false, true, ""
+    }
+    if transfer.progress_overflow {
+        return false, false, true, ""
     }
 
-    return true, false, ""
+    if result != .E_OK {
+        return false, false, false, fmt.aprintf("File download failed: %v", result)
+    }
+    if status < 200 || status >= 300 {
+        return false, false, false, fmt.aprintf("File download returned HTTP %d", status)
+    }
+    if expected_size > 0 && final_size != expected_size {
+        return false, false, false, fmt.aprintf(
+            "File download size mismatch: got %d bytes, expected %d",
+            final_size,
+            expected_size,
+        )
+    }
+
+    fmt.printf("[DOWNLOAD] Local transfer completed name=%s bytes=%d\n", file_name, final_size)
+    return true, false, false, ""
+}
+
+
+download_file :: proc(
+    manager: ^DownloadManager,
+    entry_index: int,
+    url, part_path, file_name: string,
+    expected_size: i64,
+) -> (completed, cancelled: bool, error_message: string) {
+    for attempt := 0; attempt < 2; attempt += 1 {
+        completed, cancelled, restart, transfer_error := download_file_once(
+            manager,
+            entry_index,
+            url,
+            part_path,
+            file_name,
+            expected_size,
+        )
+        if !restart {
+            return completed, cancelled, transfer_error
+        }
+
+        if attempt == 1 {
+            delete(transfer_error)
+            return false, false, "Could not resume download safely after the server rejected the byte range."
+        }
+
+        remove_err := os.remove(part_path)
+        if remove_err != nil {
+            delete(transfer_error)
+            return false, false, fmt.aprintf(
+                "Could not reset partial download after resume mismatch: %v",
+                remove_err,
+            )
+        }
+        fmt.printf(
+            "[DOWNLOAD] Retrying from byte zero after resume mismatch name=%s\n",
+            file_name,
+        )
+        delete(transfer_error)
+    }
+
+    return false, false, "File download did not start."
 }
 
 
@@ -808,6 +1329,7 @@ download_finalize_file :: proc(
     entry_index: int,
     part_path, output_path, marker_path: string,
     expected_size: i64,
+    mark_complete: bool,
 ) -> (finalized, cancelled: bool, error_message: string) {
     // Keep cancellation from racing the rename/marker pair. The UI cannot
     // set cancel_requested until this short critical section completes.
@@ -833,21 +1355,57 @@ download_finalize_file :: proc(
         )
     }
 
-    marker_bytes := transmute([]byte)output_path
+    if mark_complete {
+        marker_bytes := transmute([]byte)output_path
+        marker_err := os.write_entire_file(marker_path, marker_bytes)
+        if marker_err != nil {
+            os.remove(output_path)
+            return false, false, fmt.aprintf(
+                "Downloaded file, but completion marker failed: %v",
+                marker_err,
+            )
+        }
+
+        manager.entries[entry_index].progress = 1
+        manager.entries[entry_index].bytes_downloaded = expected_size
+        manager.entries[entry_index].bytes_total = expected_size
+        manager.entries[entry_index].state = .Completed
+    }
+    return true, false, ""
+}
+
+
+download_mark_entry_complete :: proc(
+    manager: ^DownloadManager,
+    entry_index: int,
+    marker_path, marker_target: string,
+    total_bytes: i64,
+) -> (marked: bool, error_message: string) {
+    sync.mutex_lock(&manager.mutex)
+    defer sync.mutex_unlock(&manager.mutex)
+
+    if entry_index < 0 || entry_index >= len(manager.entries) {
+        return false, "Invalid download entry."
+    }
+    if manager.stop_requested || manager.entries[entry_index].cancel_requested {
+        return false, "Download cancelled."
+    }
+
+    marker_bytes := transmute([]byte)marker_target
     marker_err := os.write_entire_file(marker_path, marker_bytes)
     if marker_err != nil {
-        os.remove(output_path)
-        return false, false, fmt.aprintf(
-            "Downloaded file, but completion marker failed: %v",
+        message := fmt.aprintf(
+            "Downloaded files, but completion marker failed: %v",
             marker_err,
         )
+        return false, message
     }
 
     manager.entries[entry_index].progress = 1
-    manager.entries[entry_index].bytes_downloaded = expected_size
-    manager.entries[entry_index].bytes_total = expected_size
+    manager.entries[entry_index].bytes_downloaded = total_bytes
+    manager.entries[entry_index].bytes_total = total_bytes
     manager.entries[entry_index].state = .Completed
-    return true, false, ""
+    return true, ""
 }
 
 
@@ -866,7 +1424,8 @@ download_should_cancel :: proc(manager: ^DownloadManager, entry_index: int) -> b
     return manager.stop_requested ||
         entry_index < 0 ||
         entry_index >= len(manager.entries) ||
-        manager.entries[entry_index].cancel_requested
+        manager.entries[entry_index].cancel_requested ||
+        manager.entries[entry_index].pause_requested
 }
 
 
@@ -911,6 +1470,22 @@ download_set_paths :: proc(manager: ^DownloadManager, entry_index: int, output_p
 }
 
 
+download_set_archive_path :: proc(manager: ^DownloadManager, entry_index: int, archive_path: string) {
+    sync.mutex_lock(&manager.mutex)
+    defer sync.mutex_unlock(&manager.mutex)
+
+    if entry_index < 0 || entry_index >= len(manager.entries) {
+        return
+    }
+
+    delete(manager.entries[entry_index].archive_path)
+    manager.entries[entry_index].archive_path = strings.clone(
+        archive_path,
+        context.allocator,
+    )
+}
+
+
 download_set_progress :: proc(manager: ^DownloadManager, entry_index: int, progress: f64, downloaded, total: i64) {
     sync.mutex_lock(&manager.mutex)
     defer sync.mutex_unlock(&manager.mutex)
@@ -944,15 +1519,16 @@ download_set_torrent_progress :: proc(manager: ^DownloadManager, entry_index: in
 
 download_fail_entry :: proc(manager: ^DownloadManager, entry_index: int, message: string) {
     sync.mutex_lock(&manager.mutex)
-    defer sync.mutex_unlock(&manager.mutex)
-
     if entry_index < 0 || entry_index >= len(manager.entries) {
+        sync.mutex_unlock(&manager.mutex)
         return
     }
 
     delete(manager.entries[entry_index].error_message)
     manager.entries[entry_index].error_message = strings.clone(message, context.allocator)
     manager.entries[entry_index].state = .Failed
+    sync.mutex_unlock(&manager.mutex)
+    download_write_manifest(manager, entry_index, "failed", message)
 }
 
 
@@ -971,7 +1547,32 @@ download_fail_entry_from_rd :: proc(manager: ^DownloadManager, entry_index: int,
 }
 
 
+download_pause_entry :: proc(manager: ^DownloadManager, entry_index: int, client: ^RealDebridClient) {
+    torrent_id := download_copy_torrent_id(manager, entry_index)
+    defer delete(torrent_id)
+    if client != nil && len(torrent_id) > 0 {
+        download_delete_remote_torrent(client, torrent_id)
+    }
+
+    resume_phase := "paused"
+    sync.mutex_lock(&manager.mutex)
+    if entry_index >= 0 && entry_index < len(manager.entries) {
+        switch manager.entries[entry_index].state {
+        case .Extracting: resume_phase = "extracting"
+        case .Installing: resume_phase = "installing"
+        case .NotDownloaded, .Queued, .Resolving, .Downloading,
+             .Completed, .Cancelled, .Paused, .Failed:
+            resume_phase = "paused"
+        }
+    }
+    sync.mutex_unlock(&manager.mutex)
+    download_set_state(manager, entry_index, .Paused)
+    download_write_manifest(manager, entry_index, resume_phase, "Partial work preserved.")
+}
+
+
 download_cancel_entry :: proc(manager: ^DownloadManager, entry_index: int, client: ^RealDebridClient) {
+    paused := download_should_pause(manager, entry_index)
     torrent_id := download_copy_torrent_id(manager, entry_index)
     defer delete(torrent_id)
 
@@ -979,13 +1580,13 @@ download_cancel_entry :: proc(manager: ^DownloadManager, entry_index: int, clien
         download_delete_remote_torrent(client, torrent_id)
     }
 
-    part_path := download_copy_part_path(manager, entry_index)
-    defer delete(part_path)
-    if len(part_path) > 0 && os.exists(part_path) {
-        os.remove(part_path)
+    if paused {
+        download_set_state(manager, entry_index, .Paused)
+        download_write_manifest(manager, entry_index, "paused", "Partial download preserved.")
+    } else {
+        download_set_state(manager, entry_index, .Cancelled)
+        download_write_manifest(manager, entry_index, "cancelled", "Download cancelled; partial data preserved.")
     }
-
-    download_set_state(manager, entry_index, .Cancelled)
 }
 
 
@@ -1076,6 +1677,114 @@ download_info_hash :: proc(magnet: string) -> string {
     }
 
     return strings.clone(rest[:end], context.allocator)
+}
+
+
+download_manifest_path :: proc(download_directory, info_hash: string) -> string {
+    safe_hash := sanitize_filename(info_hash, context.allocator)
+    defer delete(safe_hash)
+
+    filename := fmt.aprintf(".fitdeck-%s.state", safe_hash)
+    defer delete(filename)
+    path, join_err := filepath.join({download_directory, filename}, context.allocator)
+    if join_err != nil {
+        return fmt.aprintf("%s/%s", download_directory, filename)
+    }
+    return path
+}
+
+
+download_manifest_value :: proc(data, key: string) -> string {
+    marker := fmt.aprintf("%s=", key)
+    defer delete(marker)
+    start := strings.index(data, marker)
+    if start < 0 {
+        return ""
+    }
+    value_start := start + len(marker)
+    value_end := strings.index(data[value_start:], "\n")
+    if value_end < 0 {
+        value_end = len(data) - value_start
+    }
+    return strings.clone(data[value_start:value_start+value_end], context.allocator)
+}
+
+
+download_write_manifest :: proc(manager: ^DownloadManager, entry_index: int, phase, message: string) {
+    if manager == nil || manager.app == nil {
+        return
+    }
+
+    sync.mutex_lock(&manager.mutex)
+    if entry_index < 0 || entry_index >= len(manager.entries) {
+        sync.mutex_unlock(&manager.mutex)
+        return
+    }
+    info_hash := strings.clone(manager.entries[entry_index].info_hash, context.allocator)
+    archive_path := strings.clone(manager.entries[entry_index].archive_path, context.allocator)
+    output_path := strings.clone(manager.entries[entry_index].output_path, context.allocator)
+    part_path := strings.clone(manager.entries[entry_index].part_path, context.allocator)
+    torrent_id := strings.clone(manager.entries[entry_index].rd_torrent_id, context.allocator)
+    download_directory := strings.clone(manager.app.download_path, context.allocator)
+    sync.mutex_unlock(&manager.mutex)
+
+    defer delete(info_hash)
+    defer delete(archive_path)
+    defer delete(output_path)
+    defer delete(part_path)
+    defer delete(torrent_id)
+    defer delete(download_directory)
+
+    if len(archive_path) == 0 {
+        archive_path = strings.clone(output_path, context.allocator)
+    }
+    manifest_path := download_manifest_path(download_directory, info_hash)
+    defer delete(manifest_path)
+    temp_path := fmt.aprintf("%s.tmp", manifest_path)
+    defer delete(temp_path)
+    contents := fmt.aprintf(
+        "phase=%s\narchive_path=%s\noutput_path=%s\npart_path=%s\ntorrent_id=%s\nmessage=%s\n",
+        phase,
+        archive_path,
+        output_path,
+        part_path,
+        torrent_id,
+        message,
+    )
+    defer delete(contents)
+
+    write_err := os.write_entire_file(temp_path, transmute([]byte)contents)
+    if write_err == nil {
+        rename_err := os.rename(temp_path, manifest_path)
+        if rename_err != nil {
+            fmt.printf("[DOWNLOAD] WARNING: could not commit state manifest: %v\n", rename_err)
+        }
+    } else {
+        fmt.printf("[DOWNLOAD] WARNING: could not write state manifest: %v\n", write_err)
+    }
+}
+
+
+download_read_manifest_for_game :: proc(manager: ^DownloadManager, game_index: int) -> (phase, archive_path, torrent_id: string) {
+    if manager == nil || manager.app == nil ||
+       game_index < 0 || game_index >= len(manager.app.games) {
+        return "", "", ""
+    }
+
+    info_hash := download_info_hash(manager.app.games[game_index].magnetLink)
+    defer delete(info_hash)
+    path := download_manifest_path(manager.app.download_path, info_hash)
+    defer delete(path)
+    data, read_err := os.read_entire_file_from_path(path, context.allocator)
+    if read_err != nil {
+        return "", "", ""
+    }
+    defer delete(data)
+    text := string(data[:])
+    phase = download_manifest_value(text, "phase")
+    archive_path = download_manifest_value(text, "archive_path")
+    torrent_id = download_manifest_value(text, "torrent_id")
+    return phase, archive_path, torrent_id
 }
 
 

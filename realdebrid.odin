@@ -371,11 +371,15 @@ rd_request :: proc(
     curl.easy_setopt(handle, .USERAGENT, user_agent_cstr)
     curl.easy_setopt(handle, .TIMEOUT, 30)
     curl.easy_setopt(handle, .HTTPHEADER, headers)
+
     curl.easy_setopt(handle, .WRITEFUNCTION, CurlWriteCallback)
     curl.easy_setopt(handle, .WRITEDATA, &builder)
 
     if method == "POST" {
-        curl.easy_setopt(handle, .POST, 1)
+        post_result := curl.easy_setopt(handle, .POST, libc.long(1))
+        if post_result != .E_OK {
+            fmt.printf("[RD HTTP] CURLOPT_POST failed code=%v\n", post_result)
+        }
     } else if method == "PUT" {
         put_cstr := strings.clone_to_cstring(
             "PUT",
@@ -393,12 +397,24 @@ rd_request :: proc(
             )
             defer delete(form_cstr)
 
-            curl.easy_setopt(handle, .POSTFIELDS, form_cstr)
-            curl.easy_setopt(
+
+            post_size_result := curl.easy_setopt(
                 handle,
                 .POSTFIELDSIZE,
                 libc.long(len(form_body)),
             )
+            post_fields_result := curl.easy_setopt(
+                handle,
+                .COPYPOSTFIELDS,
+                cast(rawptr)form_cstr,
+            )
+            if post_fields_result != .E_OK || post_size_result != .E_OK {
+                fmt.printf(
+                    "[RD HTTP] POST body options failed fields=%v size=%v\n",
+                    post_fields_result,
+                    post_size_result,
+                )
+            }
         }
     } else if method != "GET" {
         method_cstr := strings.clone_to_cstring(
