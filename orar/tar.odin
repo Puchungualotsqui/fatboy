@@ -16,6 +16,9 @@ TAR_TYPE_PAX_EXTENDED :: byte('x')
 
 parse_tar :: proc(archive: ^Archive) -> Error {
 	data := archive.Data
+	if archive.Payload != nil {
+		data = archive.Payload
+	}
 	if len(data) < TAR_BLOCK_SIZE {
 		return .Truncated
 	}
@@ -338,7 +341,11 @@ decode_tar_entry :: proc(archive: ^Archive, index: int) -> ([]byte, Error) {
 		}
 		return result, .None
 	}
-	if entry.Size > u64(len(archive.Data)) || !valid_range(archive.Data, int(entry.Data_Offset), entry.Size) {
+	data := archive.Data
+	if archive.Payload != nil {
+		data = archive.Payload
+	}
+	if entry.Size > u64(len(data)) || !valid_range(data, int(entry.Data_Offset), entry.Size) {
 		return nil, .Truncated
 	}
 	if entry.Size > 0x7fffffffffffffff {
@@ -348,6 +355,6 @@ decode_tar_entry :: proc(archive: ^Archive, index: int) -> ([]byte, Error) {
 	if alloc_error != nil {
 		return nil, .Out_Of_Memory
 	}
-	copy(result, archive.Data[int(entry.Data_Offset):int(entry.Data_Offset)+int(entry.Size)])
+	copy(result, data[int(entry.Data_Offset):int(entry.Data_Offset)+int(entry.Size)])
 	return result, .None
 }

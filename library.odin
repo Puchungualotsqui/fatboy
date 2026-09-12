@@ -249,7 +249,7 @@ RenderLibraryScreen :: proc(
                     } else if isHovered {
                         rowBg = ROW_HOVER_BACKGROUND
                     } else if download_snapshot.found &&
-                              download_snapshot.state == .Completed {
+                              download_snapshot.state == .Installed {
                         rowBg = rl.Color{34, 50, 40, 255}
                     }
 
@@ -260,12 +260,13 @@ RenderLibraryScreen :: proc(
                        download_snapshot.state == .Failed {
                         badgeTextColor = STATUS_ERR
                     } else if download_snapshot.found &&
-                              download_snapshot.state != .Completed {
+                              download_snapshot.state != .Installed {
                         badgeTextColor = ACCENT_COLOR
                     }
 
                     badgeText := DownloadStateText(download_snapshot.state)
-                    if download_snapshot.state == .Downloading {
+                    if download_snapshot.state == .Downloading ||
+                       download_snapshot.state == .Extracting {
                         badgeText = fmt.tprintf(
                             "%s %d%%",
                             DownloadStateText(download_snapshot.state),
@@ -393,14 +394,23 @@ RenderLibraryScreen :: proc(
                                 )
 
                                 if download_snapshot.found &&
-                                   download_snapshot.state == .Downloading {
-                                    active_file_name := DownloadFileNameForGame(
-                                        &app.download_manager,
-                                        index,
-                                    )
+                                   (download_snapshot.state == .Downloading ||
+                                    download_snapshot.state == .Extracting) {
+                                    fallback_message := "Extracting archive..."
+                                    if download_snapshot.state == .Downloading {
+                                        fallback_message = "Downloading game archive..."
+                                    }
+                                    phase_message := fallback_message
+                                    if len(download_snapshot.status_message) > 0 {
+                                        phase_message = download_snapshot.status_message
+                                    }
+                                    progress_color := TEXT_MUTED
+                                    if download_snapshot.state == .Downloading {
+                                        progress_color = STATUS_OK
+                                    }
                                     progress_label := fmt.tprintf(
-                                        "Downloading %s  %d%%  %d/%d MiB",
-                                        len(active_file_name) > 0 ? active_file_name : "file",
+                                        "%s  %d%%  %d/%d MiB",
+                                        phase_message,
                                         int(download_snapshot.progress * 100),
                                         download_snapshot.bytes_downloaded / (1024 * 1024),
                                         download_snapshot.bytes_total / (1024 * 1024),
@@ -415,12 +425,16 @@ RenderLibraryScreen :: proc(
                                         progress_label,
                                         {
                                             font_size = 12,
-                                            color = STATUS_OK,
+                                            color = progress_color,
                                             disabled = .True,
                                         },
                                     )
                                 } else if download_snapshot.found &&
                                           download_snapshot.state == .Resolving {
+                                    resolving_message := download_snapshot.status_message
+                                    if len(resolving_message) == 0 {
+                                        resolving_message = "Preparing Real-Debrid torrent..."
+                                    }
                                     orui.label(
                                         orui.id(
                                             fmt.tprintf(
@@ -428,23 +442,7 @@ RenderLibraryScreen :: proc(
                                                 index,
                                             ),
                                         ),
-                                        "Preparing Real-Debrid torrent...",
-                                        {
-                                            font_size = 12,
-                                            color = TEXT_MUTED,
-                                            disabled = .True,
-                                        },
-                                    )
-                                } else if download_snapshot.found &&
-                                          download_snapshot.state == .Extracting {
-                                    orui.label(
-                                        orui.id(
-                                            fmt.tprintf(
-                                                "progress_%d",
-                                                index,
-                                            ),
-                                        ),
-                                        "Extracting archive and launching installer...",
+                                        resolving_message,
                                         {
                                             font_size = 12,
                                             color = TEXT_MUTED,
@@ -460,10 +458,50 @@ RenderLibraryScreen :: proc(
                                                 index,
                                             ),
                                         ),
-                                        "Installer launched; follow its instructions.",
+                                        "Installing through GE-Proton8-25...",
                                         {
                                             font_size = 12,
                                             color = STATUS_OK,
+                                            disabled = .True,
+                                        },
+                                    )
+                                } else if download_snapshot.found &&
+                                          download_snapshot.state == .Extracted {
+                                    extracted_message := download_snapshot.status_message
+                                    if len(extracted_message) == 0 {
+                                        extracted_message = "Archive extracted; installer not run."
+                                    }
+                                    orui.label(
+                                        orui.id(
+                                            fmt.tprintf(
+                                                "progress_%d",
+                                                index,
+                                            ),
+                                        ),
+                                        extracted_message,
+                                        {
+                                            font_size = 12,
+                                            color = ACCENT_COLOR,
+                                            disabled = .True,
+                                        },
+                                    )
+                                } else if download_snapshot.found &&
+                                          download_snapshot.state == .Failed {
+                                    failure_message := download_snapshot.error_message
+                                    if len(failure_message) == 0 {
+                                        failure_message = "Installation failed; retry."
+                                    }
+                                    orui.label(
+                                        orui.id(
+                                            fmt.tprintf(
+                                                "progress_%d",
+                                                index,
+                                            ),
+                                        ),
+                                        failure_message,
+                                        {
+                                            font_size = 12,
+                                            color = STATUS_ERR,
                                             disabled = .True,
                                         },
                                     )
@@ -547,7 +585,8 @@ RenderLibraryScreen :: proc(
                                 !download_snapshot.found ||
                                 download_snapshot.state == .Cancelled ||
                                 download_snapshot.state == .Paused ||
-                                download_snapshot.state == .Failed
+                                download_snapshot.state == .Failed ||
+                                download_snapshot.state == .Extracted
 
                             if can_pause {
                                 if orui.button(
@@ -595,7 +634,8 @@ RenderLibraryScreen :: proc(
                                     }
                                 }
                             } else if can_queue {
-                                queue_label := download_snapshot.state == .Paused ? "Resume" : "Download"
+                                queue_label := download_snapshot.state == .Paused ? "Resume" :
+                                    download_snapshot.state == .Extracted ? "Install" : "Download"
                                 if orui.button(
                                     orui.id(
                                         fmt.tprintf(

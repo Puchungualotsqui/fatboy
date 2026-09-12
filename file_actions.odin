@@ -20,10 +20,13 @@ DownloadPathIsArchive :: proc(path: string) -> bool {
     }
 
     extension := lower[dot+1:]
-    return extension == "rar" ||
-        extension == "7z" ||
-        extension == "zip" ||
-        extension == "tar"
+    if extension == "rar" || extension == "7z" || extension == "zip" || extension == "tar" {
+        return true
+    }
+    return strings.ends_with(lower, ".tar.gz") ||
+        strings.ends_with(lower, ".tar.xz") ||
+        strings.ends_with(lower, ".tgz") ||
+        strings.ends_with(lower, ".txz")
 }
 
 
@@ -32,6 +35,17 @@ DownloadArchiveExtractDirectory :: proc(archive_path: string) -> string {
     if backslash := strings.last_index(archive_path, "\\"); backslash > last_separator {
         last_separator = backslash
     }
+    lower := strings.to_lower(archive_path, context.temp_allocator)
+    compound_suffix := ""
+    if strings.ends_with(lower, ".tar.gz") || strings.ends_with(lower, ".tar.xz") {
+        compound_suffix = archive_path[len(archive_path)-7:]
+    } else if strings.ends_with(lower, ".tgz") || strings.ends_with(lower, ".txz") {
+        compound_suffix = archive_path[len(archive_path)-4:]
+    }
+    if len(compound_suffix) > 0 {
+        return fmt.aprintf("%s_extracted", archive_path[:len(archive_path)-len(compound_suffix)])
+    }
+
     dot := strings.last_index(archive_path, ".")
     if dot > last_separator && dot > 0 {
         return fmt.aprintf("%s_extracted", archive_path[:dot])
@@ -89,7 +103,7 @@ archive_entry_relative_path :: proc(name: string) -> (string, bool) {
 archive_error_message :: proc(err: orar.Error) -> string {
     #partial switch err {
     case .Unsupported_Format:
-        return "This file is not a supported archive. orar supports RAR, ZIP, and TAR files; 7z is not supported."
+        return "This file is not a supported archive. orar supports RAR, ZIP, TAR, TAR.XZ, and TAR.GZ files; 7z is not supported."
     case .Unsupported_Feature:
         return "This archive uses a compression feature that orar does not support."
     case .Encrypted:
@@ -110,6 +124,17 @@ ExtractDownloadArchiveAndWait :: proc(
     entry_index: int,
     archive_path: string,
 ) -> (bool, string) {
+    output_directory := DownloadArchiveExtractDirectory(archive_path)
+    defer delete(output_directory)
+    return ExtractArchiveToDirectory(manager, entry_index, archive_path, output_directory)
+}
+
+
+ExtractArchiveToDirectory :: proc(
+    manager: ^DownloadManager,
+    entry_index: int,
+    archive_path, output_directory: string,
+) -> (bool, string) {
     if len(archive_path) == 0 || !os.exists(archive_path) {
         return false, "The completed archive could not be found."
     }
@@ -120,8 +145,6 @@ ExtractDownloadArchiveAndWait :: proc(
     }
     defer orar.Destroy_Archive(&archive)
 
-    output_directory := DownloadArchiveExtractDirectory(archive_path)
-    defer delete(output_directory)
     if !os.exists(output_directory) {
         if mkdir_err := os.make_directory_all(output_directory); mkdir_err != nil {
             return false, fmt.aprintf("Could not create extraction folder: %v", mkdir_err)
@@ -279,32 +302,44 @@ ExtractDownloadArchiveAndWait :: proc(
 }
 
 
+DownloadInstallerResult :: enum {
+    InstallerStarted,
+    InstallerNotFound,
+    InstallerCancelled,
+    InstallerPaused,
+    InstallerFailed,
+}
+
+
 LaunchDownloadInstaller :: proc(
     manager: ^DownloadManager,
     entry_index: int,
     archive_path: string,
-) -> (bool, string) {
+) -> (DownloadInstallerResult, string) {
+    when ODIN_OS == .Linux {
+        return LaunchGEProtonInstaller(manager, entry_index, archive_path)
+    } else {
+        return LaunchNativeDownloadInstaller(manager, entry_index, archive_path)
+    }
+}
+
+
+LaunchNativeDownloadInstaller :: proc(
+    manager: ^DownloadManager,
+    entry_index: int,
+    archive_path: string,
+) -> (DownloadInstallerResult, string) {
     if len(archive_path) == 0 || !os.exists(archive_path) {
-        return false, "The completed archive could not be found."
+        return .InstallerFailed, "The completed archive could not be found."
     }
 
     extracted_directory := DownloadArchiveExtractDirectory(archive_path)
     defer delete(extracted_directory)
     if !os.is_directory(extracted_directory) {
-        return false, "Extract the archive first; the extraction folder was not found."
+        return .InstallerFailed, "Extract the archive first; the extraction folder was not found."
     }
 
-    // FitGirl archives normally contain a Windows executable, but the portal
-    // itself must not assume that every host can run one. On Unix-like hosts,
-    // only try conventional native executable names; otherwise extraction is
-    // still considered successful and the user can launch the files manually.
-    installer_names: []string
-    when ODIN_OS == .Windows {
-        installer_names = []string{"setup.exe", "install.exe", "installer.exe"}
-    } else {
-        installer_names = []string{"setup", "install", "installer"}
-    }
-
+    installer_names := []string{"setup.exe", "install.exe", "installer.exe"}
     installer_path := ""
     for installer_name in installer_names {
         candidate, join_err := filepath.join(
@@ -322,8 +357,8 @@ LaunchDownloadInstaller :: proc(
     }
 
     if len(installer_path) == 0 {
-        return true, fmt.aprintf(
-            "Archive extracted to %s. No native installer was found; launch the extracted files manually.",
+        return .InstallerNotFound, fmt.aprintf(
+            "Archive extracted to %s, but no Windows installer was found.",
             extracted_directory,
         )
     }
@@ -333,30 +368,34 @@ LaunchDownloadInstaller :: proc(
         os.Process_Desc{command = []string{installer_path}},
     )
     if start_err != nil {
-        return false, fmt.aprintf("Could not launch the native installer: %v", start_err)
+        return .InstallerFailed, fmt.aprintf("Could not launch the native installer: %v", start_err)
     }
 
     for {
         process_state, wait_err := os.process_wait(process, 250 * time.Millisecond)
         if wait_err == .Timeout {
-            if download_should_cancel(manager, entry_index) ||
-               download_should_pause(manager, entry_index) {
+            if download_should_cancel(manager, entry_index) {
                 _ = os.process_terminate(process)
                 _, _ = os.process_wait(process)
-                return false, "Installer interrupted."
+                return .InstallerCancelled, "Installer cancelled."
+            }
+            if download_should_pause(manager, entry_index) {
+                _ = os.process_terminate(process)
+                _, _ = os.process_wait(process)
+                return .InstallerPaused, "Installer paused."
             }
             continue
         }
         if wait_err != nil {
-            return false, fmt.aprintf("Could not wait for the native installer: %v", wait_err)
+            return .InstallerFailed, fmt.aprintf("Could not wait for the native installer: %v", wait_err)
         }
         if !process_state.success {
-            return false, fmt.aprintf(
+            return .InstallerFailed, fmt.aprintf(
                 "The native installer exited with code %d.",
                 process_state.exit_code,
             )
         }
         break
     }
-    return true, "Installer completed."
+    return .InstallerStarted, "Installer completed."
 }

@@ -25,6 +25,7 @@ deflate_output :: struct {
 	expected_size: u64,
 	window:        [32768]byte,
 	window_offset: int,
+	max_output:    u64,
 }
 
 // RFC 1951 length and distance bases.  The table indexes are the Deflate
@@ -201,6 +202,12 @@ deflate_output_grow :: proc(output: ^deflate_output) -> Error {
 		}
 		next = int(output.expected_size)
 	}
+	if output.max_output != 0 && u64(next) > output.max_output {
+		if output.max_output > u64(0x7fffffffffffffff) {
+			return .Limit_Exceeded
+		}
+		next = int(output.max_output)
+	}
 	if next <= current {
 		return .Limit_Exceeded
 	}
@@ -220,6 +227,9 @@ deflate_output_grow :: proc(output: ^deflate_output) -> Error {
 deflate_output_write :: proc(output: ^deflate_output, value: byte) -> Error {
 	if output.expected_size != 0 && u64(output.length) >= output.expected_size {
 		return .Invalid_Archive
+	}
+	if output.max_output != 0 && u64(output.length) >= output.max_output {
+		return .Limit_Exceeded
 	}
 	if output.length >= len(output.data) {
 		if err := deflate_output_grow(output); err != .None {
@@ -486,7 +496,7 @@ deflate_reader_has_only_padding :: proc(reader: ^deflate_bit_reader) -> bool {
 	return true
 }
 
-deflate_decode_stream :: proc(reader: ^deflate_bit_reader, output: ^deflate_output) -> Error {
+deflate_decode_stream :: proc(reader: ^deflate_bit_reader, output: ^deflate_output, require_padding: bool) -> Error {
 	fixed_literal_tree, fixed_distance_tree, fixed_ok := deflate_make_fixed_trees()
 	if !fixed_ok {
 		return .Invalid_Archive
@@ -524,7 +534,7 @@ deflate_decode_stream :: proc(reader: ^deflate_bit_reader, output: ^deflate_outp
 		}
 	}
 
-	if !deflate_reader_has_only_padding(reader) {
+	if require_padding && !deflate_reader_has_only_padding(reader) {
 		return .Invalid_Archive
 	}
 	return .None
@@ -543,7 +553,7 @@ inflate_raw :: proc(data: []byte, expected_size: u64) -> ([]byte, Error) {
 
 	reader := deflate_bit_reader{data = data}
 	output := deflate_output{expected_size = expected_size}
-	err := deflate_decode_stream(&reader, &output)
+	err := deflate_decode_stream(&reader, &output, true)
 	if err != .None {
 		delete(output.data)
 		return nil, err

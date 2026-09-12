@@ -21,7 +21,8 @@ DownloadState :: enum {
     Downloading,
     Extracting,
     Installing,
-    Completed,
+    Installed,
+    Extracted,
     Cancelled,
     Paused,
     Failed,
@@ -42,6 +43,7 @@ DownloadEntry :: struct {
     bytes_downloaded: i64,
     bytes_total:      i64,
     error_message:    string,
+    status_message:   string,
 
     cancel_requested: bool,
     pause_requested:  bool,
@@ -54,6 +56,8 @@ DownloadSnapshot :: struct {
     progress:         f64,
     bytes_downloaded: i64,
     bytes_total:      i64,
+    status_message:   string,
+    error_message:    string,
 }
 
 
@@ -115,6 +119,7 @@ DownloadManagerShutdown :: proc(manager: ^DownloadManager) {
         delete(entry.part_path)
         delete(entry.archive_path)
         delete(entry.error_message)
+        delete(entry.status_message)
     }
     delete(manager.entries)
     sync.mutex_unlock(&manager.mutex)
@@ -175,15 +180,17 @@ DownloadQueueGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
         }
 
         switch entry.state {
-        case .Queued, .Resolving, .Downloading, .Extracting, .Installing, .Completed:
+        case .Queued, .Resolving, .Downloading, .Extracting, .Installing, .Installed:
             sync.mutex_unlock(&manager.mutex)
             return false
-        case .Cancelled, .Paused, .Failed, .NotDownloaded:
+        case .Cancelled, .Paused, .Failed, .Extracted, .NotDownloaded:
             if entry.state == .Failed {
                 retry_cleanup_index = entry_index
             }
             delete(entry.error_message)
+            delete(entry.status_message)
             entry.error_message = ""
+            entry.status_message = ""
             entry.state = .Queued
             entry.progress = 0
             entry.bytes_downloaded = 0
@@ -196,12 +203,17 @@ DownloadQueueGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
     }
 
     if retry_cleanup_index < 0 {
+        resume_manifest := manifest_phase == "failed" ||
+            manifest_phase == "extracted" ||
+            manifest_phase == "installing" ||
+            manifest_phase == "archive_ready" ||
+            manifest_phase == "extracting"
         append(&manager.entries, DownloadEntry{
             game_index = game_index,
             info_hash = strings.clone(info_hash, context.allocator),
-            output_path = stale_failed_manifest ? strings.clone(manifest_archive, context.allocator) : "",
-            part_path = stale_failed_manifest ? strings.clone(stale_failed_part, context.allocator) : "",
-            archive_path = stale_failed_manifest ? strings.clone(manifest_archive, context.allocator) : "",
+            output_path = resume_manifest ? strings.clone(manifest_archive, context.allocator) : "",
+            part_path = manifest_phase == "failed" ? strings.clone(stale_failed_part, context.allocator) : "",
+            archive_path = resume_manifest ? strings.clone(manifest_archive, context.allocator) : "",
             state = .Queued,
         })
         if stale_failed_manifest {
@@ -232,9 +244,12 @@ DownloadCancelGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
         case .Queued:
             entry.state = .Cancelled
             entry.cancel_requested = true
+            delete(entry.status_message)
+            entry.status_message = "Cancelled; local partial files were removed."
             sync.mutex_unlock(&manager.mutex)
             // A queued retry may still reference files from an earlier
             // attempt, even though its worker has not started yet.
+            CleanupGEProtonRuntimeDownload()
             download_remove_local_artifacts(manager, entry_index)
             return true
         case .Resolving, .Downloading, .Extracting, .Installing:
@@ -242,7 +257,7 @@ DownloadCancelGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
             entry.pause_requested = false
             sync.mutex_unlock(&manager.mutex)
             return true
-        case .NotDownloaded, .Completed, .Cancelled, .Paused, .Failed:
+        case .NotDownloaded, .Installed, .Extracted, .Cancelled, .Paused, .Failed:
             sync.mutex_unlock(&manager.mutex)
             return false
         }
@@ -312,6 +327,8 @@ DownloadSnapshotForGame :: proc(manager: ^DownloadManager, game_index: int) -> D
             result.progress = entry.progress
             result.bytes_downloaded = entry.bytes_downloaded
             result.bytes_total = entry.bytes_total
+            result.status_message = strings.clone(entry.status_message, context.temp_allocator)
+            result.error_message = strings.clone(entry.error_message, context.temp_allocator)
             sync.mutex_unlock(&manager.mutex)
             return result
         }
@@ -324,7 +341,23 @@ DownloadSnapshotForGame :: proc(manager: ^DownloadManager, game_index: int) -> D
     defer delete(manifest_torrent)
     if len(phase) > 0 && phase != "completed" {
         result.found = true
-        result.state = .Paused
+        switch phase {
+        case "extracted", "installing":
+            result.state = .Extracted
+            result.status_message = "Archive extracted; installer has not completed."
+        case "archive_ready", "extracting":
+            result.state = .Paused
+            result.status_message = "Archive work is paused and can be resumed."
+        case "cancelled":
+            result.state = .Cancelled
+            result.status_message = "Installation cancelled."
+        case "failed":
+            result.state = .Failed
+            result.error_message = download_manifest_value_from_file(manager, game_index, "message")
+        case:
+            result.state = .Paused
+            result.status_message = "Partial work is paused and can be resumed."
+        }
         return result
     }
 
@@ -335,8 +368,9 @@ DownloadSnapshotForGame :: proc(manager: ^DownloadManager, game_index: int) -> D
 
         if len(info_hash) > 0 && download_marker_valid(marker_path) {
             result.found = true
-            result.state = .Completed
+            result.state = .Installed
             result.progress = 1
+            result.status_message = "Installed."
         }
     }
 
@@ -435,8 +469,9 @@ DownloadStateText :: proc(state: DownloadState) -> string {
     case .Resolving:     return "PREPARING"
     case .Downloading:   return "DOWNLOADING"
     case .Extracting:    return "EXTRACTING"
-    case .Installing:    return "INSTALLING"
-    case .Completed:     return "DOWNLOADED"
+    case .Installing:    return "INSTALLING THROUGH GE-PROTON8-25"
+    case .Installed:     return "INSTALLED"
+    case .Extracted:     return "EXTRACTED - NOT INSTALLED"
     case .Cancelled:     return "CANCELLED"
     case .Paused:        return "RESUME"
     case .Failed:        return "RETRY"
@@ -500,14 +535,33 @@ download_resume_archive_entry :: proc(
         return
     }
 
+    // An old manifest could say "installing" after the process was killed.
+    // It is never safe to interpret that phase as permission to execute setup.exe
+    // directly; all resumes go through the current GE-Proton path.
     if phase == "installing" {
-        download_set_state(manager, entry_index, .Paused)
-        download_write_manifest(manager, entry_index, "paused", "Installer may still be running; it was not relaunched.")
-        return
+        fmt.printf("[DOWNLOAD] Migrating legacy installing phase to GE-Proton\n")
+        download_write_manifest(manager, entry_index, "extracted", "Legacy installer phase migrated; resume through GE-Proton.")
     }
 
-    if phase != "installing" {
+    runtime_ready, runtime_message := EnsureGEProtonRuntime(manager, entry_index)
+    if !runtime_ready {
+        if download_should_pause(manager, entry_index) {
+            download_pause_entry(manager, entry_index, client)
+        } else if download_should_cancel(manager, entry_index) {
+            download_cancel_entry(manager, entry_index, client)
+        } else {
+            download_fail_entry(manager, entry_index, runtime_message)
+        }
+        delete(runtime_message)
+        return
+    }
+    delete(runtime_message)
+
+    extracted_directory := DownloadArchiveExtractDirectory(archive_path)
+    defer delete(extracted_directory)
+    if !os.is_directory(extracted_directory) {
         download_set_state(manager, entry_index, .Extracting)
+        download_set_message(manager, entry_index, "Extracting archive...")
         download_write_manifest(manager, entry_index, "extracting", "")
         fmt.printf("[DOWNLOAD] Extracting archive %s\n", archive_path)
         extracted, extraction_message := ExtractDownloadArchiveAndWait(
@@ -531,17 +585,26 @@ download_resume_archive_entry :: proc(
         delete(extraction_message)
     }
 
+    download_set_state(manager, entry_index, .Extracted)
+    download_set_message(manager, entry_index, "Archive extracted; preparing GE-Proton installer...")
+    download_write_manifest(manager, entry_index, "extracted", "Archive extracted; installer has not completed.")
+
     download_set_state(manager, entry_index, .Installing)
-    download_write_manifest(manager, entry_index, "installing", "")
-    launched, install_message := LaunchDownloadInstaller(
+    download_set_message(manager, entry_index, "Installing through GE-Proton8-25...")
+    download_write_manifest(manager, entry_index, "installing", "Installing through GE-Proton8-25.")
+    install_result, install_message := LaunchDownloadInstaller(
         manager,
         entry_index,
         archive_path,
     )
-    if !launched {
-        if download_should_pause(manager, entry_index) {
+    if install_result != .InstallerStarted {
+        if install_result == .InstallerNotFound {
+            download_set_state(manager, entry_index, .Extracted)
+            download_set_message(manager, entry_index, install_message)
+            download_write_manifest(manager, entry_index, "extracted", install_message)
+        } else if install_result == .InstallerPaused || download_should_pause(manager, entry_index) {
             download_pause_entry(manager, entry_index, client)
-        } else if download_should_cancel(manager, entry_index) {
+        } else if install_result == .InstallerCancelled || download_should_cancel(manager, entry_index) {
             download_cancel_entry(manager, entry_index, client)
         } else {
             download_fail_entry(manager, entry_index, install_message)
@@ -567,11 +630,17 @@ download_resume_archive_entry :: proc(
     )
     delete(marker_path)
     if !marked {
-        download_fail_entry(manager, entry_index, marker_error)
+        if download_should_cancel(manager, entry_index) {
+            download_cancel_entry(manager, entry_index, client)
+        } else {
+            download_fail_entry(manager, entry_index, marker_error)
+        }
         delete(marker_error)
         return
     }
     delete(marker_error)
+    download_set_message(manager, entry_index, "Installed through GE-Proton8-25.")
+    download_write_manifest(manager, entry_index, "completed", "Installed through GE-Proton8-25.")
     if client != nil && len(torrent_id) > 0 {
         download_delete_remote_torrent(client, torrent_id)
     }
@@ -594,6 +663,34 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
 
     if game_index < 0 || game_index >= len(app.games) {
         download_fail_entry(manager, entry_index, "Invalid game index.")
+        return
+    }
+
+    // A fully downloaded archive must remain installable even if the
+    // Real-Debrid token expired after the download completed. Resume the
+    // archive/runtime/install path before contacting the API again.
+    resume_phase, resume_archive, resume_torrent := download_read_manifest_for_game(manager, game_index)
+    defer delete(resume_phase)
+    defer delete(resume_archive)
+    defer delete(resume_torrent)
+    if download_should_cancel(manager, entry_index) {
+        download_cancel_entry(manager, entry_index, nil)
+        return
+    }
+    if (resume_phase == "archive_ready" ||
+        resume_phase == "extracting" ||
+        resume_phase == "extracted" ||
+        resume_phase == "installing" ||
+        resume_phase == "paused") &&
+       len(resume_archive) > 0 && os.exists(resume_archive) {
+        download_resume_archive_entry(
+            manager,
+            entry_index,
+            resume_archive,
+            resume_torrent,
+            resume_phase,
+            nil,
+        )
         return
     }
 
@@ -626,35 +723,13 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
         return
     }
 
-    resume_phase, resume_archive, resume_torrent := download_read_manifest_for_game(manager, game_index)
-    defer delete(resume_phase)
-    defer delete(resume_archive)
-    defer delete(resume_torrent)
-    if (resume_phase == "archive_ready" ||
-        resume_phase == "extracting" ||
-        resume_phase == "installing") &&
-       len(resume_archive) > 0 && os.exists(resume_archive) {
-        client := NewRealDebridClient(token)
-        if len(resume_torrent) > 0 {
-            download_set_torrent_id(manager, entry_index, resume_torrent)
-        }
-        download_resume_archive_entry(
-            manager,
-            entry_index,
-            resume_archive,
-            resume_torrent,
-            resume_phase,
-            &client,
-        )
-        return
-    }
-
     if download_should_cancel(manager, entry_index) {
         download_cancel_entry(manager, entry_index, nil)
         return
     }
 
     download_set_state(manager, entry_index, .Resolving)
+    download_set_message(manager, entry_index, "Preparing Real-Debrid torrent...")
     download_write_manifest(manager, entry_index, "resolving", "")
 
     if !EnsureDownloadDirectory(app.download_path) {
@@ -822,6 +897,7 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
     }
 
     download_set_state(manager, entry_index, .Downloading)
+    download_set_message(manager, entry_index, "Downloading game archive...")
 
     if len(info.links) == 0 {
         DestroyRealDebridTorrentInfo(&info)
@@ -877,6 +953,9 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
         expected_size := direct.filesize
         download_set_paths(manager, entry_index, output_path, part_path)
         download_write_manifest(manager, entry_index, "local_downloading", "")
+        file_status_message := fmt.aprintf("Downloading %s...", filename)
+        download_set_message(manager, entry_index, file_status_message)
+        delete(file_status_message)
         download_set_progress(
             manager,
             entry_index,
@@ -1016,55 +1095,18 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
     }
 
     if DownloadPathIsArchive(first_output_path) {
-        fmt.printf("[DOWNLOAD] Archive detected; starting extraction %s\n", first_output_path)
-        download_set_state(manager, entry_index, .Extracting)
-        download_write_manifest(manager, entry_index, "archive_ready", "")
-        download_write_manifest(manager, entry_index, "extracting", "")
-        fmt.printf("[DOWNLOAD] Extracting archive %s\n", first_output_path)
-        extracted, extraction_message := ExtractDownloadArchiveAndWait(
+        fmt.printf("[DOWNLOAD] Archive detected; starting GE-Proton install flow %s\n", first_output_path)
+        download_write_manifest(manager, entry_index, "archive_ready", "Archive downloaded; preparing extraction.")
+        download_resume_archive_entry(
             manager,
             entry_index,
             first_output_path,
+            torrent_id,
+            "archive_ready",
+            &client,
         )
-        if !extracted {
-            fmt.printf("[DOWNLOAD] Archive extraction failed: %s\n", extraction_message)
-            if download_should_pause(manager, entry_index) {
-                download_pause_entry(manager, entry_index, &client)
-            } else if download_should_cancel(manager, entry_index) {
-                download_cancel_entry(manager, entry_index, &client)
-            } else {
-                download_fail_entry(manager, entry_index, extraction_message)
-                download_delete_remote_torrent(&client, torrent_id)
-            }
-            delete(extraction_message)
-            delete(first_output_path)
-            return
-        }
-        fmt.printf("[DOWNLOAD] Archive extraction completed: %s\n", extraction_message)
-        delete(extraction_message)
-
-        download_set_state(manager, entry_index, .Installing)
-        download_write_manifest(manager, entry_index, "installing", "")
-        launched, install_message := LaunchDownloadInstaller(
-            manager,
-            entry_index,
-            first_output_path,
-        )
-        if !launched {
-            if download_should_pause(manager, entry_index) {
-                download_pause_entry(manager, entry_index, &client)
-            } else if download_should_cancel(manager, entry_index) {
-                download_cancel_entry(manager, entry_index, &client)
-            } else {
-                download_fail_entry(manager, entry_index, install_message)
-                download_delete_remote_torrent(&client, torrent_id)
-            }
-            delete(install_message)
-            delete(first_output_path)
-            return
-        }
-        fmt.printf("[DOWNLOAD] Archive processing completed for %s\n", first_output_path)
-        delete(install_message)
+        delete(first_output_path)
+        return
     }
 
     marked, marker_error := download_mark_entry_complete(
@@ -1075,7 +1117,8 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
         completed_bytes,
     )
     if marked {
-        download_write_manifest(manager, entry_index, "completed", "")
+        download_set_message(manager, entry_index, "Installed.")
+        download_write_manifest(manager, entry_index, "completed", "Installed.")
     }
     delete(first_output_path)
     if !marked {
@@ -1447,7 +1490,7 @@ download_finalize_file :: proc(
         manager.entries[entry_index].progress = 1
         manager.entries[entry_index].bytes_downloaded = expected_size
         manager.entries[entry_index].bytes_total = expected_size
-        manager.entries[entry_index].state = .Completed
+        manager.entries[entry_index].state = .Installed
     }
     return true, false, ""
 }
@@ -1482,7 +1525,7 @@ download_mark_entry_complete :: proc(
     manager.entries[entry_index].progress = 1
     manager.entries[entry_index].bytes_downloaded = total_bytes
     manager.entries[entry_index].bytes_total = total_bytes
-    manager.entries[entry_index].state = .Completed
+    manager.entries[entry_index].state = .Installed
     return true, ""
 }
 
@@ -1513,6 +1556,18 @@ download_set_state :: proc(manager: ^DownloadManager, entry_index: int, state: D
     if entry_index >= 0 && entry_index < len(manager.entries) {
         manager.entries[entry_index].state = state
     }
+}
+
+
+download_set_message :: proc(manager: ^DownloadManager, entry_index: int, message: string) {
+    sync.mutex_lock(&manager.mutex)
+    defer sync.mutex_unlock(&manager.mutex)
+
+    if entry_index < 0 || entry_index >= len(manager.entries) {
+        return
+    }
+    delete(manager.entries[entry_index].status_message)
+    manager.entries[entry_index].status_message = strings.clone(message, context.allocator)
 }
 
 
@@ -1603,7 +1658,9 @@ download_fail_entry :: proc(manager: ^DownloadManager, entry_index: int, message
     }
 
     delete(manager.entries[entry_index].error_message)
+    delete(manager.entries[entry_index].status_message)
     manager.entries[entry_index].error_message = strings.clone(message, context.allocator)
+    manager.entries[entry_index].status_message = strings.clone(message, context.allocator)
     manager.entries[entry_index].state = .Failed
     sync.mutex_unlock(&manager.mutex)
     download_write_manifest(manager, entry_index, "failed", message)
@@ -1638,13 +1695,15 @@ download_pause_entry :: proc(manager: ^DownloadManager, entry_index: int, client
         switch manager.entries[entry_index].state {
         case .Extracting: resume_phase = "extracting"
         case .Installing: resume_phase = "installing"
+        case .Extracted: resume_phase = "extracted"
         case .NotDownloaded, .Queued, .Resolving, .Downloading,
-             .Completed, .Cancelled, .Paused, .Failed:
+             .Installed, .Cancelled, .Paused, .Failed:
             resume_phase = "paused"
         }
     }
     sync.mutex_unlock(&manager.mutex)
     download_set_state(manager, entry_index, .Paused)
+    download_set_message(manager, entry_index, "Paused; resumable data was preserved.")
     download_write_manifest(manager, entry_index, resume_phase, "Partial work preserved.")
 }
 
@@ -1679,6 +1738,8 @@ download_remove_local_artifacts :: proc(manager: ^DownloadManager, entry_index: 
     output_path := strings.clone(manager.entries[entry_index].output_path, context.allocator)
     part_path := strings.clone(manager.entries[entry_index].part_path, context.allocator)
     archive_path := strings.clone(manager.entries[entry_index].archive_path, context.allocator)
+    info_hash := strings.clone(manager.entries[entry_index].info_hash, context.allocator)
+    download_directory := strings.clone(manager.app.download_path, context.allocator)
 
     delete(manager.entries[entry_index].output_path)
     delete(manager.entries[entry_index].part_path)
@@ -1691,6 +1752,8 @@ download_remove_local_artifacts :: proc(manager: ^DownloadManager, entry_index: 
     defer delete(output_path)
     defer delete(part_path)
     defer delete(archive_path)
+    defer delete(info_hash)
+    defer delete(download_directory)
 
     download_remove_local_path(output_path, "downloaded file")
     if len(part_path) > 0 && part_path != output_path {
@@ -1718,6 +1781,26 @@ download_remove_local_artifacts :: proc(manager: ^DownloadManager, entry_index: 
             }
         }
     }
+
+    prefix_path := DownloadGamePrefixPath(download_directory, info_hash)
+    defer delete(prefix_path)
+    install_path := DownloadGameInstallPath(download_directory, info_hash)
+    defer delete(install_path)
+    if len(prefix_path) > 0 && os.exists(prefix_path) {
+        if remove_err := os.remove_all(prefix_path); remove_err != nil {
+            fmt.printf("[DOWNLOAD] WARNING: could not remove Proton prefix %s: %v\n", prefix_path, remove_err)
+        } else {
+            fmt.printf("[DOWNLOAD] Removed Proton prefix %s\n", prefix_path)
+        }
+    }
+
+    if len(install_path) > 0 && os.exists(install_path) {
+        if remove_err := os.remove_all(install_path); remove_err != nil {
+            fmt.printf("[DOWNLOAD] WARNING: could not remove partial game installation %s: %v\n", install_path, remove_err)
+        } else {
+            fmt.printf("[DOWNLOAD] Removed partial game installation %s\n", install_path)
+        }
+    }
 }
 
 
@@ -1734,8 +1817,10 @@ download_cancel_entry :: proc(manager: ^DownloadManager, entry_index: int, clien
         download_set_state(manager, entry_index, .Paused)
         download_write_manifest(manager, entry_index, "paused", "Partial download preserved.")
     } else {
+        CleanupGEProtonRuntimeDownload()
         download_remove_local_artifacts(manager, entry_index)
         download_set_state(manager, entry_index, .Cancelled)
+        download_set_message(manager, entry_index, "Cancelled; local partial files were removed.")
         download_write_manifest(manager, entry_index, "cancelled", "Download cancelled; local partial files removed.")
     }
 }
@@ -1936,6 +2021,24 @@ download_read_manifest_for_game :: proc(manager: ^DownloadManager, game_index: i
     archive_path = download_manifest_value(text, "archive_path")
     torrent_id = download_manifest_value(text, "torrent_id")
     return phase, archive_path, torrent_id
+}
+
+
+download_manifest_value_from_file :: proc(manager: ^DownloadManager, game_index: int, key: string) -> string {
+    if manager == nil || manager.app == nil ||
+       game_index < 0 || game_index >= len(manager.app.games) {
+        return ""
+    }
+    info_hash := download_info_hash(manager.app.games[game_index].magnetLink)
+    defer delete(info_hash)
+    path := download_manifest_path(manager.app.download_path, info_hash)
+    defer delete(path)
+    data, read_err := os.read_entire_file_from_path(path, context.temp_allocator)
+    if read_err != nil {
+        return ""
+    }
+    defer delete(data)
+    return download_manifest_value(string(data[:]), key)
 }
 
 

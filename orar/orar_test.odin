@@ -8,6 +8,8 @@ format_detection_and_rejection_test :: proc(t: ^testing.T) {
 	testing.expect_value(t, Detect([]byte{'R', 'a', 'r', '!', 0x1a, 0x07, 0x00}), Format.RAR4)
 	testing.expect_value(t, Detect([]byte{'R', 'a', 'r', '!', 0x1a, 0x07, 0x01, 0x00}), Format.RAR5)
 	testing.expect_value(t, Detect([]byte{0x50, 0x4b, 0x03, 0x04}), Format.ZIP)
+	testing.expect_value(t, Detect([]byte{0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00}), Format.TAR_XZ)
+	testing.expect_value(t, Detect([]byte{0x1f, 0x8b}), Format.TAR_GZ)
 	testing.expect_value(t, Detect([]byte{'n', 'o', 't', ' ', 'a', 'r', 'c', 'h'}), Format.Unknown)
 	_, err := Open_Bytes([]byte{'n', 'o', 't', ' ', 'a', 'n', ' ', 'a', 'r', 'c', 'h', 'i', 'v', 'e'})
 	testing.expect_value(t, err, Error.Unsupported_Format)
@@ -73,6 +75,45 @@ zip_store_and_deflate_test :: proc(t: ^testing.T) {
 	testing.expect_value(t, deflate_output_err, Error.None)
 	defer delete(deflate_output)
 	testing.expect(t, bytes_equal_orar(deflate_output, deflate_payload[:]))
+}
+
+@(test)
+tar_xz_probe_test :: proc(t: ^testing.T) {
+	path := "orar/testdata/a.tar.xz"
+	archive, open_err := Open_File(path)
+	testing.expect_value(t, open_err, Error.None)
+	if open_err != .None {
+		return
+	}
+	defer Destroy_Archive(&archive)
+	testing.expect_value(t, archive.Format, Format.TAR_XZ)
+	entry, entry_err := Next(&archive)
+	testing.expect_value(t, entry_err, Error.None)
+	if entry_err == .None {
+		output, extract_err := Extract_Current(&archive)
+		testing.expect_value(t, extract_err, Error.None)
+		testing.expect(t, string(output) == "hello\n")
+		delete(output)
+	}
+}
+
+@(test)
+tar_gz_fixture_test :: proc(t: ^testing.T) {
+	archive, open_err := Open_File("orar/testdata/a.tar.gz")
+	testing.expect_value(t, open_err, Error.None)
+	if open_err != .None {
+		return
+	}
+	defer Destroy_Archive(&archive)
+	testing.expect_value(t, archive.Format, Format.TAR_GZ)
+	entry, entry_err := Next(&archive)
+	testing.expect_value(t, entry_err, Error.None)
+	if entry_err == .None {
+		output, extract_err := Extract_Current(&archive)
+		testing.expect_value(t, extract_err, Error.None)
+		testing.expect(t, string(output) == "hello\n")
+		delete(output)
+	}
 }
 
 @(test)

@@ -18,6 +18,10 @@ of the checked-in `unarr` reference implementation.
   return `Error.Unsupported_Feature`.
 - **TAR**: traditional and ustar headers, GNU long names, and PAX `path`,
   `size`, and `mtime` records.
+- **TAR.XZ**: XZ streams using the LZMA2 filter, CRC32/CRC64 checks, and the
+  same TAR features as plain TAR.
+- **TAR.GZ**: GZIP-wrapped DEFLATE streams with header/trailer and CRC32
+  validation, using the same TAR features as plain TAR.
 - **ZIP**: stored and raw Deflate entries, ZIP64 metadata, UTF-8 and CP437
   names, directory metadata, archive comments, and CRC32 verification.
   Deflate64, BZip2, LZMA, XZ, and PPMd ZIP methods return
@@ -92,8 +96,9 @@ odin test orar -debug
 ```
 
 The tests construct RAR4, RAR5-store, TAR, ZIP-store, and ZIP-Deflate archives in memory.
-When the checked-in unarr corpus is available, they additionally exercise the
-real TAR, ZIP, and compressed RAR4 files.
+They also validate the checked-in `tar.xz` and `tar.gz` fixtures. When the
+checked-in unarr corpus is available, they additionally exercise the real TAR, ZIP, and
+compressed RAR4 files.
 
 ## License
 

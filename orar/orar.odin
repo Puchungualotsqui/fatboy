@@ -10,6 +10,8 @@ Format :: enum {
 	RAR5,
 	ZIP,
 	TAR,
+	TAR_XZ,
+	TAR_GZ,
 }
 
 // Entry_Kind describes the logical kind of an archive entry.
@@ -59,9 +61,12 @@ Entry :: struct {
 // archive created by Open_Bytes_Borrowed only borrows the caller's bytes and
 // must not outlive them.
 Archive :: struct {
-	Format:          Format,
-	Data:            []byte,
-	Owns_Data:       bool,
+	Format:         Format,
+	Data:           []byte,
+	// Payload is an owned decompressed container payload, used by TAR.XZ/TAR.GZ.
+	// Data always remains the original archive bytes.
+	Payload:        []byte,
+	Owns_Data:      bool,
 	Entries:         [dynamic]Entry,
 	Comment:         string,
 	Cursor:          int,
@@ -90,6 +95,13 @@ Detect :: proc(data: []byte) -> Format {
 		(data[2] == 0x03 || data[2] == 0x05 || data[2] == 0x07) &&
 		(data[3] == 0x04 || data[3] == 0x06 || data[3] == 0x08) {
 		return .ZIP
+	}
+	if len(data) >= 6 && data[0] == 0xfd && data[1] == 0x37 &&
+		data[2] == 0x7a && data[3] == 0x58 && data[4] == 0x5a && data[5] == 0x00 {
+		return .TAR_XZ
+	}
+	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+		return .TAR_GZ
 	}
 
 	// TAR has no mandatory magic in its oldest form. The ustar marker is a
@@ -173,6 +185,7 @@ Destroy_Archive :: proc(archive: ^Archive) {
 	delete(archive.Entries)
 	delete(archive.Comment)
 	delete(archive.Current_Data)
+	delete(archive.Payload)
 	if archive.Owns_Data {
 		delete(archive.Data)
 	}
@@ -369,6 +382,10 @@ Format_Name :: proc(format: Format) -> string {
 		return "ZIP"
 	case .TAR:
 		return "TAR"
+	case .TAR_XZ:
+		return "TAR.XZ"
+	case .TAR_GZ:
+		return "TAR.GZ"
 	case .Unknown:
 		return "unknown"
 	}
@@ -402,6 +419,28 @@ parse_archive :: proc(archive: ^Archive) -> Error {
 			archive.Format = .TAR
 		}
 		return err
+	case .TAR_XZ:
+		payload, err := decode_xz(archive.Data)
+		if err != .None {
+			return err
+		}
+		archive.Payload = payload
+		err = parse_tar(archive)
+		if err == .None {
+			archive.Format = .TAR_XZ
+		}
+		return err
+	case .TAR_GZ:
+		payload, err := decode_gzip(archive.Data)
+		if err != .None {
+			return err
+		}
+		archive.Payload = payload
+		err = parse_tar(archive)
+		if err == .None {
+			archive.Format = .TAR_GZ
+		}
+		return err
 	case .Unknown:
 		return .Unsupported_Format
 	}
@@ -417,7 +456,7 @@ decode_entry :: proc(archive: ^Archive, index: int) -> ([]byte, Error) {
 		return decode_rar5_entry(archive, index)
 	case .ZIP:
 		return decode_zip_entry(archive, index)
-	case .TAR:
+	case .TAR, .TAR_XZ, .TAR_GZ:
 		return decode_tar_entry(archive, index)
 	case .Unknown:
 		return nil, .Unsupported_Format
