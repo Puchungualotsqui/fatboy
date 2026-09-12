@@ -1,7 +1,7 @@
 package main
 
 import "core:fmt"
-import orui "orui"
+import orui "./orui"
 import rl "vendor:raylib"
 
 

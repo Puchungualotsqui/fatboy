@@ -4,7 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import endian "core:encoding/endian"
-import orui "orui"
+import orui "./orui"
 import tinyfd "tinyfiledialogs"
 import rl "vendor:raylib"
 

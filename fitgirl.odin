@@ -759,7 +759,7 @@ download_worker :: proc(task: thread.Task) {
     curl.easy_setopt(
         handle,
         .USERAGENT,
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FitDeck/1.0",
+        "Mozilla/5.0 FitDeck/1.0",
     )
     curl.easy_setopt(handle, .TIMEOUT, 15)
     curl.easy_setopt(handle, .ACCEPT_ENCODING, "")

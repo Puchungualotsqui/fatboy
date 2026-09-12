@@ -143,18 +143,30 @@ DownloadQueueGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
     marker_path := download_marker_path(app.download_path, info_hash)
     defer delete(marker_path)
 
+    manifest_phase, manifest_archive, _ := download_read_manifest_for_game(manager, game_index)
+    defer delete(manifest_phase)
+    defer delete(manifest_archive)
+    stale_failed_manifest := manifest_phase == "failed" && len(manifest_archive) > 0
+    stale_failed_part := ""
+    if stale_failed_manifest {
+        stale_failed_part = fmt.aprintf("%s.part", manifest_archive)
+        defer delete(stale_failed_part)
+    }
+
     sync.mutex_lock(&manager.mutex)
-    defer sync.mutex_unlock(&manager.mutex)
 
     if manager.stop_requested {
+        sync.mutex_unlock(&manager.mutex)
         return false
     }
 
     if len(info_hash) > 0 && download_marker_valid(marker_path) {
+        sync.mutex_unlock(&manager.mutex)
         return false
     }
 
-    for &entry in manager.entries {
+    retry_cleanup_index := -1
+    for &entry, entry_index in manager.entries {
         same_game := entry.game_index == game_index
         same_hash := len(info_hash) > 0 && entry.info_hash == info_hash
 
@@ -164,8 +176,12 @@ DownloadQueueGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
 
         switch entry.state {
         case .Queued, .Resolving, .Downloading, .Extracting, .Installing, .Completed:
+            sync.mutex_unlock(&manager.mutex)
             return false
         case .Cancelled, .Paused, .Failed, .NotDownloaded:
+            if entry.state == .Failed {
+                retry_cleanup_index = entry_index
+            }
             delete(entry.error_message)
             entry.error_message = ""
             entry.state = .Queued
@@ -174,15 +190,29 @@ DownloadQueueGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
             entry.bytes_total = 0
             entry.cancel_requested = false
             entry.pause_requested = false
-            return true
+            break
         }
+        break
     }
 
-    append(&manager.entries, DownloadEntry{
-        game_index = game_index,
-        info_hash = strings.clone(info_hash, context.allocator),
-        state = .Queued,
-    })
+    if retry_cleanup_index < 0 {
+        append(&manager.entries, DownloadEntry{
+            game_index = game_index,
+            info_hash = strings.clone(info_hash, context.allocator),
+            output_path = stale_failed_manifest ? strings.clone(manifest_archive, context.allocator) : "",
+            part_path = stale_failed_manifest ? strings.clone(stale_failed_part, context.allocator) : "",
+            archive_path = stale_failed_manifest ? strings.clone(manifest_archive, context.allocator) : "",
+            state = .Queued,
+        })
+        if stale_failed_manifest {
+            retry_cleanup_index = len(manager.entries) - 1
+        }
+    }
+    sync.mutex_unlock(&manager.mutex)
+
+    if retry_cleanup_index >= 0 {
+        download_remove_local_artifacts(manager, retry_cleanup_index)
+    }
     return true
 }
 
@@ -193,9 +223,7 @@ DownloadCancelGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
     }
 
     sync.mutex_lock(&manager.mutex)
-    defer sync.mutex_unlock(&manager.mutex)
-
-    for &entry in manager.entries {
+    for &entry, entry_index in manager.entries {
         if entry.game_index != game_index {
             continue
         }
@@ -204,16 +232,23 @@ DownloadCancelGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
         case .Queued:
             entry.state = .Cancelled
             entry.cancel_requested = true
+            sync.mutex_unlock(&manager.mutex)
+            // A queued retry may still reference files from an earlier
+            // attempt, even though its worker has not started yet.
+            download_remove_local_artifacts(manager, entry_index)
             return true
         case .Resolving, .Downloading, .Extracting, .Installing:
             entry.cancel_requested = true
             entry.pause_requested = false
+            sync.mutex_unlock(&manager.mutex)
             return true
         case .NotDownloaded, .Completed, .Cancelled, .Paused, .Failed:
+            sync.mutex_unlock(&manager.mutex)
             return false
         }
     }
 
+    sync.mutex_unlock(&manager.mutex)
     return false
 }
 
@@ -474,12 +509,14 @@ download_resume_archive_entry :: proc(
     if phase != "installing" {
         download_set_state(manager, entry_index, .Extracting)
         download_write_manifest(manager, entry_index, "extracting", "")
+        fmt.printf("[DOWNLOAD] Extracting archive %s\n", archive_path)
         extracted, extraction_message := ExtractDownloadArchiveAndWait(
             manager,
             entry_index,
             archive_path,
         )
         if !extracted {
+            fmt.printf("[DOWNLOAD] Archive extraction failed: %s\n", extraction_message)
             if download_should_pause(manager, entry_index) {
                 download_pause_entry(manager, entry_index, nil)
             } else if download_should_cancel(manager, entry_index) {
@@ -490,6 +527,7 @@ download_resume_archive_entry :: proc(
             delete(extraction_message)
             return
         }
+        fmt.printf("[DOWNLOAD] Archive extraction completed: %s\n", extraction_message)
         delete(extraction_message)
     }
 
@@ -664,9 +702,26 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
             return
         }
 
+        // These booleans must be computed before destroying conversion_info:
+        // conversion_status is a string owned by that response object.
         conversion_status := conversion_info.status
+        waiting_for_selection := conversion_status == "waiting_files_selection"
+        terminal_conversion_error :=
+            conversion_status == "magnet_error" ||
+            conversion_status == "error" ||
+            conversion_status == "virus" ||
+            conversion_status == "dead"
+        conversion_is_still_running := conversion_status == "magnet_conversion"
+        conversion_failure_message := ""
+        if terminal_conversion_error {
+            conversion_failure_message = fmt.aprintf(
+                "Real-Debrid torrent failed: %s",
+                conversion_status,
+            )
+        }
+
         selected_files := "all"
-        if conversion_status == "waiting_files_selection" {
+        if waiting_for_selection {
             fmt.printf(
                 "[DOWNLOAD] Torrent awaiting file selection files=%d\n",
                 len(conversion_info.files),
@@ -685,33 +740,27 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
         }
         DestroyRealDebridTorrentInfo(&conversion_info)
 
-        if conversion_status == "waiting_files_selection" {
+        if waiting_for_selection {
             rd_err = RDSelectTorrentFiles(&client, torrent_id, selected_files)
             if rd_err.message != "" {
                 download_fail_entry_from_rd(manager, entry_index, &rd_err)
                 download_delete_remote_torrent(&client, torrent_id)
                 return
             }
+            fmt.println("[DOWNLOAD] Torrent file selection accepted; waiting for download to start")
             break
         }
 
-        if conversion_status == "magnet_error" ||
-           conversion_status == "error" ||
-           conversion_status == "virus" ||
-           conversion_status == "dead" {
-            message := fmt.aprintf(
-                "Real-Debrid torrent failed: %s",
-                conversion_status,
-            )
-            download_fail_entry(manager, entry_index, message)
-            delete(message)
+        if terminal_conversion_error {
+            download_fail_entry(manager, entry_index, conversion_failure_message)
+            delete(conversion_failure_message)
             download_delete_remote_torrent(&client, torrent_id)
             return
         }
 
         // queued/downloading/downloaded means selection has already been
         // accepted, while magnet_conversion means we should keep polling.
-        if conversion_status != "magnet_conversion" {
+        if !conversion_is_still_running {
             break
         }
 
@@ -883,16 +932,35 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
         }
 
         if !completed {
+            interrupted_by_pause := download_should_pause(manager, entry_index)
+            interrupted_by_cancel := download_should_cancel(manager, entry_index)
+            if interrupted_by_pause || interrupted_by_cancel {
+                delete(filename)
+                delete(output_path)
+                delete(part_path)
+                DestroyRealDebridTorrentInfo(&info)
+                delete(first_output_path)
+                if interrupted_by_pause {
+                    download_pause_entry(manager, entry_index, &client)
+                } else {
+                    download_cancel_entry(manager, entry_index, &client)
+                }
+                delete(transfer_error)
+                return
+            }
+
             delete(filename)
             delete(output_path)
             delete(part_path)
             DestroyRealDebridTorrentInfo(&info)
             delete(first_output_path)
             download_fail_entry(manager, entry_index, transfer_error)
+            delete(transfer_error)
             download_delete_remote_torrent(&client, torrent_id)
             return
         }
 
+        fmt.printf("[DOWNLOAD] Finalizing local file %s\n", output_path)
         finalized, finalize_cancelled, finalize_error := download_finalize_file(
             manager,
             entry_index,
@@ -901,6 +969,11 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
             marker_path,
             expected_size,
             false,
+        )
+        fmt.printf(
+            "[DOWNLOAD] Local file finalization result finalized=%v cancelled=%v\n",
+            finalized,
+            finalize_cancelled,
         )
         delete(filename)
         delete(output_path)
@@ -934,6 +1007,7 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
         )
     }
 
+    fmt.println("[DOWNLOAD] Local files finalized; releasing torrent metadata")
     DestroyRealDebridTorrentInfo(&info)
     if len(first_output_path) == 0 {
         download_fail_entry(manager, entry_index, "Real-Debrid returned no file paths.")
@@ -942,15 +1016,18 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
     }
 
     if DownloadPathIsArchive(first_output_path) {
-        download_write_manifest(manager, entry_index, "archive_ready", "")
+        fmt.printf("[DOWNLOAD] Archive detected; starting extraction %s\n", first_output_path)
         download_set_state(manager, entry_index, .Extracting)
+        download_write_manifest(manager, entry_index, "archive_ready", "")
         download_write_manifest(manager, entry_index, "extracting", "")
+        fmt.printf("[DOWNLOAD] Extracting archive %s\n", first_output_path)
         extracted, extraction_message := ExtractDownloadArchiveAndWait(
             manager,
             entry_index,
             first_output_path,
         )
         if !extracted {
+            fmt.printf("[DOWNLOAD] Archive extraction failed: %s\n", extraction_message)
             if download_should_pause(manager, entry_index) {
                 download_pause_entry(manager, entry_index, &client)
             } else if download_should_cancel(manager, entry_index) {
@@ -963,6 +1040,7 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
             delete(first_output_path)
             return
         }
+        fmt.printf("[DOWNLOAD] Archive extraction completed: %s\n", extraction_message)
         delete(extraction_message)
 
         download_set_state(manager, entry_index, .Installing)
@@ -985,7 +1063,7 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
             delete(first_output_path)
             return
         }
-        fmt.printf("[DOWNLOAD] Installer launched for %s\n", first_output_path)
+        fmt.printf("[DOWNLOAD] Archive processing completed for %s\n", first_output_path)
         delete(install_message)
     }
 
@@ -1424,8 +1502,7 @@ download_should_cancel :: proc(manager: ^DownloadManager, entry_index: int) -> b
     return manager.stop_requested ||
         entry_index < 0 ||
         entry_index >= len(manager.entries) ||
-        manager.entries[entry_index].cancel_requested ||
-        manager.entries[entry_index].pause_requested
+        manager.entries[entry_index].cancel_requested
 }
 
 
@@ -1518,6 +1595,7 @@ download_set_torrent_progress :: proc(manager: ^DownloadManager, entry_index: in
 
 
 download_fail_entry :: proc(manager: ^DownloadManager, entry_index: int, message: string) {
+    fmt.printf("[DOWNLOAD] FAILED entry=%d message=%s\n", entry_index, message)
     sync.mutex_lock(&manager.mutex)
     if entry_index < 0 || entry_index >= len(manager.entries) {
         sync.mutex_unlock(&manager.mutex)
@@ -1571,6 +1649,78 @@ download_pause_entry :: proc(manager: ^DownloadManager, entry_index: int, client
 }
 
 
+download_remove_local_path :: proc(path, label: string) {
+    if len(path) == 0 || !os.exists(path) {
+        return
+    }
+    if remove_err := os.remove(path); remove_err != nil {
+        fmt.printf(
+            "[DOWNLOAD] WARNING: could not remove %s %s: %v\n",
+            label,
+            path,
+            remove_err,
+        )
+    } else {
+        fmt.printf("[DOWNLOAD] Removed %s %s\n", label, path)
+    }
+}
+
+
+download_remove_local_artifacts :: proc(manager: ^DownloadManager, entry_index: int) {
+    if manager == nil {
+        return
+    }
+
+    sync.mutex_lock(&manager.mutex)
+    if entry_index < 0 || entry_index >= len(manager.entries) {
+        sync.mutex_unlock(&manager.mutex)
+        return
+    }
+    output_path := strings.clone(manager.entries[entry_index].output_path, context.allocator)
+    part_path := strings.clone(manager.entries[entry_index].part_path, context.allocator)
+    archive_path := strings.clone(manager.entries[entry_index].archive_path, context.allocator)
+
+    delete(manager.entries[entry_index].output_path)
+    delete(manager.entries[entry_index].part_path)
+    delete(manager.entries[entry_index].archive_path)
+    manager.entries[entry_index].output_path = ""
+    manager.entries[entry_index].part_path = ""
+    manager.entries[entry_index].archive_path = ""
+    sync.mutex_unlock(&manager.mutex)
+
+    defer delete(output_path)
+    defer delete(part_path)
+    defer delete(archive_path)
+
+    download_remove_local_path(output_path, "downloaded file")
+    if len(part_path) > 0 && part_path != output_path {
+        download_remove_local_path(part_path, "partial file")
+    }
+    if len(archive_path) > 0 && archive_path != output_path && archive_path != part_path {
+        download_remove_local_path(archive_path, "archive file")
+    }
+
+    if DownloadPathIsArchive(archive_path) {
+        extracted_directory := DownloadArchiveExtractDirectory(archive_path)
+        defer delete(extracted_directory)
+        if os.exists(extracted_directory) {
+            if remove_err := os.remove_all(extracted_directory); remove_err != nil {
+                fmt.printf(
+                    "[DOWNLOAD] WARNING: could not remove extracted directory %s: %v\n",
+                    extracted_directory,
+                    remove_err,
+                )
+            } else {
+                fmt.printf(
+                    "[DOWNLOAD] Removed extracted directory %s\n",
+                    extracted_directory,
+                )
+            }
+        }
+    }
+}
+
+
 download_cancel_entry :: proc(manager: ^DownloadManager, entry_index: int, client: ^RealDebridClient) {
     paused := download_should_pause(manager, entry_index)
     torrent_id := download_copy_torrent_id(manager, entry_index)
@@ -1584,8 +1734,9 @@ download_cancel_entry :: proc(manager: ^DownloadManager, entry_index: int, clien
         download_set_state(manager, entry_index, .Paused)
         download_write_manifest(manager, entry_index, "paused", "Partial download preserved.")
     } else {
+        download_remove_local_artifacts(manager, entry_index)
         download_set_state(manager, entry_index, .Cancelled)
-        download_write_manifest(manager, entry_index, "cancelled", "Download cancelled; partial data preserved.")
+        download_write_manifest(manager, entry_index, "cancelled", "Download cancelled; local partial files removed.")
     }
 }
 

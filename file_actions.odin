@@ -6,35 +6,102 @@ import "core:path/filepath"
 import "core:strings"
 import "core:time"
 
+import orar "orar"
+
 DownloadPathIsArchive :: proc(path: string) -> bool {
     lower := strings.to_lower(path, context.temp_allocator)
-    return strings.contains(lower, ".rar") ||
-        strings.contains(lower, ".7z") ||
-        strings.contains(lower, ".zip")
+    last_separator := strings.last_index(lower, "/")
+    if backslash := strings.last_index(lower, "\\"); backslash > last_separator {
+        last_separator = backslash
+    }
+    dot := strings.last_index(lower, ".")
+    if dot <= last_separator || dot < 0 || dot+1 >= len(lower) {
+        return false
+    }
+
+    extension := lower[dot+1:]
+    return extension == "rar" ||
+        extension == "7z" ||
+        extension == "zip" ||
+        extension == "tar"
 }
 
 
 DownloadArchiveExtractDirectory :: proc(archive_path: string) -> string {
+    last_separator := strings.last_index(archive_path, "/")
+    if backslash := strings.last_index(archive_path, "\\"); backslash > last_separator {
+        last_separator = backslash
+    }
     dot := strings.last_index(archive_path, ".")
-    if dot > 0 {
+    if dot > last_separator && dot > 0 {
         return fmt.aprintf("%s_extracted", archive_path[:dot])
     }
     return fmt.aprintf("%s_extracted", archive_path)
 }
 
 
-find_seven_zip :: proc() -> string {
-    candidates := [3]string{
-        "C:/Program Files/7-Zip/7z.exe",
-        "C:/Program Files (x86)/7-Zip/7z.exe",
-        "7z.exe",
+archive_entry_relative_path :: proc(name: string) -> (string, bool) {
+    // Archive names are not filesystem paths. Normalize both separator styles
+    // and reject absolute/traversal names before joining them to the output
+    // directory. This keeps extraction safe on every supported host OS.
+    if len(name) == 0 || name[0] == '/' || name[0] == '\\' ||
+       (len(name) >= 2 && name[1] == ':') {
+        return "", false
     }
-    for candidate in candidates {
-        if candidate == "7z.exe" || os.exists(candidate) {
-            return strings.clone(candidate, context.allocator)
+
+    normalized: [dynamic]byte
+    segment_start := 0
+    for index := 0; index <= len(name); index += 1 {
+        at_separator := index == len(name) ||
+            name[index] == '/' || name[index] == '\\'
+        if !at_separator {
+            if name[index] == 0 || name[index] == ':' || name[index] < 32 {
+                delete(normalized)
+                return "", false
+            }
+            continue
         }
+
+        segment := name[segment_start:index]
+        if segment == ".." {
+            delete(normalized)
+            return "", false
+        }
+        if segment != "" && segment != "." {
+            if len(normalized) > 0 {
+                append(&normalized, byte('/'))
+            }
+            append(&normalized, segment)
+        }
+        segment_start = index + 1
     }
-    return ""
+
+    if len(normalized) == 0 {
+        delete(normalized)
+        return "", false
+    }
+    result := strings.clone(string(normalized[:]), context.allocator)
+    delete(normalized)
+    return result, true
+}
+
+
+archive_error_message :: proc(err: orar.Error) -> string {
+    #partial switch err {
+    case .Unsupported_Format:
+        return "This file is not a supported archive. orar supports RAR, ZIP, and TAR files; 7z is not supported."
+    case .Unsupported_Feature:
+        return "This archive uses a compression feature that orar does not support."
+    case .Encrypted:
+        return "Encrypted archives are not supported."
+    case .Checksum_Mismatch:
+        return "The archive failed its checksum validation."
+    case .Truncated:
+        return "The archive is incomplete or truncated."
+    case .Invalid_Archive:
+        return "The archive is malformed or invalid."
+    }
+    return "The archive operation failed."
 }
 
 
@@ -47,11 +114,11 @@ ExtractDownloadArchiveAndWait :: proc(
         return false, "The completed archive could not be found."
     }
 
-    seven_zip := find_seven_zip()
-    if len(seven_zip) == 0 {
-        return false, "7-Zip was not found. Install 7-Zip and try again."
+    archive, open_err := orar.Open_File(archive_path)
+    if open_err != .None {
+        return false, archive_error_message(open_err)
     }
-    defer delete(seven_zip)
+    defer orar.Destroy_Archive(&archive)
 
     output_directory := DownloadArchiveExtractDirectory(archive_path)
     defer delete(output_directory)
@@ -61,37 +128,153 @@ ExtractDownloadArchiveAndWait :: proc(
         }
     }
 
-    output_parameter := fmt.aprintf("-o%s", output_directory)
-    defer delete(output_parameter)
-    command := []string{seven_zip, "x", archive_path, output_parameter, "-y"}
-    process, start_err := os.process_start(os.Process_Desc{command = command})
-    if start_err != nil {
-        return false, fmt.aprintf("Could not start 7-Zip: %v", start_err)
+    total_extract_bytes: u64 = 0
+    for entry in archive.Entries {
+        if entry.Kind == .File {
+            total_extract_bytes += entry.Size
+        }
     }
+    extracted_bytes: u64 = 0
+    download_set_progress(manager, entry_index, 0, 0, i64(total_extract_bytes))
 
+    extracted_files := 0
     for {
-        process_state, wait_err := os.process_wait(process, 250 * time.Millisecond)
-        if wait_err == .Timeout {
-            if download_should_cancel(manager, entry_index) ||
-               download_should_pause(manager, entry_index) {
-                _ = os.process_terminate(process)
-                _, _ = os.process_wait(process)
-                return false, "Extraction interrupted."
+        if download_should_cancel(manager, entry_index) ||
+           download_should_pause(manager, entry_index) {
+            return false, "Extraction interrupted."
+        }
+
+        entry, next_err := orar.Next(&archive)
+        if next_err == .End {
+            break
+        }
+        if next_err != .None {
+            return false, archive_error_message(next_err)
+        }
+
+        relative_path, path_ok := archive_entry_relative_path(entry.Name)
+        if !path_ok {
+            return false, fmt.aprintf(
+                "Archive contains an unsafe path: %s",
+                entry.Name,
+            )
+        }
+        defer delete(relative_path)
+
+        destination, join_err := filepath.join(
+            {output_directory, relative_path},
+            context.allocator,
+        )
+        if join_err != nil {
+            return false, fmt.aprintf(
+                "Could not determine extraction path for %s.",
+                entry.Name,
+            )
+        }
+        defer delete(destination)
+
+        if entry.Kind == .Directory {
+            // A parent directory may already have been created while writing
+            // an earlier file entry. Treat that normal archive layout as
+            // success, but reject a file occupying the directory path.
+            if os.exists(destination) {
+                if !os.is_directory(destination) {
+                    return false, fmt.aprintf(
+                        "Could not create extracted directory %s: a file already exists at that path.",
+                        entry.Name,
+                    )
+                }
+            } else if mkdir_err := os.make_directory_all(destination); mkdir_err != nil {
+                return false, fmt.aprintf(
+                    "Could not create extracted directory %s: %v",
+                    entry.Name,
+                    mkdir_err,
+                )
             }
             continue
         }
-        if wait_err != nil {
-            return false, fmt.aprintf("Could not wait for 7-Zip: %v", wait_err)
+        if entry.Kind != .File {
+            // Symlinks and special entries are intentionally not materialized:
+            // archive extraction must not create links or devices on the host.
+            continue
         }
-        if !process_state.success {
+
+        parent_directory := output_directory
+        separator := strings.last_index(destination, "/")
+        if backslash := strings.last_index(destination, "\\"); backslash > separator {
+            separator = backslash
+        }
+        if separator >= 0 {
+            parent_directory = destination[:separator]
+        }
+        if !os.exists(parent_directory) {
+            if mkdir_err := os.make_directory_all(parent_directory); mkdir_err != nil {
+                return false, fmt.aprintf(
+                    "Could not create folder for %s: %v",
+                    entry.Name,
+                    mkdir_err,
+                )
+            }
+        }
+
+        file, open_err := os.open(destination, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+        if open_err != nil {
             return false, fmt.aprintf(
-                "7-Zip extraction failed with exit code %d.",
-                process_state.exit_code,
+                "Could not create extracted file %s: %v",
+                entry.Name,
+                open_err,
             )
         }
-        break
+        {
+            defer os.close(file)
+            buffer: [64 * 1024]byte
+            for {
+                count, read_err := orar.Read_Current(&archive, buffer[:])
+                if read_err == .End {
+                    break
+                }
+                if read_err != .None {
+                    return false, fmt.aprintf(
+                        "Could not extract %s: %s",
+                        entry.Name,
+                        archive_error_message(read_err),
+                    )
+                }
+                if count == 0 {
+                    continue
+                }
+                written_total := 0
+                for written_total < count {
+                    written, write_err := os.write(
+                        file,
+                        buffer[written_total:count],
+                    )
+                    if write_err != nil || written <= 0 {
+                        return false, fmt.aprintf(
+                            "Could not write extracted file %s: %v",
+                            entry.Name,
+                            write_err,
+                        )
+                    }
+                    written_total += written
+                }
+            }
+        }
+        extracted_files += 1
+        extracted_bytes += entry.Size
+        progress := total_extract_bytes > 0 ? f64(extracted_bytes) / f64(total_extract_bytes) : 1
+        download_set_progress(
+            manager,
+            entry_index,
+            progress,
+            i64(extracted_bytes),
+            i64(total_extract_bytes),
+        )
     }
 
+    if extracted_files == 0 {
+        return false, "The archive contains no regular files to extract."
+    }
     return true, fmt.aprintf("Archive extracted to %s.", output_directory)
 }
 
@@ -107,23 +290,50 @@ LaunchDownloadInstaller :: proc(
 
     extracted_directory := DownloadArchiveExtractDirectory(archive_path)
     defer delete(extracted_directory)
-    installer_path, join_err := filepath.join(
-        {extracted_directory, "setup.exe"},
-        context.allocator,
-    )
-    if join_err != nil {
-        return false, "Could not determine the installer path."
+    if !os.is_directory(extracted_directory) {
+        return false, "Extract the archive first; the extraction folder was not found."
+    }
+
+    // FitGirl archives normally contain a Windows executable, but the portal
+    // itself must not assume that every host can run one. On Unix-like hosts,
+    // only try conventional native executable names; otherwise extraction is
+    // still considered successful and the user can launch the files manually.
+    installer_names: []string
+    when ODIN_OS == .Windows {
+        installer_names = []string{"setup.exe", "install.exe", "installer.exe"}
+    } else {
+        installer_names = []string{"setup", "install", "installer"}
+    }
+
+    installer_path := ""
+    for installer_name in installer_names {
+        candidate, join_err := filepath.join(
+            {extracted_directory, installer_name},
+            context.allocator,
+        )
+        if join_err != nil {
+            continue
+        }
+        if os.is_file(candidate) {
+            installer_path = candidate
+            break
+        }
+        delete(candidate)
+    }
+
+    if len(installer_path) == 0 {
+        return true, fmt.aprintf(
+            "Archive extracted to %s. No native installer was found; launch the extracted files manually.",
+            extracted_directory,
+        )
     }
     defer delete(installer_path)
 
-    if !os.exists(installer_path) {
-        return false, "Extract the archive first; setup.exe was not found."
-    }
     process, start_err := os.process_start(
         os.Process_Desc{command = []string{installer_path}},
     )
     if start_err != nil {
-        return false, fmt.aprintf("Could not launch setup.exe: %v", start_err)
+        return false, fmt.aprintf("Could not launch the native installer: %v", start_err)
     }
 
     for {
@@ -138,11 +348,11 @@ LaunchDownloadInstaller :: proc(
             continue
         }
         if wait_err != nil {
-            return false, fmt.aprintf("Could not wait for setup.exe: %v", wait_err)
+            return false, fmt.aprintf("Could not wait for the native installer: %v", wait_err)
         }
         if !process_state.success {
             return false, fmt.aprintf(
-                "setup.exe exited with code %d.",
+                "The native installer exited with code %d.",
                 process_state.exit_code,
             )
         }

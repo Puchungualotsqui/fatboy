@@ -4,7 +4,11 @@ import "base:builtin"
 import "core:c"
 
 when ODIN_OS == .Darwin {
-	foreign import lib "./macos-arm64/tinyfiledialogs.a"
+	when ODIN_ARCH == .arm64 {
+		foreign import lib "./macos-arm64/tinyfiledialogs.a"
+	} else {
+		foreign import lib "./macos/tinyfiledialogs.a"
+	}
 } else when ODIN_OS == .Linux {
 	// TODO: this is completely untested.
 	foreign import lib "./linux/tinyfiledialogs.a"
