@@ -10,7 +10,7 @@ import curl "vendor:curl"
 
 
 REALDEBRID_API_BASE :: "https://api.real-debrid.com/rest/1.0"
-REALDEBRID_USER_AGENT :: "FitDeck/1.0"
+REALDEBRID_USER_AGENT :: "Fatboy/1.0"
 
 
 // RealDebridClient does not own access_token. The caller must keep the

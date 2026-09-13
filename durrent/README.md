@@ -1,6 +1,6 @@
 # durrent
 
-`durrent` is the Odin BitTorrent core for FitDeck. It is being developed as a
+`durrent` is the Odin BitTorrent core for Fatboy. It is being developed as a
 portable Windows/Unix counterpart to the checked-in `carl` reference client.
 
 The first milestone is intentionally offline and dependency-free. It provides

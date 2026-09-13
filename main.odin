@@ -12,7 +12,7 @@ import rl "vendor:raylib"
 
 main :: proc() {
     fmt.println("========================================")
-    fmt.println("--- Starting FitDeck ---")
+    fmt.println("--- Starting Fatboy ---")
     fmt.println("========================================")
 
 
@@ -399,7 +399,7 @@ main :: proc() {
     }
 
     fmt.println(
-        "[SHUTDOWN] FitDeck shutdown complete",
+        "[SHUTDOWN] Fatboy shutdown complete",
     )
 
     fmt.println("========================================")

@@ -14,7 +14,7 @@ if ($args[0] -eq "release") {
     Write-Host "Building optimized release executable (Hiding console)..." -ForegroundColor Green
     # -subsystem:windows hides the terminal window in the final build
     # -o:speed applies max compiler optimizations
-    odin build . -out:FitDeck.exe -subsystem:windows -o:speed -extra-linker-flags:"$flags"
+    odin build . -out:Fatboy.exe -subsystem:windows -o:speed -extra-linker-flags:"$flags"
 } else {
     Write-Host "Running development build..." -ForegroundColor Cyan
     odin run . -extra-linker-flags:"$flags"

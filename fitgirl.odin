@@ -74,7 +74,7 @@ FetchLiveCatalog :: proc() -> string {
     curl.easy_setopt(
         handle,
         .USERAGENT,
-        "Mozilla/5.0 (X11; Linux x86_64) FitDeck/1.0",
+        "Mozilla/5.0 (X11; Linux x86_64) Fatboy/1.0",
     )
     curl.easy_setopt(handle, .TIMEOUT, 20)
     curl.easy_setopt(handle, .ACCEPT_ENCODING, "")
@@ -759,7 +759,7 @@ download_worker :: proc(task: thread.Task) {
     curl.easy_setopt(
         handle,
         .USERAGENT,
-        "Mozilla/5.0 FitDeck/1.0",
+        "Mozilla/5.0 Fatboy/1.0",
     )
     curl.easy_setopt(handle, .TIMEOUT, 15)
     curl.easy_setopt(handle, .ACCEPT_ENCODING, "")

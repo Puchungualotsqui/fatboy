@@ -7,7 +7,7 @@ import rl "vendor:raylib"
 
 WINDOW_WIDTH  :: 1280
 WINDOW_HEIGHT :: 800
-WINDOW_TITLE  :: "FitDeck"
+WINDOW_TITLE  :: "Fatboy"
 
 
 RELEASE_ROW_HEIGHT :: 96

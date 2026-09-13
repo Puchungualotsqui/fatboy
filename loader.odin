@@ -261,6 +261,10 @@ ProcessFinishedLoader :: proc(app: ^App) {
 
     app.games = loader_data.games
 
+    // Catalog metadata is now available, so stale Fatboy artifacts can be
+    // classified without guessing which game owns them.
+    download_cleanup_unresumable_artifacts(&app.download_manager)
+
     // Free only the LoaderData struct. app.games now owns the
     // dynamic array and all GameRelease allocations.
     free(loader_data)

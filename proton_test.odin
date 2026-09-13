@@ -21,18 +21,18 @@ runtime_checksum_mismatch_test :: proc(t: ^testing.T) {
 
 @(test)
 runtime_installation_path_test :: proc(t: ^testing.T) {
-    paths := ProtonRuntimePathsForBase("/tmp/fitdeck/runtimes")
+    paths := ProtonRuntimePathsForBase("/tmp/fatboy/runtimes")
     defer DestroyProtonRuntimePaths(&paths)
-    testing.expect_value(t, paths.root, "/tmp/fitdeck/runtimes/GE-Proton8-25")
-    testing.expect_value(t, paths.archive, "/tmp/fitdeck/runtimes/GE-Proton8-25.tar.gz")
-    testing.expect_value(t, paths.part, "/tmp/fitdeck/runtimes/GE-Proton8-25.tar.gz.part")
-    testing.expect_value(t, paths.proton, "/tmp/fitdeck/runtimes/GE-Proton8-25/proton")
+    testing.expect_value(t, paths.root, "/tmp/fatboy/runtimes/GE-Proton8-25")
+    testing.expect_value(t, paths.archive, "/tmp/fatboy/runtimes/GE-Proton8-25.tar.gz")
+    testing.expect_value(t, paths.part, "/tmp/fatboy/runtimes/GE-Proton8-25.tar.gz.part")
+    testing.expect_value(t, paths.proton, "/tmp/fatboy/runtimes/GE-Proton8-25/proton")
     prefix := DownloadGamePrefixPath("/games", "ABC123")
     defer delete(prefix)
-    install := DownloadGameInstallPath("/games", "ABC123")
+    install := DownloadGameInstallPath("/games", "Alchemy Factory", "ABC123")
     defer delete(install)
-    testing.expect_value(t, prefix, "/games/.fitdeck/prefixes/ABC123")
-    testing.expect_value(t, install, "/games/.fitdeck/games/ABC123")
+    testing.expect_value(t, prefix, "/games/.fatboy/prefixes/ABC123")
+    testing.expect_value(t, install, "/games/Alchemy_Factory")
 }
 
 

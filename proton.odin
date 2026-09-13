@@ -79,7 +79,7 @@ proton_runtime_base_directory :: proc() -> string {
             return ""
         }
         defer delete(data_directory)
-        return fmt.aprintf("%s/fitdeck/runtimes", data_directory)
+        return fmt.aprintf("%s/fatboy/runtimes", data_directory)
     } else {
         return ""
     }
@@ -396,20 +396,24 @@ DownloadGamePrefixPath :: proc(download_directory, info_hash: string) -> string 
     if len(safe_hash) == 0 {
         return ""
     }
-    return fmt.aprintf("%s/.fitdeck/prefixes/%s", download_directory, safe_hash)
+    return fmt.aprintf("%s/.fatboy/prefixes/%s", download_directory, safe_hash)
 }
 
 
-DownloadGameInstallPath :: proc(download_directory, info_hash: string) -> string {
-    if len(download_directory) == 0 || len(info_hash) == 0 {
+DownloadGameInstallPath :: proc(download_directory, game_name, fallback_id: string) -> string {
+    if len(download_directory) == 0 {
         return ""
     }
-    safe_hash := sanitize_filename(info_hash, context.temp_allocator)
-    if len(safe_hash) == 0 {
+    folder_name := sanitize_filename(game_name, context.temp_allocator)
+    if len(folder_name) == 0 {
+        folder_name = sanitize_filename(fallback_id, context.temp_allocator)
+    }
+    if len(folder_name) == 0 {
         return ""
     }
-    return fmt.aprintf("%s/.fitdeck/games/%s", download_directory, safe_hash)
+    return fmt.aprintf("%s/%s", download_directory, folder_name)
 }
+
 
 
 ensure_game_proton_prefix :: proc(download_directory, info_hash: string) -> (string, string) {
@@ -622,15 +626,21 @@ LaunchGEProtonInstaller :: proc(
 
         sync.mutex_lock(&manager.mutex)
         info_hash := ""
+        game_name := ""
         download_directory := ""
         use_ram_limit := false
         if entry_index >= 0 && entry_index < len(manager.entries) {
             info_hash = strings.clone(manager.entries[entry_index].info_hash, context.allocator)
+            game_index := manager.entries[entry_index].game_index
+            if game_index >= 0 && game_index < len(manager.app.games) {
+                game_name = strings.clone(manager.app.games[game_index].title, context.allocator)
+            }
             download_directory = strings.clone(manager.app.download_path, context.allocator)
             use_ram_limit = manager.app.use_ram_limit
         }
         sync.mutex_unlock(&manager.mutex)
         defer delete(info_hash)
+        defer delete(game_name)
         defer delete(download_directory)
 
         prefix, prefix_error := ensure_game_proton_prefix(download_directory, info_hash)
@@ -639,13 +649,13 @@ LaunchGEProtonInstaller :: proc(
         }
         defer delete(prefix)
 
-        install_directory := DownloadGameInstallPath(download_directory, info_hash)
+        install_directory := DownloadGameInstallPath(download_directory, game_name, info_hash)
         if len(install_directory) == 0 || !EnsureDownloadDirectory(install_directory) {
             delete(install_directory)
             return .InstallerFailed, strings.clone("Could not create the per-game installation directory.", context.allocator)
         }
         defer delete(install_directory)
-        install_log_path := fmt.aprintf("%s/fitdeck-install.log", install_directory)
+        install_log_path := fmt.aprintf("%s/fatboy-install.log", install_directory)
         defer delete(install_log_path)
 
         environment, environment_error := proton_process_environment(steam_root, prefix)

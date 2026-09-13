@@ -74,7 +74,7 @@ RenderLibraryScreen :: proc(
 
                 orui.label(
                     orui.id("title"),
-                    "FitDeck",
+                    "Fatboy",
                     {
                         font_size = 28,
                         color = TEXT_PRIMARY,

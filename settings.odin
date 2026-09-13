@@ -336,7 +336,7 @@ RenderSetupScreen :: proc(
 
             orui.label(
                 orui.id("setup_title"),
-                "FitDeck Configuration",
+                "Fatboy Configuration",
                 {
                     font_size = 24,
                     color = TEXT_PRIMARY,

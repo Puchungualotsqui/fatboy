@@ -145,9 +145,6 @@ DownloadQueueGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
     info_hash := download_info_hash(app.games[game_index].magnetLink)
     defer delete(info_hash)
 
-    marker_path := download_marker_path(app.download_path, info_hash)
-    defer delete(marker_path)
-
     manifest_phase, manifest_archive, manifest_torrent := download_read_manifest_for_game(manager, game_index)
     defer delete(manifest_phase)
     defer delete(manifest_archive)
@@ -168,7 +165,7 @@ DownloadQueueGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
         return false
     }
 
-    if len(info_hash) > 0 && download_marker_valid(marker_path) {
+    if len(info_hash) > 0 && download_marker_valid_for_game(app.download_path, info_hash) {
         sync.mutex_unlock(&manager.mutex)
         return false
     }
@@ -338,9 +335,7 @@ DownloadSnapshotForGame :: proc(manager: ^DownloadManager, game_index: int) -> D
     // A completion marker is authoritative, including when a process exited
     // after writing the marker but before updating the manifest or queue entry.
     if game_index >= 0 && game_index < len(manager.app.games) {
-        marker_path := download_marker_path(manager.app.download_path, info_hash)
-        defer delete(marker_path)
-        if len(info_hash) > 0 && download_marker_valid(marker_path) {
+        if len(info_hash) > 0 && download_marker_valid_for_game(manager.app.download_path, info_hash) {
             result.found = true
             result.state = .Installed
             result.progress = 1
@@ -652,16 +647,24 @@ download_resume_archive_entry :: proc(
 
     sync.mutex_lock(&manager.mutex)
     resume_info_hash := strings.clone(manager.entries[entry_index].info_hash, context.allocator)
+    resume_game_name := ""
+    resume_game_index := manager.entries[entry_index].game_index
+    if resume_game_index >= 0 && resume_game_index < len(manager.app.games) {
+        resume_game_name = strings.clone(manager.app.games[resume_game_index].title, context.allocator)
+    }
     resume_directory := strings.clone(manager.app.download_path, context.allocator)
     sync.mutex_unlock(&manager.mutex)
     defer delete(resume_info_hash)
+    defer delete(resume_game_name)
     defer delete(resume_directory)
+    install_directory := DownloadGameInstallPath(resume_directory, resume_game_name, resume_info_hash)
+    defer delete(install_directory)
     marker_path := download_marker_path(resume_directory, resume_info_hash)
     marked, marker_error := download_mark_entry_complete(
         manager,
         entry_index,
         marker_path,
-        archive_path,
+        install_directory,
         0,
     )
     delete(marker_path)
@@ -675,8 +678,19 @@ download_resume_archive_entry :: proc(
         return
     }
     delete(marker_error)
-    download_set_message(manager, entry_index, "Installed through GE-Proton8-25.")
-    download_write_manifest(manager, entry_index, "completed", "Installed through GE-Proton8-25.")
+    download_cleanup_completed_archive_artifacts(archive_path)
+    sync.mutex_lock(&manager.mutex)
+    if entry_index >= 0 && entry_index < len(manager.entries) {
+        delete(manager.entries[entry_index].output_path)
+        delete(manager.entries[entry_index].part_path)
+        delete(manager.entries[entry_index].archive_path)
+        manager.entries[entry_index].output_path = ""
+        manager.entries[entry_index].part_path = ""
+        manager.entries[entry_index].archive_path = ""
+    }
+    sync.mutex_unlock(&manager.mutex)
+    download_set_message(manager, entry_index, "Installed through GE-Proton8-25; archive cleaned up.")
+    download_write_manifest(manager, entry_index, "completed", "Installed through GE-Proton8-25; archive and extraction cleaned up.")
 }
 
 
@@ -1536,6 +1550,10 @@ download_finalize_file :: proc(
     }
 
     if mark_complete {
+        if !download_ensure_state_directory(manager.app.download_path) {
+            os.remove(output_path)
+            return false, false, strings.clone("Downloaded file, but the Fatboy state directory could not be created.", context.allocator)
+        }
         marker_bytes := transmute([]byte)output_path
         marker_err := os.write_entire_file(marker_path, marker_bytes)
         if marker_err != nil {
@@ -1565,10 +1583,19 @@ download_mark_entry_complete :: proc(
     defer sync.mutex_unlock(&manager.mutex)
 
     if entry_index < 0 || entry_index >= len(manager.entries) {
-        return false, "Invalid download entry."
+        return false, strings.clone("Invalid download entry.", context.allocator)
     }
     if manager.stop_requested || manager.entries[entry_index].cancel_requested {
-        return false, "Download cancelled."
+        return false, strings.clone("Download cancelled.", context.allocator)
+    }
+
+    download_directory := strings.clone(manager.app.download_path, context.allocator)
+    sync.mutex_unlock(&manager.mutex)
+    state_ready := download_ensure_state_directory(download_directory)
+    delete(download_directory)
+    sync.mutex_lock(&manager.mutex)
+    if !state_ready {
+        return false, strings.clone("Could not create the Fatboy state directory.", context.allocator)
     }
 
     marker_bytes := transmute([]byte)marker_target
@@ -1784,6 +1811,27 @@ download_remove_local_path :: proc(path, label: string) {
 }
 
 
+download_cleanup_completed_archive_artifacts :: proc(archive_path: string) {
+    if len(archive_path) == 0 {
+        return
+    }
+    part_path := fmt.aprintf("%s.part", archive_path)
+    defer delete(part_path)
+    download_remove_local_path(part_path, "archive partial file")
+    download_remove_local_path(archive_path, "completed archive")
+
+    extracted_directory := DownloadArchiveExtractDirectory(archive_path)
+    defer delete(extracted_directory)
+    if os.exists(extracted_directory) {
+        if remove_err := os.remove_all(extracted_directory); remove_err != nil {
+            fmt.printf("[DOWNLOAD] WARNING: could not remove extracted directory %s: %v\n", extracted_directory, remove_err)
+        } else {
+            fmt.printf("[DOWNLOAD] Removed extracted directory %s\n", extracted_directory)
+        }
+    }
+}
+
+
 download_remove_local_artifacts :: proc(manager: ^DownloadManager, entry_index: int) {
     if manager == nil {
         return
@@ -1798,6 +1846,11 @@ download_remove_local_artifacts :: proc(manager: ^DownloadManager, entry_index: 
     part_path := strings.clone(manager.entries[entry_index].part_path, context.allocator)
     archive_path := strings.clone(manager.entries[entry_index].archive_path, context.allocator)
     info_hash := strings.clone(manager.entries[entry_index].info_hash, context.allocator)
+    game_name := ""
+    game_index := manager.entries[entry_index].game_index
+    if game_index >= 0 && game_index < len(manager.app.games) {
+        game_name = strings.clone(manager.app.games[game_index].title, context.allocator)
+    }
     download_directory := strings.clone(manager.app.download_path, context.allocator)
 
     delete(manager.entries[entry_index].output_path)
@@ -1812,6 +1865,7 @@ download_remove_local_artifacts :: proc(manager: ^DownloadManager, entry_index: 
     defer delete(part_path)
     defer delete(archive_path)
     defer delete(info_hash)
+    defer delete(game_name)
     defer delete(download_directory)
 
     download_remove_local_path(output_path, "downloaded file")
@@ -1843,7 +1897,7 @@ download_remove_local_artifacts :: proc(manager: ^DownloadManager, entry_index: 
 
     prefix_path := DownloadGamePrefixPath(download_directory, info_hash)
     defer delete(prefix_path)
-    install_path := DownloadGameInstallPath(download_directory, info_hash)
+    install_path := DownloadGameInstallPath(download_directory, game_name, info_hash)
     defer delete(install_path)
     if len(prefix_path) > 0 && os.exists(prefix_path) {
         if remove_err := os.remove_all(prefix_path); remove_err != nil {
@@ -1860,6 +1914,7 @@ download_remove_local_artifacts :: proc(manager: ^DownloadManager, entry_index: 
             fmt.printf("[DOWNLOAD] Removed partial game installation %s\n", install_path)
         }
     }
+
 }
 
 
@@ -1975,15 +2030,38 @@ download_info_hash :: proc(magnet: string) -> string {
 }
 
 
+download_state_directory :: proc(download_directory: string) -> string {
+    if len(download_directory) == 0 {
+        return ""
+    }
+    return fmt.aprintf("%s/.fatboy", download_directory)
+}
+
+
+download_ensure_state_directory :: proc(download_directory: string) -> bool {
+    state_directory := download_state_directory(download_directory)
+    defer delete(state_directory)
+    if len(state_directory) == 0 {
+        return false
+    }
+    if os.exists(state_directory) {
+        return os.is_directory(state_directory)
+    }
+    return os.make_directory_all(state_directory) == nil
+}
+
+
+
 download_manifest_path :: proc(download_directory, info_hash: string) -> string {
     safe_hash := sanitize_filename(info_hash, context.allocator)
     defer delete(safe_hash)
-
-    filename := fmt.aprintf(".fitdeck-%s.state", safe_hash)
+    filename := fmt.aprintf("%s.state", safe_hash)
     defer delete(filename)
-    path, join_err := filepath.join({download_directory, filename}, context.allocator)
+    state_directory := download_state_directory(download_directory)
+    defer delete(state_directory)
+    path, join_err := filepath.join({state_directory, filename}, context.allocator)
     if join_err != nil {
-        return fmt.aprintf("%s/%s", download_directory, filename)
+        return fmt.aprintf("%s/%s", state_directory, filename)
     }
     return path
 }
@@ -2032,6 +2110,10 @@ download_write_manifest :: proc(manager: ^DownloadManager, entry_index: int, pha
 
     if len(archive_path) == 0 {
         archive_path = strings.clone(output_path, context.allocator)
+    }
+    if !download_ensure_state_directory(download_directory) {
+        fmt.printf("[DOWNLOAD] WARNING: could not create Fatboy state directory %s/.fatboy\n", download_directory)
+        return
     }
     manifest_path := download_manifest_path(download_directory, info_hash)
     defer delete(manifest_path)
@@ -2101,18 +2183,153 @@ download_manifest_value_from_file :: proc(manager: ^DownloadManager, game_index:
 }
 
 
+download_remove_local_directory :: proc(path, label: string) {
+    if len(path) == 0 || !os.exists(path) {
+        return
+    }
+    if remove_err := os.remove_all(path); remove_err != nil {
+        fmt.printf("[STARTUP] WARNING: could not remove %s %s: %v\n", label, path, remove_err)
+    } else {
+        fmt.printf("[STARTUP] Fatboy removed %s %s\n", label, path)
+    }
+}
+
+
+
+download_manifest_references_path :: proc(manager: ^DownloadManager, path: string) -> bool {
+    if manager == nil || manager.app == nil || len(path) == 0 {
+        return false
+    }
+    keys: [3]string = {"archive_path", "output_path", "part_path"}
+    for game_index in 0..<len(manager.app.games) {
+        for key in keys {
+            value := download_manifest_value_from_file(manager, game_index, key)
+            matches := value == path
+            delete(value)
+            if matches {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+
+download_cleanup_startup_game :: proc(manager: ^DownloadManager, game_index: int) {
+    if manager == nil || manager.app == nil ||
+       game_index < 0 || game_index >= len(manager.app.games) {
+        return
+    }
+    phase, archive_path, _ := download_read_manifest_for_game(manager, game_index)
+    defer delete(phase)
+    defer delete(archive_path)
+    if len(phase) == 0 {
+        return
+    }
+
+    info_hash := download_info_hash(manager.app.games[game_index].magnetLink)
+    defer delete(info_hash)
+    part_path := download_manifest_value_from_file(manager, game_index, "part_path")
+    defer delete(part_path)
+    archive_exists := len(archive_path) > 0 && os.exists(archive_path)
+    part_exists := len(part_path) > 0 && os.exists(part_path)
+    marker_valid := download_marker_valid_for_game(manager.app.download_path, info_hash)
+
+    game_path := DownloadGameInstallPath(
+        manager.app.download_path,
+        manager.app.games[game_index].title,
+        info_hash,
+    )
+    defer delete(game_path)
+
+    no_resume_data := !archive_exists && !part_exists
+    cleanup_archive := phase == "completed" || phase == "cancelled" || marker_valid || no_resume_data
+    if !cleanup_archive {
+        return
+    }
+
+    if len(archive_path) > 0 {
+        download_cleanup_completed_archive_artifacts(archive_path)
+    }
+    if len(part_path) > 0 && part_path != archive_path {
+        download_remove_local_path(part_path, "orphan partial file")
+    }
+
+    if phase == "cancelled" || (no_resume_data && phase != "completed") {
+        prefix_path := DownloadGamePrefixPath(manager.app.download_path, info_hash)
+        defer delete(prefix_path)
+        download_remove_local_directory(prefix_path, "orphan Proton prefix")
+        game_path := DownloadGameInstallPath(
+            manager.app.download_path,
+            manager.app.games[game_index].title,
+            info_hash,
+        )
+        defer delete(game_path)
+        download_remove_local_directory(game_path, "orphan game installation")
+    }
+}
+
+
+download_cleanup_unresumable_artifacts :: proc(manager: ^DownloadManager) {
+    if manager == nil || manager.app == nil || len(manager.app.download_path) == 0 {
+        return
+    }
+    state_directory := download_state_directory(manager.app.download_path)
+    defer delete(state_directory)
+    if state_entries, state_read_err := os.read_all_directory_by_path(state_directory, context.allocator); state_read_err == nil {
+        defer os.file_info_slice_delete(state_entries, context.allocator)
+        for info in state_entries {
+            if os.is_file(info.fullpath) && strings.ends_with(info.name, ".tmp") {
+                download_remove_local_path(info.fullpath, "stale state temporary file")
+            }
+        }
+    }
+    for game_index in 0..<len(manager.app.games) {
+        download_cleanup_startup_game(manager, game_index)
+    }
+
+    entries, read_err := os.read_all_directory_by_path(manager.app.download_path, context.allocator)
+    if read_err != nil {
+        return
+    }
+    defer os.file_info_slice_delete(entries, context.allocator)
+    for info in entries {
+        if os.is_file(info.fullpath) && strings.ends_with(info.name, ".part") &&
+           !download_manifest_references_path(manager, info.fullpath) {
+            download_remove_local_path(info.fullpath, "unresumable partial file")
+        } else if os.is_directory(info.fullpath) && strings.ends_with(info.name, "_extracted") {
+            archive_candidate := info.fullpath[:len(info.fullpath)-len("_extracted")]
+            referenced := download_manifest_references_path(manager, archive_candidate)
+            archive_exists := os.exists(archive_candidate)
+            delete(archive_candidate)
+            if !referenced && !archive_exists {
+                download_remove_local_directory(info.fullpath, "unresumable extraction directory")
+            }
+        }
+    }
+}
+
+
+
 download_marker_path :: proc(download_directory, info_hash: string) -> string {
     safe_hash := sanitize_filename(info_hash, context.allocator)
     defer delete(safe_hash)
-
-    filename := fmt.aprintf(".fitdeck-%s.complete", safe_hash)
+    filename := fmt.aprintf("%s.complete", safe_hash)
     defer delete(filename)
-
-    path, join_err := filepath.join({download_directory, filename}, context.allocator)
+    state_directory := download_state_directory(download_directory)
+    defer delete(state_directory)
+    path, join_err := filepath.join({state_directory, filename}, context.allocator)
     if join_err != nil {
-        return fmt.aprintf("%s/%s", download_directory, filename)
+        return fmt.aprintf("%s/%s", state_directory, filename)
     }
     return path
+}
+
+
+download_marker_valid_for_game :: proc(download_directory, info_hash: string) -> bool {
+    marker_path := download_marker_path(download_directory, info_hash)
+    defer delete(marker_path)
+    return download_marker_valid(marker_path)
 }
 
 
