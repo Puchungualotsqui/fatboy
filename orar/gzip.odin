@@ -4,7 +4,9 @@ package orar
 // DEFLATE decoder.  The wrapper validates the GZIP member framing and trailer;
 // it does not invoke a system compression library.
 
-GZIP_MAX_OUTPUT :: 512 * 1024 * 1024
+// Keep this above the largest supported game archive expansion while still
+// bounding gzip bombs and accidental unbounded allocations.
+GZIP_MAX_OUTPUT :: u64(2) * 1024 * 1024 * 1024
 
 GZIP_FLAG_HEADER_CRC :: byte(0x02)
 GZIP_FLAG_EXTRA :: byte(0x04)

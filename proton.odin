@@ -121,7 +121,7 @@ runtime_sha512_file :: proc(path: string) -> (digest: string, ok: bool, error_me
     sha2.init_512(&hash_context)
     buffer, buffer_err := make([]byte, 1024 * 1024, context.allocator)
     if buffer_err != nil {
-        return "", false, "Could not allocate checksum verification buffer."
+        return "", false, fmt.aprintf("Could not allocate checksum verification buffer.")
     }
     defer delete(buffer)
     for {
@@ -245,13 +245,13 @@ EnsureGEProtonRuntime :: proc(manager: ^DownloadManager, entry_index: int) -> (r
 
         if len(paths.proton) > 0 && os.is_file(paths.proton) {
             if !runtime_file_is_executable(paths.proton) {
-                return false, "The installed GE-Proton runtime is not executable."
+                return false, strings.clone("The installed GE-Proton runtime is not executable.", context.allocator)
             }
-            return true, "GE-Proton8-25 is already installed."
+            return true, strings.clone("GE-Proton8-25 is already installed.", context.allocator)
         }
 
         if len(paths.root) == 0 || len(paths.archive) == 0 {
-            return false, "Could not determine the Linux runtime installation directory."
+            return false, strings.clone("Could not determine the Linux runtime installation directory.", context.allocator)
         }
         parent_directory := fmt.aprintf("%s/..", paths.root)
         defer delete(parent_directory)
@@ -294,10 +294,18 @@ EnsureGEProtonRuntime :: proc(manager: ^DownloadManager, entry_index: int) -> (r
                     _ = os.remove(paths.part)
                 }
                 delete(transfer_error)
-                return false, "GE-Proton runtime download interrupted."
+                return false, strings.clone("GE-Proton runtime download interrupted.", context.allocator)
             }
             if !completed {
-                return false, transfer_error
+                // Ordinary transfer failures must not leave a corrupt runtime
+                // partial to be resumed as if it were valid.
+                _ = os.remove(paths.part)
+                if len(transfer_error) == 0 {
+                    return false, ""
+                }
+                message := strings.clone(transfer_error, context.allocator)
+                delete(transfer_error)
+                return false, message
             }
             if rename_err := os.rename(paths.part, paths.archive); rename_err != nil {
                 _ = os.remove(paths.part)
@@ -339,7 +347,7 @@ EnsureGEProtonRuntime :: proc(manager: ^DownloadManager, entry_index: int) -> (r
             _ = os.remove_all(staging_directory)
             _ = os.remove(paths.archive)
             _ = os.remove(paths.part)
-            return false, "Could not extract the GE-Proton8-25 runtime. The runtime download was removed; try again."
+            return false, strings.clone("Could not extract the GE-Proton8-25 runtime. The runtime download was removed; try again.", context.allocator)
         }
 
         source_root := staging_directory
@@ -354,7 +362,7 @@ EnsureGEProtonRuntime :: proc(manager: ^DownloadManager, entry_index: int) -> (r
             _ = os.remove_all(staging_directory)
             _ = os.remove(paths.archive)
             _ = os.remove(paths.part)
-            return false, "The GE-Proton archive did not contain its proton launcher. The runtime download was removed."
+            return false, strings.clone("The GE-Proton archive did not contain its proton launcher. The runtime download was removed.", context.allocator)
         }
 
         if os.exists(paths.root) {
@@ -372,10 +380,10 @@ EnsureGEProtonRuntime :: proc(manager: ^DownloadManager, entry_index: int) -> (r
             _ = os.remove_all(paths.root)
             _ = os.remove(paths.archive)
             _ = os.remove(paths.part)
-            return false, "The installed GE-Proton runtime is missing executable launch files."
+            return false, strings.clone("The installed GE-Proton runtime is missing executable launch files.", context.allocator)
         }
         fmt.printf("[PROTON] Installed GE-Proton8-25 at %s\n", paths.root)
-        return true, "GE-Proton8-25 is ready."
+        return true, strings.clone("GE-Proton8-25 is ready.", context.allocator)
     }
 }
 
@@ -407,9 +415,18 @@ DownloadGameInstallPath :: proc(download_directory, info_hash: string) -> string
 ensure_game_proton_prefix :: proc(download_directory, info_hash: string) -> (string, string) {
     prefix := DownloadGamePrefixPath(download_directory, info_hash)
     if len(prefix) == 0 {
-        return "", "Could not determine the per-game Proton prefix path."
+        return "", strings.clone("Could not determine the per-game Proton prefix path.", context.allocator)
     }
-    if mkdir_err := os.make_directory_all(prefix); mkdir_err != nil {
+    if os.exists(prefix) {
+        if !os.is_directory(prefix) {
+            prefix_error := fmt.aprintf(
+                "Could not create the per-game Proton prefix: path already exists but is not a directory: %s",
+                prefix,
+            )
+            delete(prefix)
+            return "", prefix_error
+        }
+    } else if mkdir_err := os.make_directory_all(prefix); mkdir_err != nil {
         delete(prefix)
         return "", fmt.aprintf("Could not create the per-game Proton prefix: %v", mkdir_err)
     }
@@ -427,25 +444,63 @@ DetectSteamInstallation :: proc() -> string {
         }
         defer delete(home)
 
-        candidates := []string{
-            fmt.aprintf("%s/.steam/steam", home),
-            fmt.aprintf("%s/.local/share/Steam", home),
-            fmt.aprintf("%s/.var/app/com.valvesoftware.Steam/.steam/steam", home),
-            fmt.aprintf("%s/.var/app/com.valvesoftware.Steam/data/Steam", home),
-            fmt.aprintf("%s/.var/app/com.valvesoftware.Steam/.local/share/Steam", home),
+        candidates: [dynamic]string
+        xdg_data_home := ""
+        inherited, env_err := os.environ(context.allocator)
+        if env_err == nil {
+            for value in inherited {
+                separator := strings.index(value, "=")
+                key := separator >= 0 ? value[:separator] : value
+                if separator >= 0 {
+                    setting := value[separator+1:]
+                    if key == "STEAM_COMPAT_CLIENT_INSTALL_PATH" ||
+                       key == "STEAM_ROOT" ||
+                       key == "STEAM_PATH" ||
+                       key == "STEAM_INSTALL_PATH" {
+                        if len(setting) > 0 {
+                            append(&candidates, strings.clone(setting, context.allocator))
+                        }
+                    } else if key == "XDG_DATA_HOME" && len(setting) > 0 {
+                        xdg_data_home = strings.clone(setting, context.allocator)
+                    }
+                }
+                delete(value)
+            }
+            delete(inherited)
         }
+        defer delete(xdg_data_home)
+
+        append(&candidates, fmt.aprintf("%s/.steam/root", home))
+        append(&candidates, fmt.aprintf("%s/.steam/steam", home))
+        append(&candidates, fmt.aprintf("%s/.local/share/Steam", home))
+        if len(xdg_data_home) > 0 {
+            append(&candidates, fmt.aprintf("%s/Steam", xdg_data_home))
+            append(&candidates, fmt.aprintf("%s/steam", xdg_data_home))
+        }
+
+        // Flatpak and Snap keep their Steam data under different per-user
+        // roots. Check both the conventional Steam symlink and its targets.
+        append(&candidates, fmt.aprintf("%s/.var/app/com.valvesoftware.Steam/.steam/steam", home))
+        append(&candidates, fmt.aprintf("%s/.var/app/com.valvesoftware.Steam/data/Steam", home))
+        append(&candidates, fmt.aprintf("%s/.var/app/com.valvesoftware.Steam/.local/share/Steam", home))
+        append(&candidates, fmt.aprintf("%s/snap/steam/common/.steam/root", home))
+        append(&candidates, fmt.aprintf("%s/snap/steam/common/.steam/steam", home))
+        append(&candidates, fmt.aprintf("%s/snap/steam/common/.local/share/Steam", home))
+
         for candidate in candidates {
             if os.is_directory(candidate) {
                 result := strings.clone(candidate, context.allocator)
                 for other in candidates {
                     delete(other)
                 }
+                delete(candidates)
                 return result
             }
         }
         for candidate in candidates {
             delete(candidate)
         }
+        delete(candidates)
     }
     return ""
 }
@@ -461,12 +516,15 @@ proton_process_environment :: proc(steam_root, prefix: string) -> ([]string, str
     for value in inherited {
         separator := strings.index(value, "=")
         key := separator >= 0 ? value[:separator] : value
-        if key == "STEAM_COMPAT_CLIENT_INSTALL_PATH" ||
-           key == "STEAM_COMPAT_DATA_PATH" {
-            delete(value)
+        is_compat_override := key == "STEAM_COMPAT_CLIENT_INSTALL_PATH" ||
+                              key == "STEAM_COMPAT_DATA_PATH"
+        owned_value := strings.clone(value, context.allocator)
+        delete(value)
+        if is_compat_override {
+            delete(owned_value)
             continue
         }
-        append(&environment, value)
+        append(&environment, owned_value)
     }
     delete(inherited)
 
@@ -481,6 +539,34 @@ DestroyProtonProcessEnvironment :: proc(environment: []string) {
         delete(value)
     }
     delete(environment)
+}
+
+
+terminate_proton_process_tree :: proc(process: os.Process) {
+    when ODIN_OS == .Linux {
+        // The Linux launcher is started through setsid above. Signal its
+        // process group, not just the Proton parent, so Wine children cannot
+        // survive a cancelled installer.
+        group_id := fmt.aprintf("-%d", process.pid)
+        defer delete(group_id)
+        term, term_err := os.process_start(os.Process_Desc{
+            command = []string{"kill", "-TERM", "--", group_id},
+        })
+        if term_err == nil {
+            _, _ = os.process_wait(term)
+        }
+        _ = os.process_terminate(process)
+        kill, kill_err := os.process_start(os.Process_Desc{
+            command = []string{"kill", "-KILL", "--", group_id},
+        })
+        if kill_err == nil {
+            _, _ = os.process_wait(kill)
+        }
+    } else {
+        // Keep the existing native behavior for Windows and other targets.
+        _ = os.process_terminate(process)
+    }
+    _, _ = os.process_wait(process)
 }
 
 
@@ -505,7 +591,7 @@ LaunchGEProtonInstaller :: proc(
     archive_path: string,
 ) -> (DownloadInstallerResult, string) {
     when ODIN_OS != .Linux {
-        return .InstallerFailed, "GE-Proton is only used for Linux installs."
+        return .InstallerFailed, strings.clone("GE-Proton is only used for Linux installs.", context.allocator)
     } else {
         extracted_directory := DownloadArchiveExtractDirectory(archive_path)
         defer delete(extracted_directory)
@@ -525,21 +611,23 @@ LaunchGEProtonInstaller :: proc(
         runtime_paths := proton_runtime_paths()
         defer DestroyProtonRuntimePaths(&runtime_paths)
         if !os.is_file(runtime_paths.proton) {
-            return .InstallerFailed, "GE-Proton8-25 is not installed; install the runtime before running the game installer."
+            return .InstallerFailed, strings.clone("GE-Proton8-25 is not installed; install the runtime before running the game installer.", context.allocator)
         }
 
         steam_root := DetectSteamInstallation()
         if len(steam_root) == 0 {
-            return .InstallerFailed, "Could not find a Steam installation. Install Steam or start it once before installing through GE-Proton."
+            return .InstallerFailed, strings.clone("Could not find a Steam installation. Install Steam or start it once before installing through GE-Proton.", context.allocator)
         }
         defer delete(steam_root)
 
         sync.mutex_lock(&manager.mutex)
         info_hash := ""
         download_directory := ""
+        use_ram_limit := false
         if entry_index >= 0 && entry_index < len(manager.entries) {
             info_hash = strings.clone(manager.entries[entry_index].info_hash, context.allocator)
             download_directory = strings.clone(manager.app.download_path, context.allocator)
+            use_ram_limit = manager.app.use_ram_limit
         }
         sync.mutex_unlock(&manager.mutex)
         defer delete(info_hash)
@@ -554,7 +642,7 @@ LaunchGEProtonInstaller :: proc(
         install_directory := DownloadGameInstallPath(download_directory, info_hash)
         if len(install_directory) == 0 || !EnsureDownloadDirectory(install_directory) {
             delete(install_directory)
-            return .InstallerFailed, "Could not create the per-game installation directory."
+            return .InstallerFailed, strings.clone("Could not create the per-game installation directory.", context.allocator)
         }
         defer delete(install_directory)
         install_log_path := fmt.aprintf("%s/fitdeck-install.log", install_directory)
@@ -570,31 +658,49 @@ LaunchGEProtonInstaller :: proc(
         defer delete(installer_dir_arg)
         installer_log_arg := proton_windows_path(install_log_path)
         defer delete(installer_log_arg)
-        dir_argument := fmt.aprintf("/DIR=\"%s\"", installer_dir_arg)
+        // These are already individual argv elements, not shell text. Do not
+        // embed quote characters: Wine/Proton performs the necessary command
+        // line quoting when it forwards the argv vector to the Windows process.
+        dir_argument := fmt.aprintf("/DIR=%s", installer_dir_arg)
         defer delete(dir_argument)
-        log_argument := fmt.aprintf("/LOG=\"%s\"", installer_log_arg)
+        log_argument := fmt.aprintf("/LOG=%s", installer_log_arg)
         defer delete(log_argument)
 
-        command := []string{
-            runtime_paths.proton,
-            "run",
-            installer_path,
-            "/VERYSILENT",
-            "/SUPPRESSMSGBOXES",
-            "/NOCANCEL",
-            "/NORESTART",
-            "/NOICONS",
-            dir_argument,
-            log_argument,
+        command: [dynamic]string
+        when ODIN_OS == .Linux {
+            // setsid makes the Proton launcher the leader of a private process
+            // group, so cancellation can terminate Wine/installer descendants.
+            append(&command, "setsid")
         }
+        append(&command, runtime_paths.proton)
+        append(&command, "run")
+        append(&command, installer_path)
+        append(&command, "/VERYSILENT")
+        append(&command, "/SILENT")
+        append(&command, "/SUPPRESSMSGBOXES")
+        if use_ram_limit {
+            append(&command, "/RAM=2")
+        }
+        append(&command, "/NOCANCEL")
+        append(&command, "/NORESTART")
+        append(&command, "/NOICONS")
+        append(&command, dir_argument)
+        append(&command, log_argument)
+        defer delete(command)
         fmt.printf(
-            "[PROTON] Starting unattended installer through GE-Proton8-25: %s/proton run %s /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOICONS\n",
+            "[PROTON] Starting unattended installer through GE-Proton8-25: %s/proton run %s /VERYSILENT /SILENT /SUPPRESSMSGBOXES /NORESTART /NOICONS%s\n",
             runtime_paths.root,
             installer_path,
+            use_ram_limit ? " /RAM=2" : "",
+        )
+        fmt.printf(
+            "[PROTON] Child environment paths: Steam root=%s, per-game prefix=%s\n",
+            steam_root,
+            prefix,
         )
         process, start_err := os.process_start(os.Process_Desc{
             working_dir = extracted_directory,
-            command = command,
+            command = command[:],
             env = environment,
         })
         if start_err != nil {
@@ -606,14 +712,12 @@ LaunchGEProtonInstaller :: proc(
             process_state, wait_err := os.process_wait(process, 250 * time.Millisecond)
             if wait_err == .Timeout {
                 if download_should_cancel(manager, entry_index) {
-                    _ = os.process_terminate(process)
-                    _, _ = os.process_wait(process)
-                    return .InstallerCancelled, "Installer cancelled; the Proton process was terminated."
+                    terminate_proton_process_tree(process)
+                    return .InstallerCancelled, strings.clone("Installer cancelled; the Proton process tree was terminated.", context.allocator)
                 }
                 if download_should_pause(manager, entry_index) {
-                    _ = os.process_terminate(process)
-                    _, _ = os.process_wait(process)
-                    return .InstallerPaused, "Installer paused; the Proton process was terminated."
+                    terminate_proton_process_tree(process)
+                    return .InstallerPaused, strings.clone("Installer paused; the Proton process tree was terminated.", context.allocator)
                 }
                 continue
             }
@@ -622,12 +726,13 @@ LaunchGEProtonInstaller :: proc(
             }
             if !process_state.success {
                 return .InstallerFailed, fmt.aprintf(
-                    "The GE-Proton installer exited with code %d.",
+                    "The GE-Proton installer exited with code %d. See the installer log at %s.",
                     process_state.exit_code,
+                    install_log_path,
                 )
             }
             break
         }
-        return .InstallerStarted, "GE-Proton installer completed."
+        return .InstallerStarted, strings.clone("GE-Proton installer completed.", context.allocator)
     }
 }

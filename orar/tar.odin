@@ -31,6 +31,8 @@ parse_tar :: proc(archive: ^Archive) -> Error {
 	pending_size_set := false
 	pending_filetime: i64 = 0
 	pending_filetime_set := false
+	pending_link_target := ""
+	pending_link_target_set := false
 
 	for position+TAR_BLOCK_SIZE <= len(data) {
 		header := data[position:position+TAR_BLOCK_SIZE]
@@ -75,7 +77,7 @@ parse_tar :: proc(archive: ^Archive) -> Error {
 
 		if type == TAR_TYPE_PAX_GLOBAL || type == TAR_TYPE_PAX_EXTENDED {
 			if type == TAR_TYPE_PAX_EXTENDED {
-				pax_apply(data[data_offset:data_offset+int(size)], &pending_name, &pending_raw_name, &pending_size, &pending_size_set, &pending_filetime, &pending_filetime_set)
+				pax_apply(data[data_offset:data_offset+int(size)], &pending_name, &pending_raw_name, &pending_size, &pending_size_set, &pending_filetime, &pending_filetime_set, &pending_link_target, &pending_link_target_set)
 			}
 			position = data_offset + int(padded_size)
 			parsed_any = true
@@ -88,13 +90,21 @@ parse_tar :: proc(archive: ^Archive) -> Error {
 			for name_end < len(name_data) && name_data[name_end] != 0 {
 				name_end += 1
 			}
-			if len(pending_name) > 0 {
-				delete(pending_name)
-				delete(pending_raw_name)
-			}
 			long_name, long_raw := archive_name_from_bytes(name_data[:name_end], utf8_is_valid(name_data[:name_end]))
-			pending_name = long_name
-			pending_raw_name = long_raw
+			if type == TAR_TYPE_GNU_LONGNAME {
+				if len(pending_name) > 0 {
+					delete(pending_name)
+					delete(pending_raw_name)
+				}
+				pending_name = long_name
+				pending_raw_name = long_raw
+			} else {
+				delete(long_name)
+				delete(long_raw)
+				delete(pending_link_target)
+				pending_link_target, _ = archive_name_from_bytes(name_data[:name_end], utf8_is_valid(name_data[:name_end]))
+				pending_link_target_set = true
+			}
 			position = data_offset + int(padded_size)
 			parsed_any = true
 			continue
@@ -129,6 +139,18 @@ parse_tar :: proc(archive: ^Archive) -> Error {
 			filetime = pending_filetime
 		}
 
+		link_target := ""
+		if type == TAR_TYPE_SOFT_LINK || type == TAR_TYPE_HARD_LINK {
+			link_bytes := tar_field_bytes(header[157:257])
+			link_target, _ = archive_name_from_bytes(link_bytes, utf8_is_valid(link_bytes))
+		}
+		if pending_link_target_set {
+			delete(link_target)
+			link_target = pending_link_target
+			pending_link_target = ""
+			pending_link_target_set = false
+		}
+
 		kind := Entry_Kind.Other
 		switch type {
 		case TAR_TYPE_FILE:
@@ -142,6 +164,7 @@ parse_tar :: proc(archive: ^Archive) -> Error {
 		append(&archive.Entries, Entry{
 			Name = name,
 			Raw_Name = raw_name,
+			Link_Target = link_target,
 			Kind = kind,
 			Size = file_size,
 			Compressed_Size = size,
@@ -159,6 +182,7 @@ parse_tar :: proc(archive: ^Archive) -> Error {
 
 	delete(pending_name)
 	delete(pending_raw_name)
+	delete(pending_link_target)
 	if !parsed_any || len(archive.Entries) == 0 {
 		return .Invalid_Archive
 	}
@@ -239,6 +263,8 @@ pax_apply :: proc(
 	pending_size_set: ^bool,
 	pending_filetime: ^i64,
 	pending_filetime_set: ^bool,
+	pending_link_target: ^string,
+	pending_link_target_set: ^bool,
 ) {
 	position := 0
 	for position < len(data) {
@@ -291,6 +317,10 @@ pax_apply :: proc(
 				pending_filetime^ = (number + 11644473600) * 10000000
 				pending_filetime_set^ = true
 			}
+		case "linkpath":
+			delete(pending_link_target^)
+			pending_link_target^ = normalize_name(value)
+			pending_link_target_set^ = true
 		}
 		position = line_end
 	}

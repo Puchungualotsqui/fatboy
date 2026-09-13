@@ -9,9 +9,11 @@ import tinyfd "tinyfiledialogs"
 import rl "vendor:raylib"
 
 
-SETTINGS_FILE        :: "settings.bin"
-SETTINGS_VERSION     :: u32(2)
-SETTINGS_HEADER_SIZE :: 36
+SETTINGS_FILE           :: "settings.bin"
+SETTINGS_VERSION        :: u32(3)
+SETTINGS_V2_HEADER_SIZE  :: 36
+SETTINGS_HEADER_SIZE    :: 40
+SETTINGS_RAM_LIMIT_FLAG :: u32(1)
 
 EnsureDownloadDirectory :: proc(path: string) -> bool {
     if len(path) == 0 {
@@ -77,6 +79,11 @@ SaveSettings :: proc(app: ^App) -> bool {
     endian.put_u32(settings_data[20:24], .Little, u32(len(app.rd_client_id)))
     endian.put_u32(settings_data[24:28], .Little, u32(len(app.rd_client_secret)))
     endian.put_u64(settings_data[28:36], .Little, u64(app.rd_token_expires_at))
+    settings_flags: u32 = 0
+    if app.use_ram_limit {
+        settings_flags |= SETTINGS_RAM_LIMIT_FLAG
+    }
+    endian.put_u32(settings_data[36:40], .Little, settings_flags)
 
     offset := SETTINGS_HEADER_SIZE
     copy(settings_data[offset:offset+len(app.rd_key)], transmute([]byte)app.rd_key)
@@ -163,13 +170,34 @@ LoadSettings :: proc(app: ^App) -> bool {
         )
         return false
     }
-    if version != SETTINGS_VERSION || len(settings_data) < SETTINGS_HEADER_SIZE {
+    settings_header_size := SETTINGS_HEADER_SIZE
+    if version == 1 {
+        // Version 1 is handled above because it used a different payload.
+        return false
+    }
+    if version == 2 {
+        settings_header_size = SETTINGS_V2_HEADER_SIZE
+    } else if version != SETTINGS_VERSION {
         fmt.printf(
             "[SETTINGS] Unsupported settings version %d (expected %d)\n",
             version,
             SETTINGS_VERSION,
         )
         return false
+    }
+    if len(settings_data) < settings_header_size {
+        fmt.printf("[SETTINGS] Ignoring truncated %s\n", SETTINGS_FILE)
+        return false
+    }
+
+    use_ram_limit := false
+    if version >= 3 {
+        settings_flags, flags_ok := endian.get_u32(settings_data[36:40], .Little)
+        if !flags_ok {
+            fmt.printf("[SETTINGS] Ignoring %s with invalid option flags\n", SETTINGS_FILE)
+            return false
+        }
+        use_ram_limit = (settings_flags & SETTINGS_RAM_LIMIT_FLAG) != 0
     }
 
     access_len_u32, access_ok := endian.get_u32(settings_data[8:12], .Little)
@@ -179,7 +207,7 @@ LoadSettings :: proc(app: ^App) -> bool {
     client_secret_len_u32, client_secret_ok := endian.get_u32(settings_data[24:28], .Little)
     expires_u64, expires_ok := endian.get_u64(settings_data[28:36], .Little)
 
-    payload_len := len(settings_data) - SETTINGS_HEADER_SIZE
+    payload_len := len(settings_data) - settings_header_size
     total_len := u64(access_len_u32) +
         u64(path_len_u32) +
         u64(refresh_len_u32) +
@@ -202,7 +230,7 @@ LoadSettings :: proc(app: ^App) -> bool {
     client_id_len := int(client_id_len_u32)
     client_secret_len := int(client_secret_len_u32)
 
-    offset := SETTINGS_HEADER_SIZE
+    offset := settings_header_size
     access_start := offset
     offset += access_len
     path_start := offset
@@ -253,6 +281,7 @@ LoadSettings :: proc(app: ^App) -> bool {
     app.rd_client_id = loaded_client_id
     app.rd_client_secret = loaded_client_secret
     app.rd_token_expires_at = i64(expires_u64)
+    app.use_ram_limit = use_ram_limit
 
     fmt.printf("[SETTINGS] Loaded version %d from %s\n", version, SETTINGS_FILE)
     return true
@@ -558,6 +587,47 @@ RenderSetupScreen :: proc(
                     }
                 }
             }
+
+            orui.label(
+                orui.id("ram_limit_label"),
+                "FitGirl installer memory limit",
+                {
+                    font_size = 12,
+                    color = TEXT_MUTED,
+                },
+            )
+
+            ram_limit_button_text := "Enable 2 GB RAM limit (/RAM=2)"
+            if app.use_ram_limit {
+                ram_limit_button_text = "Disable 2 GB RAM limit (/RAM=2)"
+            }
+            if orui.button(
+                orui.id("btn_ram_limit"),
+                ram_limit_button_text,
+                {
+                    width = orui.grow(),
+                    height = orui.fixed(36),
+                    background_color = app.use_ram_limit ? ACCENT_COLOR : ROW_HOVER_BACKGROUND,
+                    color = app.use_ram_limit ? APP_BACKGROUND : TEXT_PRIMARY,
+                    corner_radius = orui.corner(5),
+                },
+            ) {
+                app.use_ram_limit = !app.use_ram_limit
+                if app.use_ram_limit {
+                    app.status_message = "FitGirl installers will use the 2 GB RAM limit."
+                } else {
+                    app.status_message = "FitGirl installers will use their default RAM limit."
+                }
+            }
+            orui.label(
+                orui.id("ram_limit_help"),
+                "Some FitGirl installers need /RAM=2 on systems with limited memory. This applies when the next installer starts.",
+                {
+                    font_size = 12,
+                    color = TEXT_MUTED,
+                    overflow = .Wrap,
+                },
+            )
 
             download_path_text := strings.trim_space(app.download_path)
             auth_ready :=

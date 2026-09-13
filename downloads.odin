@@ -148,10 +148,13 @@ DownloadQueueGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
     marker_path := download_marker_path(app.download_path, info_hash)
     defer delete(marker_path)
 
-    manifest_phase, manifest_archive, _ := download_read_manifest_for_game(manager, game_index)
+    manifest_phase, manifest_archive, manifest_torrent := download_read_manifest_for_game(manager, game_index)
     defer delete(manifest_phase)
     defer delete(manifest_archive)
-    stale_failed_manifest := manifest_phase == "failed" && len(manifest_archive) > 0
+    defer delete(manifest_torrent)
+    manifest_archive_exists := len(manifest_archive) > 0 && os.exists(manifest_archive)
+    failed_archive_resume := manifest_phase == "failed" && manifest_archive_exists
+    stale_failed_manifest := manifest_phase == "failed" && len(manifest_archive) > 0 && !manifest_archive_exists
     stale_failed_part := ""
     if stale_failed_manifest {
         stale_failed_part = fmt.aprintf("%s.part", manifest_archive)
@@ -184,7 +187,7 @@ DownloadQueueGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
             sync.mutex_unlock(&manager.mutex)
             return false
         case .Cancelled, .Paused, .Failed, .Extracted, .NotDownloaded:
-            if entry.state == .Failed {
+            if entry.state == .Failed && stale_failed_manifest {
                 retry_cleanup_index = entry_index
             }
             delete(entry.error_message)
@@ -203,17 +206,20 @@ DownloadQueueGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
     }
 
     if retry_cleanup_index < 0 {
-        resume_manifest := manifest_phase == "failed" ||
+        resume_manifest := failed_archive_resume ||
+            manifest_phase == "paused" ||
             manifest_phase == "extracted" ||
             manifest_phase == "installing" ||
             manifest_phase == "archive_ready" ||
             manifest_phase == "extracting"
+        cleanup_manifest := resume_manifest || stale_failed_manifest
         append(&manager.entries, DownloadEntry{
             game_index = game_index,
             info_hash = strings.clone(info_hash, context.allocator),
-            output_path = resume_manifest ? strings.clone(manifest_archive, context.allocator) : "",
-            part_path = manifest_phase == "failed" ? strings.clone(stale_failed_part, context.allocator) : "",
-            archive_path = resume_manifest ? strings.clone(manifest_archive, context.allocator) : "",
+            rd_torrent_id = resume_manifest ? strings.clone(manifest_torrent, context.allocator) : "",
+            output_path = cleanup_manifest ? strings.clone(manifest_archive, context.allocator) : "",
+            part_path = stale_failed_manifest ? strings.clone(stale_failed_part, context.allocator) : "",
+            archive_path = cleanup_manifest ? strings.clone(manifest_archive, context.allocator) : "",
             state = .Queued,
         })
         if stale_failed_manifest {
@@ -244,12 +250,24 @@ DownloadCancelGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
         case .Queued:
             entry.state = .Cancelled
             entry.cancel_requested = true
+            torrent_id := strings.clone(entry.rd_torrent_id, context.allocator)
             delete(entry.status_message)
-            entry.status_message = "Cancelled; local partial files were removed."
+            entry.status_message = strings.clone(
+                "Cancelled; local partial files were removed.",
+                context.allocator,
+            )
             sync.mutex_unlock(&manager.mutex)
+
             // A queued retry may still reference files from an earlier
-            // attempt, even though its worker has not started yet.
-            CleanupGEProtonRuntimeDownload()
+            // attempt, even though its worker has not started yet. If its
+            // manifest restored a remote torrent, release that torrent too.
+            if manager.app != nil && len(torrent_id) > 0 && len(manager.app.rd_key) > 0 {
+                token := strings.clone(manager.app.rd_key, context.allocator)
+                client := NewRealDebridClient(token)
+                download_delete_remote_torrent(&client, torrent_id)
+                delete(token)
+            }
+            delete(torrent_id)
             download_remove_local_artifacts(manager, entry_index)
             return true
         case .Resolving, .Downloading, .Extracting, .Installing:
@@ -314,7 +332,21 @@ DownloadSnapshotForGame :: proc(manager: ^DownloadManager, game_index: int) -> D
     info_hash := ""
     if game_index >= 0 && game_index < len(manager.app.games) {
         info_hash = download_info_hash(manager.app.games[game_index].magnetLink)
-        defer delete(info_hash)
+    }
+    defer delete(info_hash)
+
+    // A completion marker is authoritative, including when a process exited
+    // after writing the marker but before updating the manifest or queue entry.
+    if game_index >= 0 && game_index < len(manager.app.games) {
+        marker_path := download_marker_path(manager.app.download_path, info_hash)
+        defer delete(marker_path)
+        if len(info_hash) > 0 && download_marker_valid(marker_path) {
+            result.found = true
+            result.state = .Installed
+            result.progress = 1
+            result.status_message = "Installed."
+            return result
+        }
     }
 
     sync.mutex_lock(&manager.mutex)
@@ -359,19 +391,6 @@ DownloadSnapshotForGame :: proc(manager: ^DownloadManager, game_index: int) -> D
             result.status_message = "Partial work is paused and can be resumed."
         }
         return result
-    }
-
-    // Completion markers make the catalog state survive application restarts.
-    if game_index >= 0 && game_index < len(manager.app.games) {
-        marker_path := download_marker_path(manager.app.download_path, info_hash)
-        defer delete(marker_path)
-
-        if len(info_hash) > 0 && download_marker_valid(marker_path) {
-            result.found = true
-            result.state = .Installed
-            result.progress = 1
-            result.status_message = "Installed."
-        }
     }
 
     return result
@@ -530,6 +549,11 @@ download_resume_archive_entry :: proc(
     archive_path, torrent_id, phase: string,
     client: ^RealDebridClient,
 ) {
+    if client != nil && len(torrent_id) > 0 {
+        // Archive installation can finish, fail, pause, or be cancelled through
+        // many branches. All of those outcomes release the remote torrent.
+        defer download_delete_remote_torrent(client, torrent_id)
+    }
     if !os.exists(archive_path) {
         download_fail_entry(manager, entry_index, "Saved archive is missing; download it again.")
         return
@@ -559,6 +583,18 @@ download_resume_archive_entry :: proc(
 
     extracted_directory := DownloadArchiveExtractDirectory(archive_path)
     defer delete(extracted_directory)
+    reuse_extracted_directory := phase == "extracted" || phase == "installing"
+    if !reuse_extracted_directory && os.exists(extracted_directory) {
+        // Only an explicit extracted phase, or the legacy installing phase,
+        // proves that the extraction directory is complete. Every other phase
+        // must discard an existing tree before extracting again.
+        if remove_err := os.remove_all(extracted_directory); remove_err != nil {
+            message := fmt.aprintf("Could not reset extraction directory: %v", remove_err)
+            download_fail_entry(manager, entry_index, message)
+            delete(message)
+            return
+        }
+    }
     if !os.is_directory(extracted_directory) {
         download_set_state(manager, entry_index, .Extracting)
         download_set_message(manager, entry_index, "Extracting archive...")
@@ -572,9 +608,9 @@ download_resume_archive_entry :: proc(
         if !extracted {
             fmt.printf("[DOWNLOAD] Archive extraction failed: %s\n", extraction_message)
             if download_should_pause(manager, entry_index) {
-                download_pause_entry(manager, entry_index, nil)
+                download_pause_entry(manager, entry_index, client)
             } else if download_should_cancel(manager, entry_index) {
-                download_cancel_entry(manager, entry_index, nil)
+                download_cancel_entry(manager, entry_index, client)
             } else {
                 download_fail_entry(manager, entry_index, extraction_message)
             }
@@ -641,9 +677,6 @@ download_resume_archive_entry :: proc(
     delete(marker_error)
     download_set_message(manager, entry_index, "Installed through GE-Proton8-25.")
     download_write_manifest(manager, entry_index, "completed", "Installed through GE-Proton8-25.")
-    if client != nil && len(torrent_id) > 0 {
-        download_delete_remote_torrent(client, torrent_id)
-    }
 }
 
 
@@ -677,11 +710,20 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
         download_cancel_entry(manager, entry_index, nil)
         return
     }
+    resume_token := strings.clone(app.rd_key, context.allocator)
+    defer delete(resume_token)
+    resume_client: RealDebridClient
+    resume_client_ptr: ^RealDebridClient = nil
+    if len(resume_token) > 0 {
+        resume_client = NewRealDebridClient(resume_token)
+        resume_client_ptr = &resume_client
+    }
     if (resume_phase == "archive_ready" ||
         resume_phase == "extracting" ||
         resume_phase == "extracted" ||
         resume_phase == "installing" ||
-        resume_phase == "paused") &&
+        resume_phase == "paused" ||
+        resume_phase == "failed") &&
        len(resume_archive) > 0 && os.exists(resume_archive) {
         download_resume_archive_entry(
             manager,
@@ -689,7 +731,7 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
             resume_archive,
             resume_torrent,
             resume_phase,
-            nil,
+            resume_client_ptr,
         )
         return
     }
@@ -770,6 +812,11 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
             return
         }
 
+        if download_should_pause(manager, entry_index) {
+            download_pause_entry(manager, entry_index, &client)
+            return
+        }
+
         conversion_info, conversion_err := RDGetTorrentInfo(&client, torrent_id)
         if conversion_err.message != "" {
             download_fail_entry_from_rd(manager, entry_index, &conversion_err)
@@ -839,6 +886,10 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
             break
         }
 
+        if download_should_pause(manager, entry_index) {
+            download_pause_entry(manager, entry_index, &client)
+            return
+        }
         time.sleep(2 * time.Second)
     }
 
@@ -847,6 +898,10 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
     for {
         if download_should_cancel(manager, entry_index) {
             download_cancel_entry(manager, entry_index, &client)
+            return
+        }
+        if download_should_pause(manager, entry_index) {
+            download_pause_entry(manager, entry_index, &client)
             return
         }
 
@@ -893,6 +948,10 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
         }
 
         DestroyRealDebridTorrentInfo(&info)
+        if download_should_pause(manager, entry_index) {
+            download_pause_entry(manager, entry_index, &client)
+            return
+        }
         time.sleep(2 * time.Second)
     }
 
@@ -1293,7 +1352,7 @@ download_file_once :: proc(
 
     handle := curl.easy_init()
     if handle == nil {
-        return false, false, false, "Could not initialize libcurl for file download."
+        return false, false, false, strings.clone("Could not initialize libcurl for file download.", context.allocator)
     }
     defer curl.easy_cleanup(handle)
 
@@ -1423,7 +1482,7 @@ download_file :: proc(
 
         if attempt == 1 {
             delete(transfer_error)
-            return false, false, "Could not resume download safely after the server rejected the byte range."
+            return false, false, strings.clone("Could not resume download safely after the server rejected the byte range.", context.allocator)
         }
 
         remove_err := os.remove(part_path)
@@ -1441,7 +1500,7 @@ download_file :: proc(
         delete(transfer_error)
     }
 
-    return false, false, "File download did not start."
+    return false, false, strings.clone("File download did not start.", context.allocator)
 }
 
 
@@ -1817,7 +1876,6 @@ download_cancel_entry :: proc(manager: ^DownloadManager, entry_index: int, clien
         download_set_state(manager, entry_index, .Paused)
         download_write_manifest(manager, entry_index, "paused", "Partial download preserved.")
     } else {
-        CleanupGEProtonRuntimeDownload()
         download_remove_local_artifacts(manager, entry_index)
         download_set_state(manager, entry_index, .Cancelled)
         download_set_message(manager, entry_index, "Cancelled; local partial files were removed.")
@@ -1832,7 +1890,8 @@ download_delete_remote_torrent :: proc(client: ^RealDebridClient, torrent_id: st
     }
 
     err := RDDeleteTorrent(client, torrent_id)
-    if err.message != "" {
+    torrent_already_gone := err.http_status == 404 && err.message == "unknown_ressource"
+    if err.message != "" && !torrent_already_gone {
         fmt.printf(
             "[DOWNLOAD] WARNING: could not delete Real-Debrid torrent %s (HTTP %d, API %d): %s\n",
             torrent_id,

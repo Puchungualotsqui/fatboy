@@ -75,6 +75,7 @@ App :: struct {
     rd_client_secret:     string,
     rd_token_expires_at:  i64,
     download_path:        string,
+    use_ram_limit:        bool,
 
     load_status: string,
     games:       [dynamic]GameRelease,

@@ -40,11 +40,12 @@ Error :: enum {
 	Out_Of_Memory,
 }
 
-// Entry is metadata for one archive member. Name and Raw_Name are owned by the
-// Archive and remain valid until the next Destroy_Archive call.
+// Entry is metadata for one archive member. Name, Raw_Name, and Link_Target
+// are owned by the Archive and remain valid until the next Destroy_Archive call.
 Entry :: struct {
 	Name:             string,
 	Raw_Name:         string,
+	Link_Target:      string,
 	Kind:             Entry_Kind,
 	Size:             u64,
 	Compressed_Size:  u64,
@@ -181,6 +182,7 @@ Destroy_Archive :: proc(archive: ^Archive) {
 	for entry in archive.Entries {
 		delete(entry.Name)
 		delete(entry.Raw_Name)
+		delete(entry.Link_Target)
 	}
 	delete(archive.Entries)
 	delete(archive.Comment)
@@ -287,6 +289,13 @@ Entry_Size :: proc(archive: ^Archive) -> u64 {
 		return 0
 	}
 	return archive.Entries[archive.Current].Size
+}
+
+Entry_Link_Target :: proc(archive: ^Archive) -> string {
+	if archive == nil || archive.Current < 0 || archive.Current >= len(archive.Entries) {
+		return ""
+	}
+	return archive.Entries[archive.Current].Link_Target
 }
 
 Entry_Filetime :: proc(archive: ^Archive) -> i64 {

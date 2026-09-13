@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
+import "core:sync"
 import "core:time"
 
 import orar "orar"
@@ -100,6 +101,61 @@ archive_entry_relative_path :: proc(name: string) -> (string, bool) {
 }
 
 
+archive_link_target_within_output :: proc(link_name, target: string) -> (string, bool) {
+	if len(target) == 0 || target[0] == '/' || target[0] == '\\' ||
+	   (len(target) >= 2 && target[1] == ':') {
+		return "", false
+	}
+
+	normalized_bytes: [dynamic]byte
+	for value in target {
+		if value == 0 || value == ':' || value < 32 {
+			delete(normalized_bytes)
+			return "", false
+		}
+		append(&normalized_bytes, value == '\\' ? byte('/') : byte(value))
+	}
+	normalized_target := strings.clone(string(normalized_bytes[:]), context.allocator)
+	delete(normalized_bytes)
+
+	component_count := 0
+	validate_components :: proc(path: string, component_count: ^int) -> bool {
+		start := 0
+		for index := 0; index <= len(path); index += 1 {
+			if index < len(path) && path[index] != '/' {
+				continue
+			}
+			segment := path[start:index]
+			if segment == "" || segment == "." {
+				start = index + 1
+				continue
+			}
+			if segment == ".." {
+				if component_count^ == 0 {
+					return false
+				}
+				component_count^ -= 1
+			} else {
+				component_count^ += 1
+			}
+			start = index + 1
+		}
+		return true
+	}
+
+	parent_end := strings.last_index(link_name, "/")
+	if parent_end >= 0 && !validate_components(link_name[:parent_end], &component_count) {
+		delete(normalized_target)
+		return "", false
+	}
+	if !validate_components(normalized_target, &component_count) {
+		delete(normalized_target)
+		return "", false
+	}
+	return normalized_target, true
+}
+
+
 archive_error_message :: proc(err: orar.Error) -> string {
     #partial switch err {
     case .Unsupported_Format:
@@ -114,6 +170,8 @@ archive_error_message :: proc(err: orar.Error) -> string {
         return "The archive is incomplete or truncated."
     case .Invalid_Archive:
         return "The archive is malformed or invalid."
+    case .Limit_Exceeded:
+        return "The archive expands beyond the supported extraction limit."
     }
     return "The archive operation failed."
 }
@@ -136,12 +194,12 @@ ExtractArchiveToDirectory :: proc(
     archive_path, output_directory: string,
 ) -> (bool, string) {
     if len(archive_path) == 0 || !os.exists(archive_path) {
-        return false, "The completed archive could not be found."
+        return false, strings.clone("The completed archive could not be found.", context.allocator)
     }
 
     archive, open_err := orar.Open_File(archive_path)
     if open_err != .None {
-        return false, archive_error_message(open_err)
+        return false, strings.clone(archive_error_message(open_err), context.allocator)
     }
     defer orar.Destroy_Archive(&archive)
 
@@ -164,7 +222,7 @@ ExtractArchiveToDirectory :: proc(
     for {
         if download_should_cancel(manager, entry_index) ||
            download_should_pause(manager, entry_index) {
-            return false, "Extraction interrupted."
+            return false, strings.clone("Extraction interrupted.", context.allocator)
         }
 
         entry, next_err := orar.Next(&archive)
@@ -172,7 +230,7 @@ ExtractArchiveToDirectory :: proc(
             break
         }
         if next_err != .None {
-            return false, archive_error_message(next_err)
+            return false, strings.clone(archive_error_message(next_err), context.allocator)
         }
 
         relative_path, path_ok := archive_entry_relative_path(entry.Name)
@@ -216,9 +274,44 @@ ExtractArchiveToDirectory :: proc(
             }
             continue
         }
+        if entry.Kind == .Symlink {
+            // ZIP symlink entries do not expose their payload as metadata yet;
+            // leave those special entries untouched rather than guessing a target.
+            if len(entry.Link_Target) == 0 {
+                continue
+            }
+            when ODIN_OS == .Linux {
+                parent_directory := output_directory
+                separator := strings.last_index(destination, "/")
+                if backslash := strings.last_index(destination, "\\"); backslash > separator {
+                    separator = backslash
+                }
+                if separator >= 0 {
+                    parent_directory = destination[:separator]
+                }
+                if !os.exists(parent_directory) {
+                    if mkdir_err := os.make_directory_all(parent_directory); mkdir_err != nil {
+                        return false, fmt.aprintf("Could not create folder for link %s: %v", entry.Name, mkdir_err)
+                    }
+                }
+
+                target, target_ok := archive_link_target_within_output(relative_path, entry.Link_Target)
+                if !target_ok {
+                    return false, fmt.aprintf("Archive link target escapes the extraction folder: %s -> %s", entry.Name, entry.Link_Target)
+                }
+                defer delete(target)
+                if os.exists(destination) {
+                    return false, fmt.aprintf("Could not create extracted link %s: a file already exists at that path.", entry.Name)
+                }
+                if link_err := os.symlink(target, destination); link_err != nil {
+                    return false, fmt.aprintf("Could not create extracted link %s: %v", entry.Name, link_err)
+                }
+                extracted_files += 1
+            }
+            continue
+        }
         if entry.Kind != .File {
-            // Symlinks and special entries are intentionally not materialized:
-            // archive extraction must not create links or devices on the host.
+            // Devices and other special entries are never materialized on the host.
             continue
         }
 
@@ -296,7 +389,7 @@ ExtractArchiveToDirectory :: proc(
     }
 
     if extracted_files == 0 {
-        return false, "The archive contains no regular files to extract."
+        return false, strings.clone("The archive contains no regular files to extract.", context.allocator)
     }
     return true, fmt.aprintf("Archive extracted to %s.", output_directory)
 }
@@ -330,13 +423,13 @@ LaunchNativeDownloadInstaller :: proc(
     archive_path: string,
 ) -> (DownloadInstallerResult, string) {
     if len(archive_path) == 0 || !os.exists(archive_path) {
-        return .InstallerFailed, "The completed archive could not be found."
+        return .InstallerFailed, strings.clone("The completed archive could not be found.", context.allocator)
     }
 
     extracted_directory := DownloadArchiveExtractDirectory(archive_path)
     defer delete(extracted_directory)
     if !os.is_directory(extracted_directory) {
-        return .InstallerFailed, "Extract the archive first; the extraction folder was not found."
+        return .InstallerFailed, strings.clone("Extract the archive first; the extraction folder was not found.", context.allocator)
     }
 
     installer_names := []string{"setup.exe", "install.exe", "installer.exe"}
@@ -364,8 +457,21 @@ LaunchNativeDownloadInstaller :: proc(
     }
     defer delete(installer_path)
 
+    use_ram_limit := false
+    if manager != nil && manager.app != nil {
+        sync.mutex_lock(&manager.mutex)
+        use_ram_limit = manager.app.use_ram_limit
+        sync.mutex_unlock(&manager.mutex)
+    }
+    command: [dynamic]string
+    append(&command, installer_path)
+    if use_ram_limit {
+        append(&command, "/RAM=2")
+    }
+    defer delete(command)
+
     process, start_err := os.process_start(
-        os.Process_Desc{command = []string{installer_path}},
+        os.Process_Desc{command = command[:]},
     )
     if start_err != nil {
         return .InstallerFailed, fmt.aprintf("Could not launch the native installer: %v", start_err)
@@ -377,12 +483,12 @@ LaunchNativeDownloadInstaller :: proc(
             if download_should_cancel(manager, entry_index) {
                 _ = os.process_terminate(process)
                 _, _ = os.process_wait(process)
-                return .InstallerCancelled, "Installer cancelled."
+                return .InstallerCancelled, strings.clone("Installer cancelled.", context.allocator)
             }
             if download_should_pause(manager, entry_index) {
                 _ = os.process_terminate(process)
                 _, _ = os.process_wait(process)
-                return .InstallerPaused, "Installer paused."
+                return .InstallerPaused, strings.clone("Installer paused.", context.allocator)
             }
             continue
         }
@@ -397,5 +503,5 @@ LaunchNativeDownloadInstaller :: proc(
         }
         break
     }
-    return .InstallerStarted, "Installer completed."
+    return .InstallerStarted, strings.clone("Installer completed.", context.allocator)
 }

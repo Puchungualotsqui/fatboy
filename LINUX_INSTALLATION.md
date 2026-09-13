@@ -25,7 +25,7 @@ The unattended installer is started only as:
 ```text
 STEAM_COMPAT_CLIENT_INSTALL_PATH=<detected Steam root>
 STEAM_COMPAT_DATA_PATH=<per-game prefix>
-<runtime>/proton run <extracted-directory>/setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NOCANCEL /NORESTART /NOICONS /DIR="..." /LOG="..."
+<runtime>/proton run <extracted-directory>/setup.exe /VERYSILENT /SILENT /SUPPRESSMSGBOXES /NOCANCEL /NORESTART /NOICONS /DIR="..." /LOG="..."
 ```
 
 The game files go under `<download-directory>/.fitdeck/games/<info-hash>/`, and
