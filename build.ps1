@@ -30,4 +30,4 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Build complete: $PSScriptRoot\Fatboy.exe" -ForegroundColor Green
-Write-Host "Keep font.ttf beside the executable for the custom font." -ForegroundColor DarkGray
+Write-Host "The custom font is embedded in the executable." -ForegroundColor DarkGray

@@ -1,9 +1,17 @@
 package main
 
+import "core:c"
 import "core:fmt"
 import curl "vendor:curl"
 import orui "orui"
 import rl "vendor:raylib"
+
+
+// ---------------------------------------------------------
+// Embedded assets
+// ---------------------------------------------------------
+
+EMBEDDED_FONT_DATA :: #load("font.ttf", []u8)
 
 
 // ---------------------------------------------------------
@@ -118,17 +126,28 @@ main :: proc() {
     // Font
     // -----------------------------------------------------
 
-    if rl.FileExists("font.ttf") {
-        fmt.println(
-            "[BOOT] Loading custom font.ttf...",
-        )
+    fmt.printf(
+        "[BOOT] Loading embedded font.ttf (%d bytes)...\n",
+        len(EMBEDDED_FONT_DATA),
+    )
+    ctx.default_font = rl.GetFontDefault()
 
-        customFont := rl.LoadFontEx(
-            "font.ttf",
+    font_data, font_alloc_err := make(
+        []u8,
+        len(EMBEDDED_FONT_DATA),
+        context.allocator,
+    )
+    if font_alloc_err == nil {
+        copy(font_data, EMBEDDED_FONT_DATA)
+        customFont := rl.LoadFontFromMemory(
+            ".ttf",
+            rawptr(&font_data[0]),
+            c.int(len(font_data)),
             36,
             nil,
             0,
         )
+        delete(font_data)
 
         if customFont.texture.id != 0 {
             rl.SetTextureFilter(
@@ -139,24 +158,19 @@ main :: proc() {
             ctx.default_font = customFont
 
             fmt.printf(
-                "[BOOT] Custom font loaded, texture=%d\n",
+                "[BOOT] Embedded font loaded, texture=%d\n",
                 customFont.texture.id,
             )
         } else {
             fmt.println(
-                "[BOOT] WARNING: custom font load failed; using default font",
+                "[BOOT] WARNING: embedded font load failed; using default font",
             )
-
-            ctx.default_font =
-                rl.GetFontDefault()
         }
     } else {
-        fmt.println(
-            "[BOOT] font.ttf not found; using default font",
+        fmt.printf(
+            "[BOOT] WARNING: embedded font allocation failed: %v\n",
+            font_alloc_err,
         )
-
-        ctx.default_font =
-            rl.GetFontDefault()
     }
 
 
