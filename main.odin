@@ -69,7 +69,11 @@ main :: proc() {
     )
 
     rl.SetTraceLogLevel(.FATAL)
-    rl.SetConfigFlags({.MSAA_4X_HINT})
+    rl.SetConfigFlags({
+        .WINDOW_RESIZABLE,
+        .WINDOW_HIGHDPI,
+        .MSAA_4X_HINT,
+    })
 
     rl.InitWindow(
         WINDOW_WIDTH,
@@ -257,6 +261,13 @@ main :: proc() {
 
     for !rl.WindowShouldClose() {
         frame_number += 1
+
+        // F11 and Alt+Enter provide a discoverable fullscreen toggle while
+        // keeping the normal window resizable through the window manager.
+        if rl.IsKeyPressed(.F11) ||
+           (rl.IsKeyDown(.LEFT_ALT) && rl.IsKeyPressed(.ENTER)) {
+            rl.ToggleFullscreen()
+        }
 
 
         // -------------------------------------------------
