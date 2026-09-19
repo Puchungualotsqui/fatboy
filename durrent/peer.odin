@@ -1,5 +1,6 @@
 package durrent
 
+import "core:net"
 import "core:sync"
 import "core:time"
 
@@ -133,6 +134,22 @@ Peer_Session_Connect :: proc(session: ^Peer_Session, address: string, timeout: t
 		return .Invalid_State
 	}
 	transport_error := Peer_Transport_Connect(&session.Transport, address, timeout)
+	if transport_error != .None {
+		return peer_session_fail_locked(session, peer_transport_error(transport_error))
+	}
+	return peer_session_begin_locked(session)
+}
+
+Peer_Session_Accept :: proc(session: ^Peer_Session, socket: net.TCP_Socket, timeout: time.Duration) -> Peer_Error {
+	if session == nil {
+		return .Invalid_Peer
+	}
+	sync.mutex_lock(&session.Mutex)
+	defer sync.mutex_unlock(&session.Mutex)
+	if session.State != .New {
+		return .Invalid_State
+	}
+	transport_error := Peer_Transport_Adopt(&session.Transport, socket, timeout)
 	if transport_error != .None {
 		return peer_session_fail_locked(session, peer_transport_error(transport_error))
 	}

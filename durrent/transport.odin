@@ -141,6 +141,21 @@ peer_dial_worker :: proc(data: rawptr) {
 	}
 }
 
+Peer_Transport_Adopt :: proc(transport: ^Peer_Transport, socket: net.TCP_Socket, timeout: time.Duration) -> Peer_Transport_Error {
+	if transport == nil || transport.Connected || socket == net.TCP_Socket(0) {
+		return .Invalid_Transport
+	}
+	if timeout > 0 && (net.set_option(socket, .Receive_Timeout, timeout) != nil || net.set_option(socket, .Send_Timeout, timeout) != nil) {
+		net.close(socket)
+		return .Timeout
+	}
+	transport.Socket = socket
+	transport.Connected = true
+	transport.Read_Timeout = timeout
+	transport.Write_Timeout = timeout
+	return .None
+}
+
 Peer_Transport_Queue :: proc(transport: ^Peer_Transport, data: []byte) -> Peer_Transport_Error {
 	if transport == nil {
 		return .Invalid_Transport
@@ -163,7 +178,7 @@ Peer_Transport_Flush :: proc(transport: ^Peer_Transport) -> Peer_Transport_Error
 		return .None
 	}
 	_, send_error := net.send_tcp(transport.Socket, transport.Write_Buffer[:])
-	if send_error == net.TCP_Send_Error.Timeout {
+	if send_error == net.TCP_Send_Error.Timeout || send_error == net.TCP_Send_Error.Would_Block {
 		return .Timeout
 	}
 	if send_error != net.TCP_Send_Error.None {
@@ -182,7 +197,7 @@ Peer_Transport_Receive :: proc(transport: ^Peer_Transport, buffer: []byte) -> (i
 		return 0, .Disconnected
 	}
 	count, recv_error := net.recv_tcp(transport.Socket, buffer)
-	if recv_error == net.TCP_Recv_Error.Timeout {
+	if recv_error == net.TCP_Recv_Error.Timeout || recv_error == net.TCP_Recv_Error.Would_Block {
 		return 0, .Timeout
 	}
 	if recv_error != net.TCP_Recv_Error.None {
