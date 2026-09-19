@@ -14,6 +14,7 @@ RELEASE_ROW_HEIGHT :: 96
 RELEASE_ROW_EXTENT :: 106
 CATALOG_API_PAGE_SIZE :: 30
 CATALOG_GAME_RESERVE :: 8192
+SEARCH_DEBOUNCE_SECONDS :: 0.35
 
 
 // ---------------------------------------------------------
@@ -104,6 +105,8 @@ App :: struct {
     catalog_pages:         [dynamic]CatalogPageCache,
     search_query:          string,
     search_focused:        bool,
+    search_pending:        bool,
+    search_changed_at:     f64,
     catalog_page:          int,
     catalog_has_next:      bool,
 

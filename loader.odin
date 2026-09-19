@@ -32,9 +32,11 @@ StartCatalogPageLoader :: proc(app: ^App, api_page: int, query: string) {
         return
     }
 
+    // A new search supersedes an older page request. Joining the old worker
+    // here prevents partial query text from being dropped silently.
+    ShutdownCoverLoader(app)
     if app.loader_thread != nil {
-        fmt.println("[MAIN] WARNING: catalog loader already running")
-        return
+        ShutdownLoader(app)
     }
 
     fmt.printf(
@@ -621,9 +623,13 @@ ProcessFinishedLoader :: proc(app: ^App) {
         app.status_message = "READY"
         app.screen = .Library
     } else {
-        // Do not advance the visible page when the API has no valid releases.
-        // This also prevents repeatedly requesting the same empty page.
-        app.catalog_has_next = false
+        // A raw API page can contain only digest/non-release posts. Keep the
+        // API page position and use the raw count to decide whether Next can
+        // continue past this filtered page.
+        CatalogClearVisiblePage(app)
+        app.catalog_page = requested_page - 1
+        app.catalog_has_next =
+            loader_data.raw_post_count >= CATALOG_API_PAGE_SIZE
         app.load_status = "No releases on that page."
         app.status_message = "No releases found on that page."
     }

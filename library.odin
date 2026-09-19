@@ -39,7 +39,12 @@ RebuildFilteredGameIndices :: proc(app: ^App) {
     // The catalog is now server-paged. A search starts a new page-1 request
     // instead of pretending that the currently cached pages are complete.
     CatalogResetPages(app)
-    app.load_status = "Searching catalog..."
+    app.search_pending = false
+    if len(app.search_query) > 0 {
+        app.load_status = "Searching catalog..."
+    } else {
+        app.load_status = "Loading catalog page..."
+    }
     StartCatalogPageLoader(app, 1, app.search_query)
 }
 
@@ -102,6 +107,8 @@ RequestCatalogPage :: proc(app: ^App, api_page: int) {
     // Prevent the page integration from growing app.games while cover tasks
     // still hold pointers into its current backing array.
     ShutdownCoverLoader(app)
+    CatalogClearVisiblePage(app)
+    app.selected_game = -1
     app.load_status = "Loading catalog page..."
     app.status_message = "Loading page..."
     StartCatalogPageLoader(app, api_page, app.search_query)
@@ -124,7 +131,7 @@ ProcessCatalogSearchInput :: proc(app: ^App) {
         return
     }
 
-    changed := false
+    text_changed := false
 
     for {
         codepoint := rl.GetCharPressed()
@@ -134,26 +141,42 @@ ProcessCatalogSearchInput :: proc(app: ^App) {
 
         if codepoint >= 32 && codepoint != 127 {
             search_query_append_rune(app, rune(codepoint))
-            changed = true
+            text_changed = true
         }
     }
 
     if rl.IsKeyPressed(.BACKSPACE) {
         search_query_remove_last_rune(app)
-        changed = true
+        text_changed = true
+    }
+
+    if text_changed {
+        app.search_pending = true
+        app.search_changed_at = rl.GetTime()
     }
 
     if rl.IsKeyPressed(.ESCAPE) {
         app.search_focused = false
+        app.search_pending = false
     }
 
-    if changed {
+    // Enter submits immediately, but normal typing is submitted after a
+    // short quiet period. This avoids one HTTP request per keystroke while
+    // keeping the field responsive without requiring Enter.
+    submit_search :=
+        rl.IsKeyPressed(.ENTER) ||
+        rl.IsKeyPressed(.KP_ENTER)
+    debounce_elapsed :=
+        app.search_pending &&
+        rl.GetTime() - app.search_changed_at >= SEARCH_DEBOUNCE_SECONDS
+
+    if submit_search || debounce_elapsed {
         RebuildFilteredGameIndices(app)
     }
 }
 
 
-RenderCatalogSearchBar :: proc(app: ^App) {
+RenderCatalogSearchBar :: proc(app: ^App, font: rl.Font) {
     if app == nil {
         return
     }
@@ -169,7 +192,11 @@ RenderCatalogSearchBar :: proc(app: ^App) {
     }
 
     if len(display_text) == 0 {
-        display_text = "Search games..."
+        if app.search_focused {
+            display_text = "Search as you type..."
+        } else {
+            display_text = "Search games..."
+        }
         text_color = TEXT_MUTED
     }
 
@@ -180,11 +207,12 @@ RenderCatalogSearchBar :: proc(app: ^App) {
         context.temp_allocator,
     )
 
-    rl.DrawText(
+    rl.DrawTextEx(
+        font,
         display_cstr,
-        i32(bounds.x) + 12,
-        i32(bounds.y) + 9,
+        rl.Vector2{bounds.x + 12, bounds.y + 7},
         16,
+        0,
         text_color,
     )
 
@@ -193,14 +221,16 @@ RenderCatalogSearchBar :: proc(app: ^App) {
             app.search_query,
             context.temp_allocator,
         )
-        text_width := rl.MeasureText(
+        text_size := rl.MeasureTextEx(
+            font,
             query_cstr,
             16,
+            0,
         )
 
         if int(rl.GetTime() * 2) % 2 == 0 {
             rl.DrawRectangle(
-                i32(bounds.x) + 12 + text_width,
+                i32(bounds.x + 12 + text_size.x),
                 i32(bounds.y) + 8,
                 1,
                 18,
@@ -222,6 +252,15 @@ RenderLibraryScreen :: proc(
     filtered_count := len(app.filtered_game_indices)
     page_start := 0
     page_end := filtered_count
+    catalog_count_label := fmt.tprintf(
+        "%d Games on Page %d",
+        filtered_count,
+        app.catalog_page + 1,
+    )
+
+    if app.loader_thread != nil {
+        catalog_count_label = "Loading catalog..."
+    }
 
     {
         orui.container(
@@ -316,11 +355,7 @@ RenderLibraryScreen :: proc(
 
                 orui.label(
                     orui.id("catalog count"),
-                    fmt.tprintf(
-                        "%d Games on Page %d",
-                        filtered_count,
-                        app.catalog_page + 1,
-                    ),
+                    catalog_count_label,
                     {
                         font_size = 14,
                         color = TEXT_PRIMARY,
@@ -413,7 +448,29 @@ RenderLibraryScreen :: proc(
                 )
             }
 
-            if filtered_count > 0 {
+            if app.loader_thread != nil {
+                spinner := "|"
+                spinner_phase := int(rl.GetTime() * 8) % 4
+                if spinner_phase == 1 {
+                    spinner = "/"
+                } else if spinner_phase == 2 {
+                    spinner = "-"
+                } else if spinner_phase == 3 {
+                    spinner = "\\"
+                }
+
+                orui.label(
+                    orui.id("catalog_loading"),
+                    fmt.tprintf(
+                        "Loading releases %s",
+                        spinner,
+                    ),
+                    {
+                        font_size = 16,
+                        color = ACCENT_COLOR,
+                    },
+                )
+            } else if filtered_count > 0 {
                 list := orui.begin_virtual_list(
                     orui.id("releases"),
                     {

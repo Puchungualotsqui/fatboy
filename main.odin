@@ -321,7 +321,7 @@ main :: proc() {
         }
 
         if app.screen == .Library {
-            RenderCatalogSearchBar(&app)
+            RenderCatalogSearchBar(&app, ctx.default_font)
         }
 
         rl.EndDrawing()

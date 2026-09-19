@@ -42,34 +42,63 @@ CurlWriteCallback :: proc "c" (
 
 FITGIRL_API_BASE_URL :: "https://fitgirl-repacks.site/wp-json/wp/v2/posts"
 
-FetchLiveCatalogPage :: proc(page, per_page: int, search: string) -> string {
-    builder: strings.Builder
-    strings.builder_init(&builder, context.allocator)
-    defer strings.builder_destroy(&builder)
-
-    encoded_search := ""
-    if len(search) > 0 {
-        encoded_search = rd_url_encode(search)
-        defer delete(encoded_search)
-    }
-
-    api_url := ""
-    if len(encoded_search) > 0 {
-        api_url = fmt.aprintf(
-            "%s?per_page=%d&page=%d&search=%s",
-            FITGIRL_API_BASE_URL,
-            per_page,
-            page,
-            encoded_search,
-        )
-    } else {
-        api_url = fmt.aprintf(
+BuildCatalogURL :: proc(page, per_page: int, search: string) -> string {
+    if len(search) == 0 {
+        return fmt.aprintf(
             "%s?per_page=%d&page=%d",
             FITGIRL_API_BASE_URL,
             per_page,
             page,
         )
     }
+
+    prefix := fmt.aprintf(
+        "%s?per_page=%d&page=%d&orderby=relevance&search=",
+        FITGIRL_API_BASE_URL,
+        per_page,
+        page,
+    )
+    defer delete(prefix)
+
+    builder: strings.Builder
+    strings.builder_init(&builder, context.allocator)
+    strings.write_string(&builder, prefix)
+
+    hex := "0123456789ABCDEF"
+    for value_rune in search {
+        if (value_rune >= 'a' && value_rune <= 'z') ||
+           (value_rune >= 'A' && value_rune <= 'Z') ||
+           (value_rune >= '0' && value_rune <= '9') ||
+           value_rune == '-' || value_rune == '_' ||
+           value_rune == '.' || value_rune == '~' {
+            strings.write_rune(&builder, value_rune)
+        } else if value_rune == ' ' {
+            // Use RFC 3986 encoding because this is a URI query parameter.
+            strings.write_string(&builder, "%20")
+        } else if value_rune <= 0x7f {
+            byte_value := byte(value_rune)
+            strings.write_byte(&builder, '%')
+            strings.write_byte(&builder, hex[byte_value >> 4])
+            strings.write_byte(&builder, hex[byte_value & 0x0f])
+        } else {
+            strings.write_rune(&builder, value_rune)
+        }
+    }
+
+    return strings.to_string(builder)
+}
+
+
+FetchLiveCatalogPage :: proc(page, per_page: int, search: string) -> string {
+    builder: strings.Builder
+    strings.builder_init(&builder, context.allocator)
+    defer strings.builder_destroy(&builder)
+
+    api_url := BuildCatalogURL(
+        page,
+        per_page,
+        search,
+    )
     defer delete(api_url)
 
     fmt.printf(
@@ -172,9 +201,13 @@ CountCatalogPosts :: proc(data: []byte) -> int {
 
 
 ExtractMagnet :: proc(html: string) -> string {
+    lower := strings.to_lower(
+        html,
+        context.temp_allocator,
+    )
     prefix := "magnet:?xt=urn:btih:"
 
-    index := strings.index(html, prefix)
+    index := strings.index(lower, prefix)
 
     if index == -1 {
         return ""
@@ -956,6 +989,10 @@ download_worker :: proc(task: thread.Task) {
 }
 
 loader_proc :: proc(t: ^thread.Thread) {
+    // Loader threads do not inherit the main thread's Odin context. URL
+    // encoding and response buffers must use a valid worker context.
+    context = runtime.default_context()
+
     fmt.println("[LOADER] Thread entered loader_proc")
 
     if t == nil {
@@ -1025,12 +1062,27 @@ loader_proc :: proc(t: ^thread.Thread) {
     // page is reported as an error so the setup/loading screen remains useful.
     if len(games) == 0 && api_page == 1 {
         data.games = games
+
         if !response_received {
             data.error_message = "Error: Could not reach catalog."
-        } else {
-            data.error_message = "No valid releases found."
+            fmt.println("[LOADER] ERROR: could not reach catalog")
+            return
         }
 
+        if len(data.query) > 0 {
+            // A valid search page may contain only posts filtered out by the
+            // release parser. Preserve raw_post_count so the UI can still
+            // offer the next API page.
+            data.success = true
+            fmt.printf(
+                "[LOADER] Search for %q returned %d raw posts, 0 parsed games\n",
+                data.query,
+                data.raw_post_count,
+            )
+            return
+        }
+
+        data.error_message = "No valid releases found."
         fmt.println(
             "[LOADER] ERROR: first catalog page returned no valid releases",
         )
