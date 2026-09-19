@@ -158,17 +158,40 @@ Tracker_Manager_Announce :: proc(
 				continue
 			}
 			request.Event = event
-			response, status, http_error := Tracker_HTTP_Announce(string(url), request, options)
-			delete(url)
-			if http_error != .None {
-				manager.Last_HTTP_Status = status
-				if http_error == .Tracker_Failure {
-					last_error = .Tracker_Failure
-				} else if http_error == .Invalid_Response {
-					last_error = .Invalid_Response
-				} else if http_error == .Out_Of_Memory {
-					last_error = .Out_Of_Memory
+			response: Tracker_Announce_Response
+			status: int
+			announce_error := Tracker_Manager_Error.None
+			if tracker_url_is_udp(string(url)) {
+				udp_response, udp_error := UDP_Tracker_Announce(string(url), request, UDP_Tracker_Default_Options())
+				response = udp_response
+				switch udp_error {
+				case .None:
+				case .Tracker_Failure: announce_error = .Tracker_Failure
+				case .Invalid_Response, .Invalid_Peer: announce_error = .Invalid_Response
+				case .Out_Of_Memory: announce_error = .Out_Of_Memory
+				case .Invalid_Client, .Invalid_URL, .Resolve, .Socket, .Send, .Receive, .Timeout, .Transaction_Mismatch:
+					announce_error = .HTTP
 				}
+			} else {
+				http_response, http_status, http_error := Tracker_HTTP_Announce(string(url), request, options)
+				response = http_response
+				status = http_status
+				if http_error != .None {
+					if http_error == .Tracker_Failure {
+						announce_error = .Tracker_Failure
+					} else if http_error == .Invalid_Response {
+						announce_error = .Invalid_Response
+					} else if http_error == .Out_Of_Memory {
+						announce_error = .Out_Of_Memory
+					} else {
+						announce_error = .HTTP
+					}
+				}
+			}
+			delete(url)
+			if announce_error != .None {
+				manager.Last_HTTP_Status = status
+				last_error = announce_error
 				Destroy_Tracker_Response(&response)
 				continue
 			}

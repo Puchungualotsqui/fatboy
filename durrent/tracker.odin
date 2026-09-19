@@ -5,6 +5,11 @@ Tracker_Peer :: struct {
 	Port: u16,
 }
 
+Tracker_Peer_IPv6 :: struct {
+	IP:   [16]byte,
+	Port: u16,
+}
+
 Tracker_Event :: enum {
 	None,
 	Started,
@@ -32,6 +37,7 @@ Tracker_Announce_Response :: struct {
 	Incomplete:     u64,
 	Has_Incomplete: bool,
 	Peers:          [dynamic]Tracker_Peer,
+	Peers6:         [dynamic]Tracker_Peer_IPv6,
 	Failure_Reason: []byte,
 	Warning_Message: []byte,
 }
@@ -49,6 +55,7 @@ Destroy_Tracker_Response :: proc(response: ^Tracker_Announce_Response) {
 		return
 	}
 	delete(response.Peers)
+	delete(response.Peers6)
 	delete(response.Failure_Reason)
 	delete(response.Warning_Message)
 	response^ = Tracker_Announce_Response{}
@@ -177,11 +184,13 @@ Tracker_Parse_Announce_Response :: proc(data: []byte) -> (Tracker_Announce_Respo
 	}
 
 	peers := Bencode_Dictionary_Get(&root, "peers")
-	if peers == nil {
+	peers6 := Bencode_Dictionary_Get(&root, "peers6")
+	if peers == nil && peers6 == nil {
 		Destroy_Tracker_Response(&result)
 		return Tracker_Announce_Response{}, .Invalid_Response
 	}
-	switch peers.Kind {
+	if peers != nil {
+		switch peers.Kind {
 	case .String:
 		if len(peers.String) % 6 != 0 {
 			Destroy_Tracker_Response(&result)
@@ -230,9 +239,22 @@ Tracker_Parse_Announce_Response :: proc(data: []byte) -> (Tracker_Announce_Respo
 	case .Dictionary:
 		Destroy_Tracker_Response(&result)
 		return Tracker_Announce_Response{}, .Invalid_Response
-	case:
-		Destroy_Tracker_Response(&result)
-		return Tracker_Announce_Response{}, .Invalid_Response
+		case:
+			Destroy_Tracker_Response(&result)
+			return Tracker_Announce_Response{}, .Invalid_Response
+		}
+	}
+	if peers6 != nil {
+		if peers6.Kind != .String || len(peers6.String)%18 != 0 {
+			Destroy_Tracker_Response(&result)
+			return Tracker_Announce_Response{}, .Invalid_Peer
+		}
+		for position := 0; position < len(peers6.String); position += 18 {
+			peer: Tracker_Peer_IPv6
+			copy(peer.IP[:], peers6.String[position:position+16])
+			peer.Port = u16(peers6.String[position+16]) << 8 | u16(peers6.String[position+17])
+			append(&result.Peers6, peer)
+		}
 	}
 
 	return result, .None

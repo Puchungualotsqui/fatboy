@@ -58,6 +58,7 @@ Peer_Session :: struct {
 	Expected_Info_Hash: Torrent_Hash,
 	Local_Peer_ID:     [20]byte,
 	Remote_Peer_ID:    [20]byte,
+	Remote_Extensions: bool,
 	Piece_Count:       u32,
 	Piece_Length:      u64,
 	Total_Length:      u64,
@@ -318,6 +319,36 @@ Peer_Session_Queue_Keep_Alive :: proc(session: ^Peer_Session) -> Peer_Error {
 	return peer_session_queue_locked(session, Wire_Message_View{Kind = .Keep_Alive})
 }
 
+Peer_Session_Queue_Extended :: proc(session: ^Peer_Session, extension_id: byte, payload: []byte) -> Peer_Error {
+	if session == nil {
+		return .Invalid_Peer
+	}
+	message_payload, alloc_error := make([]byte, len(payload)+1, context.allocator)
+	if alloc_error != nil {
+		return .Out_Of_Memory
+	}
+	message_payload[0] = extension_id
+	copy(message_payload[1:], payload)
+	sync.mutex_lock(&session.Mutex)
+	defer sync.mutex_unlock(&session.Mutex)
+	if session.State != .Ready {
+		delete(message_payload)
+		return .Invalid_State
+	}
+	error := peer_session_queue_locked(session, Wire_Message_View{Kind = .Extended, Payload = message_payload})
+	delete(message_payload)
+	return error
+}
+
+Peer_Session_Supports_Extensions :: proc(session: ^Peer_Session) -> bool {
+	if session == nil {
+		return false
+	}
+	sync.mutex_lock(&session.Mutex)
+	defer sync.mutex_unlock(&session.Mutex)
+	return session.State == .Ready && session.Remote_Extensions
+}
+
 Peer_Session_Remote_Has_Piece :: proc(session: ^Peer_Session, index: u32) -> bool {
 	if session == nil {
 		return false
@@ -335,6 +366,7 @@ peer_session_begin_locked :: proc(session: ^Peer_Session) -> Peer_Error {
 		Info_Hash = session.Expected_Info_Hash,
 		Peer_ID = session.Local_Peer_ID,
 	}
+	handshake.Reserved[5] = 0x10
 	encoded := Wire_Handshake_Serialize(handshake)
 	append(&session.Outgoing, ..encoded[:])
 	session.State = .Handshaking
@@ -359,6 +391,7 @@ peer_session_process_locked :: proc(session: ^Peer_Session) -> Peer_Error {
 			return peer_session_fail_locked(session, .Info_Hash_Mismatch)
 		}
 		session.Remote_Peer_ID = handshake.Peer_ID
+		session.Remote_Extensions = handshake.Reserved[5]&0x10 != 0
 		session.State = .Ready
 		if peer_session_event_locked(session, Peer_Event{Kind = .Handshake}) != .None {
 			return peer_session_fail_locked(session, .Out_Of_Memory)

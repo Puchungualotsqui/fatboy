@@ -90,13 +90,13 @@ BitTorrent v1 client while keeping each layer testable:
      cancellation/shutdown.
    - Add deterministic integration tests using local tracker and peer fixtures.
 
-7. **Add magnet metadata retrieval**
+7. **Add magnet metadata retrieval** *(implemented in `metadata.odin`)*
    - Decode BEP 10 extended handshakes.
    - Implement BEP 9 `ut_metadata` requests and metadata-piece assembly.
    - Enforce metadata size limits and verify the resulting metadata against the
      magnet info-hash before starting the torrent.
 
-8. **Add UDP tracker support**
+8. **Add UDP tracker support** *(implemented in `tracker_udp.odin`)*
    - Implement BEP 15 connect and announce packets.
    - Match transaction IDs, expire connection IDs, and retry with backoff.
    - Add compact IPv4 and IPv6 peer response handling.
