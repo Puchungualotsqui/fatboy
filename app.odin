@@ -108,6 +108,8 @@ App :: struct {
     search_focused:        bool,
     search_pending:        bool,
     search_changed_at:     f64,
+    show_installed_only:   bool,
+    catalog_filter_pending: bool,
     catalog_page:          int,
     catalog_has_next:      bool,
 

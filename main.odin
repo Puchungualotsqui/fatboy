@@ -268,6 +268,11 @@ main :: proc() {
 
         if app.screen == .Library {
             ProcessCatalogSearchInput(&app)
+            if app.catalog_filter_pending {
+                app.catalog_filter_pending = false
+                CatalogRebuildVisiblePage(&app)
+                app.selected_game = -1
+            }
             ProcessCoverLoader(&app)
             QueueVisibleCoverDownloads(&app)
         }

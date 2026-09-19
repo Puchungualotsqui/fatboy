@@ -609,6 +609,37 @@ CatalogClearVisiblePage :: proc(app: ^App) {
 }
 
 
+CatalogRebuildVisiblePage :: proc(app: ^App) {
+    if app == nil {
+        return
+    }
+
+    cache_index := CatalogPageCacheIndex(
+        app,
+        app.catalog_page + 1,
+        app.search_query,
+    )
+    if cache_index < 0 {
+        CatalogClearVisiblePage(app)
+        return
+    }
+
+    CatalogClearVisiblePage(app)
+    for game_index in app.catalog_pages[cache_index].game_indices {
+        if app.show_installed_only {
+            snapshot := DownloadSnapshotForGame(
+                &app.download_manager,
+                game_index,
+            )
+            if !snapshot.found {
+                continue
+            }
+        }
+        append(&app.filtered_game_indices, game_index)
+    }
+}
+
+
 CatalogShowCachedPage :: proc(app: ^App, api_page: int, query: string) -> bool {
     if app == nil {
         return false
@@ -619,14 +650,9 @@ CatalogShowCachedPage :: proc(app: ^App, api_page: int, query: string) -> bool {
         return false
     }
 
-    CatalogClearVisiblePage(app)
-
-    for game_index in app.catalog_pages[cache_index].game_indices {
-        append(&app.filtered_game_indices, game_index)
-    }
-
     app.catalog_page = api_page - 1
     app.catalog_has_next = app.catalog_pages[cache_index].has_next
+    CatalogRebuildVisiblePage(app)
     app.selected_game = -1
     return true
 }
@@ -708,13 +734,9 @@ CatalogAppendLoadedPage :: proc(
     append(&app.catalog_pages, cache)
     cache_index := len(app.catalog_pages) - 1
 
-    CatalogClearVisiblePage(app)
-    for game_index in app.catalog_pages[cache_index].game_indices {
-        append(&app.filtered_game_indices, game_index)
-    }
-
     app.catalog_page = loader_data.api_page - 1
     app.catalog_has_next = app.catalog_pages[cache_index].has_next
+    CatalogRebuildVisiblePage(app)
     app.selected_game = -1
     return true
 }

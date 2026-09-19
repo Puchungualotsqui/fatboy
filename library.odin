@@ -257,6 +257,13 @@ RenderLibraryScreen :: proc(
         filtered_count,
         app.catalog_page + 1,
     )
+    if app.show_installed_only {
+        catalog_count_label = fmt.tprintf(
+            "%d Installed / In-progress on Page %d",
+            filtered_count,
+            app.catalog_page + 1,
+        )
+    }
 
     if app.loader_thread != nil {
         catalog_count_label = "Loading catalog..."
@@ -446,6 +453,18 @@ RenderLibraryScreen :: proc(
                         letter_spacing = 1,
                     },
                 )
+
+                if orui.checkbox(
+                    orui.id("installed_filter"),
+                    "Installed / in-progress",
+                    &app.show_installed_only,
+                    {
+                        width = orui.fixed(220),
+                        height = orui.fixed(30),
+                    },
+                ) {
+                    app.catalog_filter_pending = true
+                }
             }
 
             if app.loader_thread != nil {
@@ -978,12 +997,19 @@ RenderLibraryScreen :: proc(
                     },
                 )
             } else {
+                empty_message := fmt.tprintf(
+                    "No games match \"%s\"",
+                    app.search_query,
+                )
+                if app.show_installed_only {
+                    empty_message = fmt.tprintf(
+                        "No installed or in-progress games match \"%s\"",
+                        app.search_query,
+                    )
+                }
                 orui.label(
                     orui.id("catalog_empty"),
-                    fmt.tprintf(
-                        "No games match \"%s\"",
-                        app.search_query,
-                    ),
+                    empty_message,
                     {
                         font_size = 14,
                         color = TEXT_MUTED,
