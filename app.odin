@@ -55,6 +55,7 @@ GameRelease :: struct {
     cover_loading:      bool,
     cover_attempted:     bool,
     cover_last_touched:  f64,
+    state_placeholder:   bool,
 }
 
 

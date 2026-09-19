@@ -373,6 +373,7 @@ RenderLibraryScreen :: proc(
                     orui.id("btn_settings"),
                     "⚙ Settings",
                     {
+                        width = orui.fixed(110),
                         height = orui.fixed(24),
 
                         padding = orui.Edges{
@@ -385,16 +386,14 @@ RenderLibraryScreen :: proc(
                         color = TEXT_MUTED,
                     },
                 ) {
-                    if DownloadManagerHasActiveWork(&app.download_manager) {
-                        app.status_message =
-                            "Finish or cancel active downloads before changing settings."
-                    } else {
-                        fmt.println(
-                            "[UI] Opening settings screen",
-                        )
-
-                        app.screen = .SetupKey
-                    }
+                    // Settings can be opened while a download is active so
+                    // users can inspect configuration or adjust safe options.
+                    // Save & Launch retains the active-work guard before any
+                    // download path or credentials are committed.
+                    fmt.println(
+                        "[UI] Opening settings screen",
+                    )
+                    app.screen = .SetupKey
                 }
             }
         }

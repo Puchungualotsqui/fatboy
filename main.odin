@@ -213,8 +213,6 @@ main :: proc() {
         app.screen = .Loading
         app.load_status =
             "Syncing with FitGirl API..."
-
-        StartLoader(&app)
     } else {
         ClearRealDebridCredentials(&app)
 
@@ -239,6 +237,11 @@ main :: proc() {
             "[BOOT] WARNING: download manager could not be started",
         )
         app.status_message = "Download manager unavailable."
+    }
+
+    if app.screen == .Loading {
+        RestorePersistedDownloadGames(&app)
+        StartLoader(&app)
     }
 
 

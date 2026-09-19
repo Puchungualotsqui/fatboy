@@ -35,6 +35,46 @@ EnsureDownloadDirectory :: proc(path: string) -> bool {
 }
 
 
+OpenDownloadDirectory :: proc(path: string) -> bool {
+    directory := strings.trim_space(path)
+    if len(directory) == 0 || !os.is_directory(directory) {
+        return false
+    }
+
+    command: [dynamic]string
+    when ODIN_OS == .Windows {
+        append(&command, "explorer")
+    } else when ODIN_OS == .Darwin {
+        append(&command, "open")
+    } else {
+        append(&command, "xdg-open")
+    }
+    append(&command, directory)
+    defer delete(command)
+
+    process, start_err := os.process_start(
+        os.Process_Desc{command = command[:]},
+    )
+    if start_err != nil {
+        fmt.printf(
+            "[SETTINGS] ERROR: could not open download folder: %v\n",
+            start_err,
+        )
+        return false
+    }
+
+    _, wait_err := os.process_wait(process)
+    if wait_err != nil {
+        fmt.printf(
+            "[SETTINGS] ERROR: folder opener failed: %v\n",
+            wait_err,
+        )
+        return false
+    }
+    return true
+}
+
+
 SaveSettings :: proc(app: ^App) -> bool {
     if app == nil ||
        len(app.rd_key) == 0 ||
@@ -586,6 +626,25 @@ RenderSetupScreen :: proc(
                         }
                     }
                 }
+
+                if orui.button(
+                    orui.id("btn_open_download_path"),
+                    "Open Folder",
+                    {
+                        width = orui.fixed(118),
+                        height = orui.grow(),
+                        background_color = ROW_HOVER_BACKGROUND,
+                        color = TEXT_PRIMARY,
+                        corner_radius = orui.corner(6),
+                    },
+                ) {
+                    if OpenDownloadDirectory(app.download_path) {
+                        app.status_message = "Opened download folder."
+                    } else {
+                        app.status_message =
+                            "The selected download folder could not be opened."
+                    }
+                }
             }
 
             orui.label(
@@ -698,7 +757,9 @@ RenderSetupScreen :: proc(
                         "[UI] Settings saved to disk",
                     )
 
-                    if len(app.games) > 0 {
+                    RestorePersistedDownloadGames(app)
+
+                    if len(app.catalog_pages) > 0 {
                         fmt.println(
                             "[UI] Existing library present; returning to library",
                         )

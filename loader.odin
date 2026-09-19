@@ -619,14 +619,28 @@ CatalogRebuildVisiblePage :: proc(app: ^App) {
         app.catalog_page + 1,
         app.search_query,
     )
-    if cache_index < 0 {
-        CatalogClearVisiblePage(app)
-        return
+    CatalogClearVisiblePage(app)
+    if cache_index >= 0 {
+        for game_index in app.catalog_pages[cache_index].game_indices {
+            if app.show_installed_only {
+                snapshot := DownloadSnapshotForGame(
+                    &app.download_manager,
+                    game_index,
+                )
+                if !snapshot.found {
+                    continue
+                }
+            }
+            append(&app.filtered_game_indices, game_index)
+        }
     }
 
-    CatalogClearVisiblePage(app)
-    for game_index in app.catalog_pages[cache_index].game_indices {
-        if app.show_installed_only {
+    if app.show_installed_only {
+        for game, game_index in app.games {
+            if !game.state_placeholder {
+                continue
+            }
+
             snapshot := DownloadSnapshotForGame(
                 &app.download_manager,
                 game_index,
@@ -634,8 +648,23 @@ CatalogRebuildVisiblePage :: proc(app: ^App) {
             if !snapshot.found {
                 continue
             }
+
+            if len(app.search_query) > 0 {
+                title_lower := strings.to_lower(
+                    game.title,
+                    context.temp_allocator,
+                )
+                query_lower := strings.to_lower(
+                    app.search_query,
+                    context.temp_allocator,
+                )
+                if !strings.contains(title_lower, query_lower) {
+                    continue
+                }
+            }
+
+            append(&app.filtered_game_indices, game_index)
         }
-        append(&app.filtered_game_indices, game_index)
     }
 }
 
@@ -689,9 +718,21 @@ FindCachedGameIndex :: proc(app: ^App, magnet_link: string) -> int {
         return -1
     }
 
+    target_hash := download_info_hash(magnet_link)
+    defer delete(target_hash)
+
     for game, game_index in app.games {
         if game.magnetLink == magnet_link {
             return game_index
+        }
+
+        if len(target_hash) > 0 {
+            game_hash := download_info_hash(game.magnetLink)
+            same_hash := game_hash == target_hash
+            delete(game_hash)
+            if same_hash {
+                return game_index
+            }
         }
     }
 
@@ -720,12 +761,20 @@ CatalogAppendLoadedPage :: proc(
         )
 
         if existing_index >= 0 {
-            DestroyGame(&loader_data.games[game_index])
+            if app.games[existing_index].state_placeholder {
+                DestroyGame(&app.games[existing_index])
+                app.games[existing_index] = loader_data.games[game_index]
+                app.games[existing_index].state_placeholder = false
+                loader_data.games[game_index] = {}
+            } else {
+                DestroyGame(&loader_data.games[game_index])
+            }
             append(&cache.game_indices, existing_index)
             continue
         }
 
         new_index := len(app.games)
+        loader_data.games[game_index].state_placeholder = false
         append(&app.games, loader_data.games[game_index])
         loader_data.games[game_index] = {}
         append(&cache.game_indices, new_index)

@@ -30,8 +30,10 @@ DownloadState :: enum {
 
 
 DownloadEntry :: struct {
-    game_index: int,
-    info_hash:  string,
+    game_index:  int,
+    info_hash:   string,
+    game_title:  string,
+    magnet_link: string,
 
     rd_torrent_id: string,
     output_path:   string,
@@ -114,6 +116,8 @@ DownloadManagerShutdown :: proc(manager: ^DownloadManager) {
     sync.mutex_lock(&manager.mutex)
     for &entry in manager.entries {
         delete(entry.info_hash)
+        delete(entry.game_title)
+        delete(entry.magnet_link)
         delete(entry.rd_torrent_id)
         delete(entry.output_path)
         delete(entry.part_path)
@@ -213,6 +217,8 @@ DownloadQueueGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
         append(&manager.entries, DownloadEntry{
             game_index = game_index,
             info_hash = strings.clone(info_hash, context.allocator),
+            game_title = strings.clone(app.games[game_index].title, context.allocator),
+            magnet_link = strings.clone(app.games[game_index].magnetLink, context.allocator),
             rd_torrent_id = resume_manifest ? strings.clone(manifest_torrent, context.allocator) : "",
             output_path = cleanup_manifest ? strings.clone(manifest_archive, context.allocator) : "",
             part_path = stale_failed_manifest ? strings.clone(stale_failed_part, context.allocator) : "",
@@ -2083,6 +2089,90 @@ download_manifest_value :: proc(data, key: string) -> string {
 }
 
 
+restore_persisted_download_state_file :: proc(
+    app: ^App,
+    name, path: string,
+) {
+    if app == nil || !os.is_file(path) || !strings.ends_with(name, ".state") {
+        return
+    }
+
+    data, read_err := os.read_entire_file_from_path(path, context.allocator)
+    if read_err != nil {
+        return
+    }
+    text := string(data[:])
+    title := download_manifest_value(text, "title")
+    magnet := download_manifest_value(text, "magnet")
+    delete(data)
+
+    // State metadata is part of the current manifest format. Ignore files
+    // without it rather than guessing from legacy filenames or paths.
+    if len(title) == 0 || len(magnet) == 0 {
+        delete(title)
+        delete(magnet)
+        return
+    }
+
+    magnet = download_normalize_magnet(magnet)
+    existing_index := FindCachedGameIndex(app, magnet)
+    if existing_index >= 0 {
+        delete(title)
+        delete(magnet)
+        return
+    }
+
+    safe_title := sanitize_filename(title, context.allocator)
+    cover_path := ""
+    if len(safe_title) > 0 {
+        cover_path = fmt.aprintf("covers/%s.png", safe_title)
+    }
+    delete(safe_title)
+
+    append(&app.games, GameRelease{
+        title = title,
+        magnetLink = magnet,
+        coverPath = cover_path,
+        state_placeholder = true,
+    })
+    fmt.printf(
+        "[STATE] Restored persisted game %q from %s\n",
+        title,
+        name,
+    )
+}
+
+
+RestorePersistedDownloadGames :: proc(app: ^App) {
+    if app == nil || len(app.download_path) == 0 {
+        return
+    }
+
+    state_directory := download_state_directory(app.download_path)
+    defer delete(state_directory)
+    if len(state_directory) == 0 || !os.is_directory(state_directory) {
+        return
+    }
+
+    entries, read_err := os.read_all_directory_by_path(
+        state_directory,
+        context.allocator,
+    )
+    if read_err != nil {
+        return
+    }
+    defer os.file_info_slice_delete(entries, context.allocator)
+
+    for info in entries {
+        restore_persisted_download_state_file(
+            app,
+            info.name,
+            info.fullpath,
+        )
+    }
+}
+
+
 download_write_manifest :: proc(manager: ^DownloadManager, entry_index: int, phase, message: string) {
     if manager == nil || manager.app == nil {
         return
@@ -2094,6 +2184,8 @@ download_write_manifest :: proc(manager: ^DownloadManager, entry_index: int, pha
         return
     }
     info_hash := strings.clone(manager.entries[entry_index].info_hash, context.allocator)
+    game_title := strings.clone(manager.entries[entry_index].game_title, context.allocator)
+    magnet_link := strings.clone(manager.entries[entry_index].magnet_link, context.allocator)
     archive_path := strings.clone(manager.entries[entry_index].archive_path, context.allocator)
     output_path := strings.clone(manager.entries[entry_index].output_path, context.allocator)
     part_path := strings.clone(manager.entries[entry_index].part_path, context.allocator)
@@ -2102,6 +2194,8 @@ download_write_manifest :: proc(manager: ^DownloadManager, entry_index: int, pha
     sync.mutex_unlock(&manager.mutex)
 
     defer delete(info_hash)
+    defer delete(game_title)
+    defer delete(magnet_link)
     defer delete(archive_path)
     defer delete(output_path)
     defer delete(part_path)
@@ -2120,8 +2214,10 @@ download_write_manifest :: proc(manager: ^DownloadManager, entry_index: int, pha
     temp_path := fmt.aprintf("%s.tmp", manifest_path)
     defer delete(temp_path)
     contents := fmt.aprintf(
-        "phase=%s\narchive_path=%s\noutput_path=%s\npart_path=%s\ntorrent_id=%s\nmessage=%s\n",
+        "phase=%s\ntitle=%s\nmagnet=%s\narchive_path=%s\noutput_path=%s\npart_path=%s\ntorrent_id=%s\nmessage=%s\n",
         phase,
+        game_title,
+        magnet_link,
         archive_path,
         output_path,
         part_path,
