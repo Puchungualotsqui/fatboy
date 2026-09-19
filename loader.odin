@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:thread"
+import "core:time"
 import "base:runtime"
 import orui "orui"
 import rl "vendor:raylib"
@@ -216,6 +217,158 @@ CatalogVisibleIndices :: proc(app: ^App) -> []int {
 }
 
 
+COVER_CACHE_LIMIT :: 100
+
+
+IsCoverCacheFile :: proc(name: string) -> bool {
+    return strings.ends_with(name, ".png") ||
+        strings.ends_with(name, ".jpg")
+}
+
+
+TouchCoverCacheFile :: proc(path: string) {
+    if len(path) == 0 || !os.exists(path) {
+        return
+    }
+
+    now := time.now()
+    _ = os.chtimes(path, now, now)
+}
+
+
+CoverCacheFileProtected :: proc(
+    app: ^App,
+    relative_path, full_path: string,
+) -> bool {
+    if app == nil {
+        return false
+    }
+
+    for game, game_index in app.games {
+        if game.coverPath != relative_path &&
+           game.coverPath != full_path {
+            continue
+        }
+
+        if game.cover_loading {
+            return true
+        }
+
+        for visible_index in CatalogVisibleIndices(app) {
+            if visible_index == game_index {
+                return true
+            }
+        }
+
+        snapshot := DownloadSnapshotForGame(
+            &app.download_manager,
+            game_index,
+        )
+        if snapshot.found && snapshot.state == .Installed {
+            return true
+        }
+
+        return false
+    }
+
+    return false
+}
+
+
+EnforceCoverCacheLimit :: proc(app: ^App) {
+    if app == nil || !os.exists("covers") {
+        return
+    }
+
+    files, read_err := os.read_all_directory_by_path(
+        "covers",
+        context.allocator,
+    )
+    if read_err != nil {
+        return
+    }
+    defer os.file_info_slice_delete(files, context.allocator)
+
+    evictable_count := 0
+    for file in files {
+        if !os.is_file(file.fullpath) || !IsCoverCacheFile(file.name) {
+            continue
+        }
+
+        relative_path := fmt.aprintf(
+            "covers/%s",
+            file.name,
+        )
+        protected := CoverCacheFileProtected(
+            app,
+            relative_path,
+            file.fullpath,
+        )
+        delete(relative_path)
+
+        if !protected {
+            evictable_count += 1
+        }
+    }
+
+    for evictable_count > COVER_CACHE_LIMIT {
+        oldest_index := -1
+        oldest_nano: i64
+
+        for file, file_index in files {
+            if !os.is_file(file.fullpath) || !IsCoverCacheFile(file.name) {
+                continue
+            }
+
+            relative_path := fmt.aprintf(
+                "covers/%s",
+                file.name,
+            )
+            protected := CoverCacheFileProtected(
+                app,
+                relative_path,
+                file.fullpath,
+            )
+            delete(relative_path)
+
+            if protected {
+                continue
+            }
+
+            modified_nano := time.time_to_unix_nano(
+                file.modification_time,
+            )
+            if oldest_index < 0 || modified_nano < oldest_nano {
+                oldest_index = file_index
+                oldest_nano = modified_nano
+            }
+        }
+
+        if oldest_index < 0 {
+            break
+        }
+
+        remove_err := os.remove(files[oldest_index].fullpath)
+        if remove_err != nil {
+            fmt.printf(
+                "[CACHE] WARNING: could not evict cover %s: %v\n",
+                files[oldest_index].name,
+                remove_err,
+            )
+            break
+        }
+
+        fmt.printf(
+            "[CACHE] Evicted least-recently-used cover %s\n",
+            files[oldest_index].name,
+        )
+        evictable_count -= 1
+    }
+
+    app.cover_cache_needs_enforcement = false
+}
+
+
 LoadGameTextureAtIndex :: proc(app: ^App, game_index: int) {
     if app == nil ||
        game_index < 0 ||
@@ -226,6 +379,11 @@ LoadGameTextureAtIndex :: proc(app: ^App, game_index: int) {
     game := &app.games[game_index]
 
     if game.coverTex.id != 0 {
+        now_seconds := rl.GetTime()
+        if now_seconds - game.cover_last_touched >= 5 {
+            TouchCoverCacheFile(game.coverPath)
+            game.cover_last_touched = now_seconds
+        }
         game.cover_attempted = true
         return
     }
@@ -260,6 +418,8 @@ LoadGameTextureAtIndex :: proc(app: ^App, game_index: int) {
 
     if game.coverTex.id != 0 {
         rl.SetTextureFilter(game.coverTex, .BILINEAR)
+        TouchCoverCacheFile(game.coverPath)
+        game.cover_last_touched = rl.GetTime()
     }
 
     game.cover_attempted = true
@@ -333,6 +493,8 @@ ProcessCoverLoader :: proc(app: ^App) {
     }
 
     LoadVisibleGameTextures(app)
+    app.cover_cache_needs_enforcement = true
+    EnforceCoverCacheLimit(app)
 }
 
 
@@ -346,6 +508,9 @@ QueueVisibleCoverDownloads :: proc(app: ^App) {
     // Existing cache files can be uploaded immediately without starting a
     // network worker.
     LoadVisibleGameTextures(app)
+    if app.cover_cache_needs_enforcement {
+        EnforceCoverCacheLimit(app)
+    }
 
     data := new(CoverLoaderData)
 

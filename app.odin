@@ -52,8 +52,9 @@ GameRelease :: struct {
     coverUrl:       string,
     coverPath:      string,
     coverTex:       rl.Texture2D,
-    cover_loading:  bool,
-    cover_attempted: bool,
+    cover_loading:      bool,
+    cover_attempted:     bool,
+    cover_last_touched:  f64,
 }
 
 
@@ -115,6 +116,7 @@ App :: struct {
 
     cover_thread: ^thread.Thread,
     cover_data:   ^CoverLoaderData,
+    cover_cache_needs_enforcement: bool,
 
     download_manager: DownloadManager,
 

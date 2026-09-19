@@ -53,6 +53,7 @@ main :: proc() {
 
     app: App
     app.games = make([dynamic]GameRelease, 0, CATALOG_GAME_RESERVE)
+    app.cover_cache_needs_enforcement = true
 
     app.status_message = "READY"
     app.load_status = "Initializing..."
