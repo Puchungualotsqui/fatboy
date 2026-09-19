@@ -2178,7 +2178,7 @@ download_manifest_value_from_file :: proc(manager: ^DownloadManager, game_index:
     if read_err != nil {
         return ""
     }
-    defer delete(data)
+    defer delete(data, context.temp_allocator)
     return download_manifest_value(string(data[:]), key)
 }
 
@@ -2347,7 +2347,23 @@ download_marker_valid :: proc(marker_path: string) -> bool {
         return false
     }
 
-    return os.exists(string(marker_data[:]))
+    target := string(marker_data[:])
+    if os.is_file(target) {
+        return true
+    }
+    if !os.is_directory(target) {
+        return false
+    }
+
+    // An installed game must contain something. This prevents an empty
+    // directory left behind by an interrupted installer from being treated
+    // as a valid completion marker during startup or UI refresh.
+    entries, directory_err := os.read_all_directory_by_path(target, context.allocator)
+    if directory_err != nil {
+        return false
+    }
+    defer os.file_info_slice_delete(entries, context.allocator)
+    return len(entries) > 0
 }
 
 

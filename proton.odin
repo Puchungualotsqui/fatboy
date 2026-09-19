@@ -680,13 +680,18 @@ LaunchGEProtonInstaller :: proc(
         when ODIN_OS == .Linux {
             // setsid makes the Proton launcher the leader of a private process
             // group, so cancellation can terminate Wine/installer descendants.
+            // --wait is essential: without it setsid may return when it
+            // hands off to Proton, making the installer appear complete
+            // while Wine is still running.
             append(&command, "setsid")
+            append(&command, "--wait")
         }
         append(&command, runtime_paths.proton)
         append(&command, "run")
         append(&command, installer_path)
         append(&command, "/VERYSILENT")
         append(&command, "/SILENT")
+        append(&command, "/NOMUSIC")
         append(&command, "/SUPPRESSMSGBOXES")
         if use_ram_limit {
             append(&command, "/RAM=2")
@@ -698,7 +703,7 @@ LaunchGEProtonInstaller :: proc(
         append(&command, log_argument)
         defer delete(command)
         fmt.printf(
-            "[PROTON] Starting unattended installer through GE-Proton8-25: %s/proton run %s /VERYSILENT /SILENT /SUPPRESSMSGBOXES /NORESTART /NOICONS%s\n",
+            "[PROTON] Starting unattended installer through GE-Proton8-25: %s/proton run %s /VERYSILENT /SILENT /NOMUSIC /SUPPRESSMSGBOXES /NORESTART /NOICONS%s\n",
             runtime_paths.root,
             installer_path,
             use_ram_limit ? " /RAM=2" : "",

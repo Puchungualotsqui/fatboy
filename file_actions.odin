@@ -465,6 +465,7 @@ LaunchNativeDownloadInstaller :: proc(
     }
     command: [dynamic]string
     append(&command, installer_path)
+    append(&command, "/NOMUSIC")
     if use_ram_limit {
         append(&command, "/RAM=2")
     }
