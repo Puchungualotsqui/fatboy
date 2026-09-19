@@ -23,6 +23,7 @@ Torrent :: struct {
 	Piece_Length:   u64,
 	Piece_Hashes:   [dynamic]Torrent_Hash,
 	Files:          [dynamic]Torrent_File,
+	Multi_File:     bool,
 	Total_Length:   u64,
 	Comment:        []byte,
 	Has_Comment:    bool,
@@ -193,6 +194,7 @@ Parse_Torrent :: proc(data: []byte) -> (Torrent, Torrent_Error) {
 		return Torrent{}, .Invalid_Field
 	}
 	if files_value != nil {
+		result.Multi_File = true
 		if files_value.Kind != .List || len(files_value.List) == 0 {
 			Destroy_Torrent(&result)
 			return Torrent{}, .Invalid_Field
