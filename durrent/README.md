@@ -101,7 +101,7 @@ BitTorrent v1 client while keeping each layer testable:
    - Match transaction IDs, expire connection IDs, and retry with backoff.
    - Add compact IPv4 and IPv6 peer response handling.
 
-9. **Add DHT discovery**
+9. **Add DHT discovery** *(implemented in `dht.odin` and `dht_client.odin`)*
    - Implement BEP 5 KRPC messages, node IDs, routing buckets, and UDP I/O.
    - Implement `get_peers`, `announce_peer`, token validation, iterative lookup,
      node expiration, and routing-table persistence.

@@ -24,6 +24,8 @@ Torrent :: struct {
 	Piece_Hashes:   [dynamic]Torrent_Hash,
 	Files:          [dynamic]Torrent_File,
 	Multi_File:     bool,
+	Private:        bool,
+	Has_Private:    bool,
 	Total_Length:   u64,
 	Comment:        []byte,
 	Has_Comment:    bool,
@@ -161,6 +163,17 @@ Parse_Torrent :: proc(data: []byte) -> (Torrent, Torrent_Error) {
 		Destroy_Torrent(&result)
 		return Torrent{}, .Unsafe_Path
 	}
+	private_value := Bencode_Dictionary_Get(info, "private")
+	if private_value != nil {
+		private_flag, private_ok := torrent_non_negative_integer(private_value)
+		if !private_ok || private_flag > 1 {
+			Destroy_Torrent(&result)
+			return Torrent{}, .Invalid_Field
+		}
+		result.Private = private_flag == 1
+		result.Has_Private = true
+	}
+
 	name_copy, name_ok := torrent_clone(name_value.String)
 	if !name_ok {
 		Destroy_Torrent(&result)
@@ -347,6 +360,14 @@ Parse_Torrent :: proc(data: []byte) -> (Torrent, Torrent_Error) {
 	}
 
 	return result, .None
+}
+
+Torrent_Allows_DHT :: proc(torrent: ^Torrent) -> bool {
+	return torrent != nil && !torrent.Private
+}
+
+Torrent_Allows_Peer_Exchange :: proc(torrent: ^Torrent) -> bool {
+	return torrent != nil && !torrent.Private
 }
 
 Torrent_Is_Safe_Path_Component :: proc(component: []byte) -> bool {
