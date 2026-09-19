@@ -40,6 +40,8 @@ Destroy_DHT_Lookup_Result :: proc(result: ^DHT_Lookup_Result) {
 DHT_Client :: struct {
 	Mutex:       sync.Mutex,
 	Socket:      net.UDP_Socket,
+	Socket6:     net.UDP_Socket,
+	Has_Socket6: bool,
 	Node_ID:     DHT_Node_ID,
 	Routing:     DHT_Routing_Table,
 	Token_Secret: [20]byte,
@@ -63,20 +65,37 @@ DHT_Client_Init :: proc(
 		return .Private_Torrent
 	}
 	DHT_Client_Destroy(client)
-	socket, socket_error := net.make_bound_udp_socket(net.IP4_Any, int(port))
-	if socket_error != nil {
+	socket4, socket4_error := net.make_bound_udp_socket(net.IP4_Any, int(port))
+	socket6, socket6_error := net.make_bound_udp_socket(net.IP6_Any, int(port))
+	socket4_ready := socket4_error == nil
+	socket6_ready := socket6_error == nil
+	if !socket4_ready && !socket6_ready {
 		return .Socket
 	}
 	timeout := options.Timeout if options.Timeout > 0 else DHT_Default_Network_Options().Timeout
-	if net.set_option(socket, .Receive_Timeout, timeout) != nil || net.set_option(socket, .Send_Timeout, timeout) != nil {
-		net.close(socket)
+	if socket4_ready && dht_configure_socket(socket4, timeout) != .None {
+		net.close(socket4)
+		socket4_ready = false
+	}
+	if socket6_ready && dht_configure_socket(socket6, timeout) != .None {
+		net.close(socket6)
+		socket6_ready = false
+	}
+	if !socket4_ready && !socket6_ready {
 		return .Socket
 	}
 	if DHT_Routing_Init(&client.Routing, node_id) != .None {
-		net.close(socket)
+		if socket4_ready {
+			net.close(socket4)
+		}
+		if socket6_ready {
+			net.close(socket6)
+		}
 		return .Out_Of_Memory
 	}
-	client.Socket = socket
+	client.Socket = socket4
+	client.Socket6 = socket6
+	client.Has_Socket6 = socket6_ready
 	client.Node_ID = node_id
 	client.Token_Secret = node_id
 	client.Secret_Time = time.now()
@@ -92,6 +111,9 @@ DHT_Client_Destroy :: proc(client: ^DHT_Client) {
 	sync.mutex_lock(&client.Mutex)
 	if client.Open {
 		net.close(client.Socket)
+		if client.Has_Socket6 {
+			net.close(client.Socket6)
+		}
 	}
 	client.Open = false
 	sync.mutex_unlock(&client.Mutex)
@@ -243,21 +265,33 @@ dht_client_exchange_locked :: proc(
 	transaction: []byte,
 	options: DHT_Network_Options,
 ) -> (DHT_Message, DHT_Error) {
+	socket: net.UDP_Socket
+	net_endpoint: net.Endpoint
 	if endpoint.IPv6 {
-		return DHT_Message{}, .Resolve
+		if !client.Has_Socket6 {
+			return DHT_Message{}, .Resolve
+		}
+		ip6: net.IP6_Address
+		for index := 0; index < 8; index += 1 {
+			ip6[index] = u16be(u16(endpoint.IP[index*2])<<8 | u16(endpoint.IP[index*2+1]))
+		}
+		socket = client.Socket6
+		net_endpoint = net.Endpoint{address = ip6, port = int(endpoint.Port)}
+	} else {
+		ip4 := net.IP4_Address{endpoint.IP[0], endpoint.IP[1], endpoint.IP[2], endpoint.IP[3]}
+		socket = client.Socket
+		net_endpoint = net.Endpoint{address = ip4, port = int(endpoint.Port)}
 	}
-	address := net.IP4_Address{endpoint.IP[0], endpoint.IP[1], endpoint.IP[2], endpoint.IP[3]}
-	net_endpoint := net.Endpoint{address = address, port = int(endpoint.Port)}
-	if _, send_error := net.send_udp(client.Socket, packet, net_endpoint); send_error != .None {
+	if _, send_error := net.send_udp(socket, packet, net_endpoint); send_error != .None {
 		return DHT_Message{}, .Send
 	}
 	timeout := options.Timeout if options.Timeout > 0 else DHT_Default_Network_Options().Timeout
-	_ = net.set_option(client.Socket, .Receive_Timeout, timeout)
+	_ = net.set_option(socket, .Receive_Timeout, timeout)
 	buffer, buffer_error := make([]byte, 64*1024, context.allocator)
 	if buffer_error != nil {
 		return DHT_Message{}, .Out_Of_Memory
 	}
-	count, _, receive_error := net.recv_udp(client.Socket, buffer)
+	count, _, receive_error := net.recv_udp(socket, buffer)
 	if receive_error == .Timeout || receive_error == .Would_Block {
 		delete(buffer)
 		return DHT_Message{}, .Timeout

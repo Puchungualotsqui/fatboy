@@ -109,9 +109,10 @@ BitTorrent v1 client while keeping each layer testable:
      exchange.
 
 10. **Add optional interoperability features**
-    - Add IPv6 support throughout peer and tracker handling.
-    - Add PEX, fast-extension messages, web seeds, and BitTorrent v2/hybrid
-      metadata as separate capabilities.
+    - Add IPv6 support throughout peer, tracker, and DHT handling *(implemented in `tracker_udp.odin`, `dht_client.odin`, and `loop.odin`)*.
+    - Add PEX *(implemented in `pex.odin` and `loop.odin`)*.
+    - Add fast-extension messages, web seeds, and BitTorrent v2/hybrid metadata
+      as separate future capabilities.
 
 11. **Integrate `durrent` with Fatboy**
     - Replace or complement the current Real-Debrid download path with a local
