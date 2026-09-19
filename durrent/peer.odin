@@ -252,6 +252,23 @@ Peer_Session_Queue_Have :: proc(session: ^Peer_Session, index: u32) -> Peer_Erro
 	return peer_session_queue_locked(session, Wire_Message_View{Kind = .Have, Index = index})
 }
 
+Peer_Session_Queue_Piece :: proc(session: ^Peer_Session, index, begin: u32, payload: []byte) -> Peer_Error {
+	if session == nil {
+		return .Invalid_Peer
+	}
+	sync.mutex_lock(&session.Mutex)
+	defer sync.mutex_unlock(&session.Mutex)
+	if session.State != .Ready || !peer_piece_payload_valid(session, index, begin, payload) {
+		return .Invalid_State
+	}
+	return peer_session_queue_locked(session, Wire_Message_View{
+		Kind = .Piece,
+		Index = index,
+		Begin = begin,
+		Payload = payload,
+	})
+}
+
 Peer_Session_Queue_Request :: proc(session: ^Peer_Session, index, begin, length: u32) -> Peer_Error {
 	if session == nil {
 		return .Invalid_Peer

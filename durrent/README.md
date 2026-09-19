@@ -84,7 +84,7 @@ BitTorrent v1 client while keeping each layer testable:
    - Manage tracker tiers, announce intervals, failover, and started,
      completed, and stopped events.
 
-6. **Implement the torrent session loop**
+6. **Implement the torrent session loop** *(implemented in `loop.odin`)*
    - Coordinate storage, trackers, peer sessions, and the piece scheduler.
    - Add peer limits, bandwidth accounting, connection cleanup, and graceful
      cancellation/shutdown.

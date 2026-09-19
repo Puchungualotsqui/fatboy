@@ -26,6 +26,7 @@ Piece_Scheduler :: struct {
 	Piece_Length:             u64,
 	Total_Length:             u64,
 	Completed:                Bitfield,
+	Block_Received:           [dynamic][]byte,
 	Availability:             []u32,
 	Peers:                    [dynamic]Piece_Scheduler_Peer,
 	Request_Timeout:          time.Duration,
@@ -65,8 +66,27 @@ Piece_Scheduler_Init :: proc(
 	if completed_error != .None {
 		return .Out_Of_Memory
 	}
+	block_received: [dynamic][]byte
+	for index: u32 = 0; index < piece_count; index += 1 {
+		length := Piece_Length(index, piece_length, total_length)
+		block_count := u32((u64(length)+u64(Block_Size)-1)/u64(Block_Size))
+		bitmap, bitmap_error := make([]byte, int((u64(block_count)+7)/8), context.allocator)
+		if bitmap_error != nil {
+			for existing in block_received {
+				delete(existing)
+			}
+			delete(block_received)
+			Destroy_Bitfield(&completed)
+			return .Out_Of_Memory
+		}
+		append(&block_received, bitmap)
+	}
 	availability, alloc_error := make([]u32, int(piece_count), context.allocator)
 	if alloc_error != nil {
+		for existing in block_received {
+			delete(existing)
+		}
+		delete(block_received)
 		Destroy_Bitfield(&completed)
 		return .Out_Of_Memory
 	}
@@ -74,6 +94,7 @@ Piece_Scheduler_Init :: proc(
 	scheduler.Piece_Length = piece_length
 	scheduler.Total_Length = total_length
 	scheduler.Completed = completed
+	scheduler.Block_Received = block_received
 	scheduler.Availability = availability
 	scheduler.Request_Timeout = request_timeout
 	scheduler.Max_Requests_Per_Peer = 5
@@ -94,8 +115,13 @@ Piece_Scheduler_Destroy :: proc(scheduler: ^Piece_Scheduler) {
 	}
 	delete(scheduler.Peers)
 	Destroy_Bitfield(&scheduler.Completed)
+	for bitmap in scheduler.Block_Received {
+		delete(bitmap)
+	}
+	delete(scheduler.Block_Received)
 	delete(scheduler.Availability)
 	scheduler.Peers = nil
+	scheduler.Block_Received = nil
 	scheduler.Availability = nil
 	scheduler.Piece_Count = 0
 	scheduler.Piece_Length = 0
@@ -248,6 +274,11 @@ Piece_Scheduler_Set_Completed :: proc(scheduler: ^Piece_Scheduler, completed: ^B
 	}
 	Destroy_Bitfield(&scheduler.Completed)
 	scheduler.Completed = copy
+	for index: u32 = 0; index < scheduler.Piece_Count; index += 1 {
+		if Bitfield_Has_Piece(&scheduler.Completed, index) {
+			piece_scheduler_mark_all_blocks_locked(scheduler, index)
+		}
+	}
 	scheduler.Seeding = Bitfield_Is_Complete(&scheduler.Completed)
 	return .None
 }
@@ -315,6 +346,20 @@ Piece_Scheduler_Next_Request :: proc(
 	return request, true, .None
 }
 
+Piece_Scheduler_Drop_Request :: proc(scheduler: ^Piece_Scheduler, peer_id: u64, index, begin: u32) -> Piece_Scheduler_Error {
+	if scheduler == nil {
+		return .Invalid_Scheduler
+	}
+	sync.mutex_lock(&scheduler.Mutex)
+	defer sync.mutex_unlock(&scheduler.Mutex)
+	peer := piece_scheduler_find_peer(scheduler, peer_id)
+	if peer == nil {
+		return .Invalid_Peer
+	}
+	piece_scheduler_remove_request_locked(peer, index, begin)
+	return .None
+}
+
 Piece_Scheduler_Complete_Block :: proc(scheduler: ^Piece_Scheduler, index, begin: u32) -> Piece_Scheduler_Error {
 	if scheduler == nil {
 		return .Invalid_Scheduler
@@ -324,9 +369,13 @@ Piece_Scheduler_Complete_Block :: proc(scheduler: ^Piece_Scheduler, index, begin
 	if index >= scheduler.Piece_Count {
 		return .Invalid_Piece
 	}
+	if !piece_scheduler_block_valid(scheduler, index, begin) {
+		return .Invalid_Piece
+	}
 	for &peer in scheduler.Peers {
 		piece_scheduler_remove_request_locked(&peer, index, begin)
 	}
+	piece_scheduler_mark_block_received_locked(scheduler, index, begin)
 	return .None
 }
 
@@ -341,6 +390,7 @@ Piece_Scheduler_Complete_Piece :: proc(scheduler: ^Piece_Scheduler, index: u32) 
 		return .Invalid_Piece
 	}
 	Bitfield_Set_Piece(&scheduler.Completed, index)
+	piece_scheduler_mark_all_blocks_locked(scheduler, index)
 	for &peer in scheduler.Peers {
 		piece_scheduler_remove_piece_requests_locked(&peer, index)
 		if peer.Session != nil {
@@ -426,6 +476,38 @@ Piece_Scheduler_Peer_Request_Count :: proc(scheduler: ^Piece_Scheduler, peer_id:
 	return u32(len(peer.In_Flight)), true
 }
 
+piece_scheduler_block_valid :: proc(scheduler: ^Piece_Scheduler, index, begin: u32) -> bool {
+	if index >= scheduler.Piece_Count || begin % Block_Size != 0 {
+		return false
+	}
+	length := Piece_Length(index, scheduler.Piece_Length, scheduler.Total_Length)
+	return length > 0 && begin < length
+}
+
+piece_scheduler_block_received :: proc(scheduler: ^Piece_Scheduler, index, begin: u32) -> bool {
+	if !piece_scheduler_block_valid(scheduler, index, begin) || index >= u32(len(scheduler.Block_Received)) {
+		return false
+	}
+	return piece_bitmap_has(scheduler.Block_Received[index], begin/Block_Size)
+}
+
+piece_scheduler_mark_block_received_locked :: proc(scheduler: ^Piece_Scheduler, index, begin: u32) {
+	if index < u32(len(scheduler.Block_Received)) {
+		piece_bitmap_set(scheduler.Block_Received[index], begin/Block_Size)
+	}
+}
+
+piece_scheduler_mark_all_blocks_locked :: proc(scheduler: ^Piece_Scheduler, index: u32) {
+	if index >= scheduler.Piece_Count || index >= u32(len(scheduler.Block_Received)) {
+		return
+	}
+	length := Piece_Length(index, scheduler.Piece_Length, scheduler.Total_Length)
+	block_count := u32((u64(length)+u64(Block_Size)-1)/u64(Block_Size))
+	for block: u32 = 0; block < block_count; block += 1 {
+		piece_bitmap_set(scheduler.Block_Received[index], block)
+	}
+}
+
 piece_scheduler_find_peer :: proc(scheduler: ^Piece_Scheduler, id: u64) -> ^Piece_Scheduler_Peer {
 	for &peer in scheduler.Peers {
 		if peer.ID == id {
@@ -449,7 +531,7 @@ piece_scheduler_find_block_locked :: proc(
 		if length > Block_Size {
 			length = Block_Size
 		}
-		if piece_scheduler_peer_has_request(peer, index, begin) {
+		if piece_scheduler_peer_has_request(peer, index, begin) || piece_scheduler_block_received(scheduler, index, begin) {
 			continue
 		}
 		if !endgame && piece_scheduler_any_request(scheduler, index, begin) {
