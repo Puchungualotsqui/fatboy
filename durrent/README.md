@@ -62,15 +62,15 @@ BitTorrent v1 client while keeping each layer testable:
      flushing, and piece verification.
    - Add resume state and startup verification of existing pieces.
 
-3. **Implement TCP peer connections**
-   - Add DNS resolution, connection timeouts, read/write buffering, and
-     disconnect handling.
+3. **Implement TCP peer connections** *(implemented in `transport.odin` and `peer.odin`)*
+   - Add DNS resolution, deadline-bounded dial workers, socket timeouts,
+     read/write buffering, and disconnect handling.
    - Send and validate the BitTorrent handshake, including the expected
      info-hash.
    - Add a peer session state machine for choke/unchoke, interested states,
      bitfields, `have`, keep-alive, request, piece, and cancel messages.
 
-4. **Implement piece scheduling**
+4. **Implement piece scheduling** *(implemented in `scheduler.odin`)*
    - Track availability across peers and select pieces using rarest-first
      scheduling.
    - Add per-peer request pipelines, request deadlines, retries, and endgame
