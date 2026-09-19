@@ -40,16 +40,41 @@ CurlWriteCallback :: proc "c" (
 }
 
 
-FITGIRL_API_URL :: "https://fitgirl-repacks.site/wp-json/wp/v2/posts?per_page=30"
+FITGIRL_API_BASE_URL :: "https://fitgirl-repacks.site/wp-json/wp/v2/posts"
 
-FetchLiveCatalog :: proc() -> string {
+FetchLiveCatalogPage :: proc(page, per_page: int, search: string) -> string {
     builder: strings.Builder
     strings.builder_init(&builder, context.allocator)
     defer strings.builder_destroy(&builder)
 
+    encoded_search := ""
+    if len(search) > 0 {
+        encoded_search = rd_url_encode(search)
+        defer delete(encoded_search)
+    }
+
+    api_url := ""
+    if len(encoded_search) > 0 {
+        api_url = fmt.aprintf(
+            "%s?per_page=%d&page=%d&search=%s",
+            FITGIRL_API_BASE_URL,
+            per_page,
+            page,
+            encoded_search,
+        )
+    } else {
+        api_url = fmt.aprintf(
+            "%s?per_page=%d&page=%d",
+            FITGIRL_API_BASE_URL,
+            per_page,
+            page,
+        )
+    }
+    defer delete(api_url)
+
     fmt.printf(
         "[HTTP] Catalog URL: %s\n",
-        FITGIRL_API_URL,
+        api_url,
     )
 
     fmt.println("[HTTP] curl.easy_init()...")
@@ -64,7 +89,7 @@ FetchLiveCatalog :: proc() -> string {
     defer curl.easy_cleanup(handle)
 
     cstrUrl := strings.clone_to_cstring(
-        FITGIRL_API_URL,
+        api_url,
         context.allocator,
     )
     defer delete(cstrUrl)
@@ -125,6 +150,26 @@ FetchLiveCatalog :: proc() -> string {
         context.allocator,
     )
 }
+
+CountCatalogPosts :: proc(data: []byte) -> int {
+    if len(data) == 0 || !json.is_valid(data) {
+        return 0
+    }
+
+    value, err := json.parse(data)
+    if err != .None {
+        return 0
+    }
+    defer json.destroy_value(value)
+
+    root, ok := value.(json.Array)
+    if !ok {
+        return 0
+    }
+
+    return len(root)
+}
+
 
 ExtractMagnet :: proc(html: string) -> string {
     prefix := "magnet:?xt=urn:btih:"
@@ -585,6 +630,9 @@ ParseGames :: proc(data: []byte) -> [dynamic]GameRelease {
 }
 
 download_worker :: proc(task: thread.Task) {
+    // Pool workers do not inherit the main thread's Odin context.
+    context = runtime.default_context()
+
     index := task.user_index
 
     fmt.printf(
@@ -927,45 +975,67 @@ loader_proc :: proc(t: ^thread.Thread) {
 
     fmt.println("[LOADER] Syncing with FitGirl API...")
 
-    json_data := FetchLiveCatalog()
-
-    if len(json_data) == 0 {
-        data.error_message = "Error: Could not reach catalog."
-
-        fmt.println(
-            "[LOADER] ERROR: Failed to fetch catalog JSON.",
-        )
-
-        return
+    api_page := data.api_page
+    if api_page <= 0 {
+        api_page = 1
     }
 
     fmt.printf(
-        "[LOADER] Received %d JSON bytes\n",
-        len(json_data),
+        "[LOADER] Fetching catalog page %d search=%q...\n",
+        api_page,
+        data.query,
     )
 
-    fmt.println(
-        "[LOADER] Parsing JSON data safely...",
+    json_data := FetchLiveCatalogPage(
+        api_page,
+        CATALOG_API_PAGE_SIZE,
+        data.query,
     )
 
-    games := ParseGames(
-        transmute([]byte)json_data,
-    )
+    games := make([dynamic]GameRelease)
+
+    if len(json_data) > 0 {
+        fmt.printf(
+            "[LOADER] Received %d JSON bytes for page %d\n",
+            len(json_data),
+            api_page,
+        )
+
+        data.raw_post_count = CountCatalogPosts(
+            transmute([]byte)json_data,
+        )
+
+        games = ParseGames(
+            transmute([]byte)json_data,
+        )
+    }
+
+    response_received := len(json_data) > 0
+    if response_received {
+        delete(json_data)
+    }
 
     fmt.printf(
-        "[LOADER] ParseGames returned %d games\n",
+        "[LOADER] Page %d produced %d games\n",
+        api_page,
         len(games),
     )
 
-    fmt.println(
-        "[LOADER] Releasing raw JSON buffer...",
-    )
+    // An empty later page is a normal end-of-catalog result. An empty first
+    // page is reported as an error so the setup/loading screen remains useful.
+    if len(games) == 0 && api_page == 1 {
+        data.games = games
+        if !response_received {
+            data.error_message = "Error: Could not reach catalog."
+        } else {
+            data.error_message = "No valid releases found."
+        }
 
-    delete(json_data)
-
-    fmt.println(
-        "[LOADER] Raw JSON buffer released",
-    )
+        fmt.println(
+            "[LOADER] ERROR: first catalog page returned no valid releases",
+        )
+        return
+    }
 
     if len(games) == 0 {
         data.games = games
@@ -984,15 +1054,10 @@ loader_proc :: proc(t: ^thread.Thread) {
     )
 
 
-    // -----------------------------------------------------
-    // Cover directory
-    // -----------------------------------------------------
-
+    // Cover files are downloaded lazily after the first page is visible.
+    // The catalog loader only fetches metadata so a large catalog does not
+    // block the library screen on hundreds of image requests.
     if !os.exists("covers") {
-        fmt.println(
-            "[LOADER] Creating covers directory...",
-        )
-
         mkdir_err := os.make_directory("covers")
 
         if mkdir_err != nil {
@@ -1000,103 +1065,8 @@ loader_proc :: proc(t: ^thread.Thread) {
                 "[LOADER] WARNING: covers directory creation failed: %v\n",
                 mkdir_err,
             )
-        } else {
-            fmt.println(
-                "[LOADER] Covers directory created",
-            )
         }
-    } else {
-        fmt.println(
-            "[LOADER] Covers directory already exists",
-        )
     }
-
-
-    // -----------------------------------------------------
-    // Cover pool
-    // -----------------------------------------------------
-
-    fmt.println(
-        "[LOADER] Initializing cover thread pool...",
-    )
-
-    pool: thread.Pool
-
-    thread.pool_init(
-        &pool,
-        context.allocator,
-        8,
-    )
-
-    fmt.println(
-        "[LOADER] Starting cover thread pool...",
-    )
-
-    thread.pool_start(&pool)
-
-    tasks := make(
-        []DownloadTask,
-        len(games),
-    )
-
-    queued := 0
-
-    fmt.println(
-        "[LOADER] Queueing cover jobs...",
-    )
-
-    for i in 0..<len(games) {
-        if len(games[i].coverUrl) == 0 {
-            fmt.printf(
-                "[LOADER] Cover %d: no URL, not queued\n",
-                i,
-            )
-            continue
-        }
-
-        tasks[i].game_ptr = &games[i]
-
-        thread.pool_add_task(
-            &pool,
-            context.allocator,
-            download_worker,
-            &tasks[i],
-            i,
-        )
-
-        queued += 1
-    }
-
-    fmt.printf(
-        "[LOADER] Queued %d cover jobs\n",
-        queued,
-    )
-
-    fmt.println(
-        "[LOADER] Waiting for cover workers...",
-    )
-
-    thread.pool_finish(&pool)
-
-    fmt.println(
-        "[LOADER] All cover workers finished",
-    )
-
-    fmt.println(
-        "[LOADER] Destroying cover thread pool...",
-    )
-
-    thread.pool_destroy(&pool)
-
-    fmt.println(
-        "[LOADER] Cover thread pool destroyed",
-    )
-
-    delete(tasks)
-
-    fmt.println(
-        "[LOADER] Cover task array released",
-    )
 
 
     // -----------------------------------------------------

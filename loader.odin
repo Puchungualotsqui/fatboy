@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:thread"
+import "base:runtime"
 import orui "orui"
 import rl "vendor:raylib"
 
@@ -18,40 +19,57 @@ StartLoader :: proc(app: ^App) {
         return
     }
 
-    if app.loader_thread != nil {
-        fmt.println("[MAIN] WARNING: loader already running")
+    StartCatalogPageLoader(
+        app,
+        1,
+        app.search_query,
+    )
+}
+
+
+StartCatalogPageLoader :: proc(app: ^App, api_page: int, query: string) {
+    if app == nil {
         return
     }
 
-    fmt.println("[MAIN] Allocating LoaderData...")
+    if app.loader_thread != nil {
+        fmt.println("[MAIN] WARNING: catalog loader already running")
+        return
+    }
+
+    fmt.printf(
+        "[MAIN] Loading catalog page %d search=%q\n",
+        api_page,
+        query,
+    )
 
     data := new(LoaderData)
-
-    fmt.println("[MAIN] Creating loader thread...")
+    data.api_page = api_page
+    data.query = strings.clone(query, context.allocator)
 
     t := thread.create(loader_proc)
 
     if t == nil {
         fmt.println("[MAIN] ERROR: thread.create returned nil")
 
+        delete(data.query)
         free(data)
 
-        app.load_status = "Error: Could not create loader thread."
+        app.load_status = "Error: Could not create catalog loader thread."
         return
     }
 
     t.data = data
-
     app.loader_data = data
     app.loader_thread = t
 
-    app.load_status = "Syncing with FitGirl API..."
-
-    fmt.println("[MAIN] Starting loader thread...")
+    if len(query) > 0 {
+        app.load_status = "Searching catalog..."
+    } else {
+        app.load_status = "Loading catalog page..."
+    }
 
     thread.start(t)
-
-    fmt.println("[MAIN] Loader thread started")
 }
 
 
@@ -185,16 +203,362 @@ LoadGameTextures :: proc(app: ^App) {
 }
 
 
+CatalogVisibleIndices :: proc(app: ^App) -> []int {
+    if app == nil || len(app.filtered_game_indices) == 0 {
+        return nil
+    }
+
+    // filtered_game_indices is the already-loaded API page. It is not a
+    // slice of the complete catalog, so no second UI-page offset applies.
+    return app.filtered_game_indices[:]
+}
+
+
+LoadGameTextureAtIndex :: proc(app: ^App, game_index: int) {
+    if app == nil ||
+       game_index < 0 ||
+       game_index >= len(app.games) {
+        return
+    }
+
+    game := &app.games[game_index]
+
+    if game.coverTex.id != 0 {
+        game.cover_attempted = true
+        return
+    }
+
+    if len(game.coverPath) == 0 || !os.exists(game.coverPath) {
+        return
+    }
+
+    path_cstr := strings.clone_to_cstring(
+        game.coverPath,
+        context.temp_allocator,
+    )
+
+    img := rl.LoadImage(path_cstr)
+
+    if img.data == nil || img.width <= 0 || img.height <= 0 {
+        remove_err := os.remove(game.coverPath)
+        if remove_err != nil {
+            fmt.printf(
+                "[TEXTURE] WARNING: could not remove invalid cover %s: %v\n",
+                game.coverPath,
+                remove_err,
+            )
+        }
+
+        game.cover_attempted = true
+        return
+    }
+
+    game.coverTex = rl.LoadTextureFromImage(img)
+    rl.UnloadImage(img)
+
+    if game.coverTex.id != 0 {
+        rl.SetTextureFilter(game.coverTex, .BILINEAR)
+    }
+
+    game.cover_attempted = true
+}
+
+
+LoadVisibleGameTextures :: proc(app: ^App) {
+    for game_index in CatalogVisibleIndices(app) {
+        LoadGameTextureAtIndex(app, game_index)
+    }
+}
+
+
+cover_loader_proc :: proc(t: ^thread.Thread) {
+    context = runtime.default_context()
+
+    if t == nil {
+        return
+    }
+
+    data := cast(^CoverLoaderData)t.data
+    if data == nil {
+        return
+    }
+
+    pool: thread.Pool
+    thread.pool_init(&pool, context.allocator, 8)
+    thread.pool_start(&pool)
+
+    for index := 0; index < len(data.tasks); index += 1 {
+        thread.pool_add_task(
+            &pool,
+            context.allocator,
+            download_worker,
+            &data.tasks[index],
+            index,
+        )
+    }
+
+    thread.pool_finish(&pool)
+    thread.pool_destroy(&pool)
+}
+
+
+ProcessCoverLoader :: proc(app: ^App) {
+    if app == nil || app.cover_thread == nil {
+        return
+    }
+
+    if !thread.is_done(app.cover_thread) {
+        return
+    }
+
+    data := app.cover_data
+    thread.destroy(app.cover_thread)
+    app.cover_thread = nil
+    app.cover_data = nil
+
+    // The worker only writes image files. GPU texture creation must happen
+    // on the main thread, so load only files for the current visible page.
+    for &game in app.games {
+        if game.cover_loading {
+            game.cover_loading = false
+            game.cover_attempted = true
+        }
+    }
+
+    if data != nil {
+        delete(data.tasks)
+        free(data)
+    }
+
+    LoadVisibleGameTextures(app)
+}
+
+
+QueueVisibleCoverDownloads :: proc(app: ^App) {
+    if app == nil ||
+       app.cover_thread != nil ||
+       app.loader_thread != nil {
+        return
+    }
+
+    // Existing cache files can be uploaded immediately without starting a
+    // network worker.
+    LoadVisibleGameTextures(app)
+
+    data := new(CoverLoaderData)
+
+    for game_index in CatalogVisibleIndices(app) {
+        game := &app.games[game_index]
+
+        if game.coverTex.id != 0 ||
+           game.cover_loading ||
+           game.cover_attempted {
+            continue
+        }
+
+        if len(game.coverUrl) == 0 {
+            game.cover_attempted = true
+            continue
+        }
+
+        if len(game.coverPath) == 0 {
+            game.cover_attempted = true
+            continue
+        }
+
+        game.cover_loading = true
+        append(&data.tasks, DownloadTask{game_ptr = game})
+    }
+
+    if len(data.tasks) == 0 {
+        delete(data.tasks)
+        free(data)
+        return
+    }
+
+    t := thread.create(cover_loader_proc)
+    if t == nil {
+        for task in data.tasks {
+            if task.game_ptr != nil {
+                task.game_ptr.cover_loading = false
+                task.game_ptr.cover_attempted = true
+            }
+        }
+
+        delete(data.tasks)
+        free(data)
+        return
+    }
+
+    t.data = data
+    app.cover_data = data
+    app.cover_thread = t
+    thread.start(t)
+}
+
+
+ShutdownCoverLoader :: proc(app: ^App) {
+    if app == nil || app.cover_thread == nil {
+        return
+    }
+
+    data := app.cover_data
+    thread.destroy(app.cover_thread)
+    app.cover_thread = nil
+    app.cover_data = nil
+
+    if data != nil {
+        delete(data.tasks)
+        free(data)
+    }
+}
+
+
+CatalogPageCacheIndex :: proc(app: ^App, api_page: int, query: string) -> int {
+    if app == nil {
+        return -1
+    }
+
+    for page, page_index in app.catalog_pages {
+        if page.api_page == api_page && page.query == query {
+            return page_index
+        }
+    }
+
+    return -1
+}
+
+
+CatalogClearVisiblePage :: proc(app: ^App) {
+    if app == nil {
+        return
+    }
+
+    if len(app.filtered_game_indices) > 0 {
+        delete(app.filtered_game_indices)
+    }
+
+    app.filtered_game_indices = make([dynamic]int)
+}
+
+
+CatalogShowCachedPage :: proc(app: ^App, api_page: int, query: string) -> bool {
+    if app == nil {
+        return false
+    }
+
+    cache_index := CatalogPageCacheIndex(app, api_page, query)
+    if cache_index < 0 {
+        return false
+    }
+
+    CatalogClearVisiblePage(app)
+
+    for game_index in app.catalog_pages[cache_index].game_indices {
+        append(&app.filtered_game_indices, game_index)
+    }
+
+    app.catalog_page = api_page - 1
+    app.catalog_has_next = app.catalog_pages[cache_index].has_next
+    app.selected_game = -1
+    return true
+}
+
+
+CatalogResetPages :: proc(app: ^App) {
+    if app == nil {
+        return
+    }
+
+    for &page in app.catalog_pages {
+        if len(page.query) > 0 {
+            delete(page.query)
+        }
+        if len(page.game_indices) > 0 {
+            delete(page.game_indices)
+        }
+    }
+
+    if len(app.catalog_pages) > 0 {
+        delete(app.catalog_pages)
+    }
+
+    app.catalog_pages = make([dynamic]CatalogPageCache)
+    CatalogClearVisiblePage(app)
+    app.catalog_page = 0
+    app.catalog_has_next = false
+    app.selected_game = -1
+}
+
+
+FindCachedGameIndex :: proc(app: ^App, magnet_link: string) -> int {
+    if app == nil || len(magnet_link) == 0 {
+        return -1
+    }
+
+    for game, game_index in app.games {
+        if game.magnetLink == magnet_link {
+            return game_index
+        }
+    }
+
+    return -1
+}
+
+
+CatalogAppendLoadedPage :: proc(
+    app: ^App,
+    loader_data: ^LoaderData,
+) -> bool {
+    if app == nil || loader_data == nil {
+        return false
+    }
+
+    cache := CatalogPageCache{
+        query = strings.clone(loader_data.query, context.allocator),
+        api_page = loader_data.api_page,
+        has_next = loader_data.raw_post_count >= CATALOG_API_PAGE_SIZE,
+    }
+
+    for game_index := 0; game_index < len(loader_data.games); game_index += 1 {
+        existing_index := FindCachedGameIndex(
+            app,
+            loader_data.games[game_index].magnetLink,
+        )
+
+        if existing_index >= 0 {
+            DestroyGame(&loader_data.games[game_index])
+            append(&cache.game_indices, existing_index)
+            continue
+        }
+
+        new_index := len(app.games)
+        append(&app.games, loader_data.games[game_index])
+        loader_data.games[game_index] = {}
+        append(&cache.game_indices, new_index)
+    }
+
+    append(&app.catalog_pages, cache)
+    cache_index := len(app.catalog_pages) - 1
+
+    CatalogClearVisiblePage(app)
+    for game_index in app.catalog_pages[cache_index].game_indices {
+        append(&app.filtered_game_indices, game_index)
+    }
+
+    app.catalog_page = loader_data.api_page - 1
+    app.catalog_has_next = app.catalog_pages[cache_index].has_next
+    app.selected_game = -1
+    return true
+}
+
+
 // ---------------------------------------------------------
 // Poll Completed Loader - MAIN THREAD ONLY
 // ---------------------------------------------------------
 
 ProcessFinishedLoader :: proc(app: ^App) {
-    if app == nil {
-        return
-    }
-
-    if app.loader_thread == nil {
+    if app == nil || app.loader_thread == nil {
         return
     }
 
@@ -202,35 +566,25 @@ ProcessFinishedLoader :: proc(app: ^App) {
         return
     }
 
-    fmt.println(
-        "[MAIN] Loader reports completion",
-    )
-
-    // Save the result pointer first because thread.destroy()
-    // frees the Thread object itself.
     loader_data := app.loader_data
-
-    fmt.println(
-        "[MAIN] Destroying/joining completed loader thread...",
-    )
-
     thread.destroy(app.loader_thread)
-
     app.loader_thread = nil
     app.loader_data = nil
 
-    fmt.println(
-        "[MAIN] Loader thread destroyed safely",
-    )
-
     if loader_data == nil {
-        fmt.println(
-            "[MAIN] ERROR: loader completed without LoaderData",
-        )
+        app.load_status = "Error: Loader returned invalid state."
+        return
+    }
 
-        app.load_status =
-            "Error: Loader returned invalid state."
-
+    // A user can type another search term while a request is in flight. Do
+    // not show stale results; discard them and request the current query.
+    if loader_data.query != app.search_query {
+        if len(loader_data.games) > 0 {
+            DestroyGames(loader_data.games)
+        }
+        delete(loader_data.query)
+        free(loader_data)
+        StartCatalogPageLoader(app, 1, app.search_query)
         return
     }
 
@@ -243,42 +597,46 @@ ProcessFinishedLoader :: proc(app: ^App) {
         if len(loader_data.games) > 0 {
             DestroyGames(loader_data.games)
         }
+        delete(loader_data.query)
 
         if len(loader_data.error_message) > 0 {
             app.load_status = loader_data.error_message
         } else {
             app.load_status = "Error loading catalog."
         }
-
         free(loader_data)
         return
     }
 
+    // Stop the cover worker before app.games can grow. Cover tasks retain
+    // pointers to existing records, and appending may move its backing array.
+    ShutdownCoverLoader(app)
+
+    requested_page := loader_data.api_page
+    loaded_count := len(loader_data.games)
+
+    if loaded_count > 0 {
+        CatalogAppendLoadedPage(app, loader_data)
+        app.load_status = "Catalog ready"
+        app.status_message = "READY"
+        app.screen = .Library
+    } else {
+        // Do not advance the visible page when the API has no valid releases.
+        // This also prevents repeatedly requesting the same empty page.
+        app.catalog_has_next = false
+        app.load_status = "No releases on that page."
+        app.status_message = "No releases found on that page."
+    }
+
     fmt.printf(
-        "[MAIN] Taking ownership of %d games\n",
-        len(loader_data.games),
+        "[MAIN] Catalog page %d integrated: %d games\n",
+        requested_page,
+        loaded_count,
     )
 
-    app.games = loader_data.games
-
-    // Catalog metadata is now available, so stale Fatboy artifacts can be
-    // classified without guessing which game owns them.
-    download_cleanup_unresumable_artifacts(&app.download_manager)
-
-    // Free only the LoaderData struct. app.games now owns the
-    // dynamic array and all GameRelease allocations.
+    delete(loader_data.games)
+    delete(loader_data.query)
     free(loader_data)
-
-    app.load_status = "Loading cover textures..."
-
-    LoadGameTextures(app)
-
-    app.screen = .Library
-    app.status_message = "READY"
-
-    fmt.println(
-        "[MAIN] Library ready",
-    )
 }
 
 
@@ -313,6 +671,9 @@ ShutdownLoader :: proc(app: ^App) {
     if loader_data != nil {
         if len(loader_data.games) > 0 {
             DestroyGames(loader_data.games)
+        }
+        if len(loader_data.query) > 0 {
+            delete(loader_data.query)
         }
 
         free(loader_data)

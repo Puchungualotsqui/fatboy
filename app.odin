@@ -12,6 +12,8 @@ WINDOW_TITLE  :: "Fatboy"
 
 RELEASE_ROW_HEIGHT :: 96
 RELEASE_ROW_EXTENT :: 106
+CATALOG_API_PAGE_SIZE :: 30
+CATALOG_GAME_RESERVE :: 8192
 
 
 // ---------------------------------------------------------
@@ -44,11 +46,13 @@ AppScreen :: enum {
 
 
 GameRelease :: struct {
-    title:      string,
-    magnetLink: string,
-    coverUrl:   string,
-    coverPath:  string,
-    coverTex:   rl.Texture2D,
+    title:          string,
+    magnetLink:     string,
+    coverUrl:       string,
+    coverPath:      string,
+    coverTex:       rl.Texture2D,
+    cover_loading:  bool,
+    cover_attempted: bool,
 }
 
 
@@ -57,11 +61,27 @@ DownloadTask :: struct {
 }
 
 
+CoverLoaderData :: struct {
+    tasks: [dynamic]DownloadTask,
+}
+
+
+CatalogPageCache :: struct {
+    query:        string,
+    api_page:     int,
+    has_next:     bool,
+    game_indices: [dynamic]int,
+}
+
+
 // LoaderData is exclusively owned by the loader thread until the
 // loader thread finishes. The main thread only reads it after
 // thread.is_done() + thread.destroy(), avoiding App data races.
 LoaderData :: struct {
     games:         [dynamic]GameRelease,
+    query:         string,
+    api_page:      int,
+    raw_post_count: int,
     success:       bool,
     error_message: string,
 }
@@ -80,8 +100,18 @@ App :: struct {
     load_status: string,
     games:       [dynamic]GameRelease,
 
+    filtered_game_indices: [dynamic]int,
+    catalog_pages:         [dynamic]CatalogPageCache,
+    search_query:          string,
+    search_focused:        bool,
+    catalog_page:          int,
+    catalog_has_next:      bool,
+
     loader_thread: ^thread.Thread,
     loader_data:   ^LoaderData,
+
+    cover_thread: ^thread.Thread,
+    cover_data:   ^CoverLoaderData,
 
     download_manager: DownloadManager,
 

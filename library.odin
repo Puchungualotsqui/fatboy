@@ -1,8 +1,214 @@
 package main
 
 import "core:fmt"
+import "core:strings"
 import orui "./orui"
 import rl "vendor:raylib"
+
+
+CatalogSearchBounds :: proc() -> rl.Rectangle {
+    screen_width := rl.GetScreenWidth()
+    x := f32(screen_width / 2 - 170)
+
+    if x < 260 {
+        x = 260
+    }
+
+    if x + 340 > f32(screen_width - 32) {
+        x = f32(screen_width - 372)
+    }
+
+    if x < 12 {
+        x = 12
+    }
+
+    return rl.Rectangle{
+        x = x,
+        y = 23,
+        width = 340,
+        height = 34,
+    }
+}
+
+
+RebuildFilteredGameIndices :: proc(app: ^App) {
+    if app == nil {
+        return
+    }
+
+    // The catalog is now server-paged. A search starts a new page-1 request
+    // instead of pretending that the currently cached pages are complete.
+    CatalogResetPages(app)
+    app.load_status = "Searching catalog..."
+    StartCatalogPageLoader(app, 1, app.search_query)
+}
+
+
+search_query_append_rune :: proc(app: ^App, value: rune) {
+    if app == nil {
+        return
+    }
+
+    old_query := app.search_query
+
+    builder: strings.Builder
+    strings.builder_init(&builder, context.allocator)
+    strings.write_string(&builder, old_query)
+    strings.write_rune(&builder, value)
+
+    app.search_query = strings.to_string(builder)
+
+    if len(old_query) > 0 {
+        delete(old_query)
+    }
+}
+
+
+search_query_remove_last_rune :: proc(app: ^App) {
+    if app == nil || len(app.search_query) == 0 {
+        return
+    }
+
+    old_query := app.search_query
+    end := len(old_query) - 1
+
+    // Move over UTF-8 continuation bytes so backspace removes one rune.
+    for end > 0 && (old_query[end] & 0xc0) == 0x80 {
+        end -= 1
+    }
+
+    app.search_query = strings.clone(
+        old_query[:end],
+        context.allocator,
+    )
+    delete(old_query)
+}
+
+
+RequestCatalogPage :: proc(app: ^App, api_page: int) {
+    if app == nil || api_page <= 0 {
+        return
+    }
+
+    if CatalogShowCachedPage(app, api_page, app.search_query) {
+        app.status_message = "READY"
+        return
+    }
+
+    if app.loader_thread != nil {
+        return
+    }
+
+    // Prevent the page integration from growing app.games while cover tasks
+    // still hold pointers into its current backing array.
+    ShutdownCoverLoader(app)
+    app.load_status = "Loading catalog page..."
+    app.status_message = "Loading page..."
+    StartCatalogPageLoader(app, api_page, app.search_query)
+}
+
+
+ProcessCatalogSearchInput :: proc(app: ^App) {
+    if app == nil || app.screen != .Library {
+        return
+    }
+
+    bounds := CatalogSearchBounds()
+    mouse := rl.GetMousePosition()
+
+    if rl.IsMouseButtonPressed(.LEFT) {
+        app.search_focused = rl.CheckCollisionPointRec(mouse, bounds)
+    }
+
+    if !app.search_focused {
+        return
+    }
+
+    changed := false
+
+    for {
+        codepoint := rl.GetCharPressed()
+        if codepoint == 0 {
+            break
+        }
+
+        if codepoint >= 32 && codepoint != 127 {
+            search_query_append_rune(app, rune(codepoint))
+            changed = true
+        }
+    }
+
+    if rl.IsKeyPressed(.BACKSPACE) {
+        search_query_remove_last_rune(app)
+        changed = true
+    }
+
+    if rl.IsKeyPressed(.ESCAPE) {
+        app.search_focused = false
+    }
+
+    if changed {
+        RebuildFilteredGameIndices(app)
+    }
+}
+
+
+RenderCatalogSearchBar :: proc(app: ^App) {
+    if app == nil {
+        return
+    }
+
+    bounds := CatalogSearchBounds()
+    background := HEADER_BACKGROUND
+    border := BORDER_COLOR
+    text_color := TEXT_PRIMARY
+    display_text := app.search_query
+
+    if app.search_focused {
+        border = ACCENT_COLOR
+    }
+
+    if len(display_text) == 0 {
+        display_text = "Search games..."
+        text_color = TEXT_MUTED
+    }
+
+    rl.DrawRectangleRec(bounds, background)
+    rl.DrawRectangleLinesEx(bounds, 1, border)
+    display_cstr := strings.clone_to_cstring(
+        display_text,
+        context.temp_allocator,
+    )
+
+    rl.DrawText(
+        display_cstr,
+        i32(bounds.x) + 12,
+        i32(bounds.y) + 9,
+        16,
+        text_color,
+    )
+
+    if app.search_focused && len(app.search_query) > 0 {
+        query_cstr := strings.clone_to_cstring(
+            app.search_query,
+            context.temp_allocator,
+        )
+        text_width := rl.MeasureText(
+            query_cstr,
+            16,
+        )
+
+        if int(rl.GetTime() * 2) % 2 == 0 {
+            rl.DrawRectangle(
+                i32(bounds.x) + 12 + text_width,
+                i32(bounds.y) + 8,
+                1,
+                18,
+                TEXT_PRIMARY,
+            )
+        }
+    }
+}
 
 
 // ---------------------------------------------------------
@@ -13,6 +219,10 @@ RenderLibraryScreen :: proc(
     app: ^App,
     theme: orui.Theme,
 ) {
+    filtered_count := len(app.filtered_game_indices)
+    page_start := 0
+    page_end := filtered_count
+
     {
         orui.container(
             orui.id("app"),
@@ -107,8 +317,9 @@ RenderLibraryScreen :: proc(
                 orui.label(
                     orui.id("catalog count"),
                     fmt.tprintf(
-                        "%d Games Found",
-                        len(app.games),
+                        "%d Games on Page %d",
+                        filtered_count,
+                        app.catalog_page + 1,
                     ),
                     {
                         font_size = 14,
@@ -202,7 +413,7 @@ RenderLibraryScreen :: proc(
                 )
             }
 
-            if len(app.games) > 0 {
+            if filtered_count > 0 {
                 list := orui.begin_virtual_list(
                     orui.id("releases"),
                     {
@@ -214,29 +425,31 @@ RenderLibraryScreen :: proc(
                     },
                     {
                         direction = .Vertical,
-                        item_count = len(app.games),
+                        item_count = page_end - page_start,
                         item_extent = RELEASE_ROW_EXTENT,
                         overscan = 2,
                     },
                 )
 
-                for index := list.first;
-                    index < list.last;
-                    index += 1 {
+                for row_index := list.first;
+                    row_index < list.last;
+                    row_index += 1 {
 
-                    game := app.games[index]
+                    filtered_index := page_start + row_index
+                    game_index := app.filtered_game_indices[filtered_index]
+                    game := app.games[game_index]
                     download_snapshot := DownloadSnapshotForGame(
                         &app.download_manager,
-                        index,
+                        game_index,
                     )
 
                     rowId := orui.virtual_list_item_id(
                         list.id,
-                        index,
+                        row_index,
                     )
 
                     isFocused :=
-                        index == app.selected_game ||
+                        game_index == app.selected_game ||
                         orui.focused(rowId) ||
                         orui.active(rowId)
 
@@ -279,7 +492,7 @@ RenderLibraryScreen :: proc(
                             orui.id(rowId),
                             orui.virtual_list_item_config(
                                 list,
-                                index,
+                                row_index,
                                 {
                                     layout = .Flex,
                                     direction = .LeftToRight,
@@ -313,7 +526,7 @@ RenderLibraryScreen :: proc(
                                 orui.id(
                                     fmt.tprintf(
                                         "info_wrap_%d",
-                                        index,
+                                        game_index,
                                     ),
                                 ),
                                 {
@@ -330,10 +543,10 @@ RenderLibraryScreen :: proc(
                                     orui.id(
                                         fmt.tprintf(
                                             "cover_%d",
-                                            index,
+                                            game_index,
                                         ),
                                     ),
-                                    &app.games[index].coverTex,
+                                    &app.games[game_index].coverTex,
                                     {
                                         width = orui.fixed(56),
                                         height = orui.fixed(76),
@@ -349,7 +562,7 @@ RenderLibraryScreen :: proc(
                                         orui.id(
                                             fmt.tprintf(
                                                 "cover_ph_%d",
-                                                index,
+                                                game_index,
                                             ),
                                         ),
                                         {
@@ -367,7 +580,7 @@ RenderLibraryScreen :: proc(
                                     orui.id(
                                         fmt.tprintf(
                                             "text_wrap_%d",
-                                            index,
+                                            game_index,
                                         ),
                                     ),
                                     {
@@ -382,7 +595,7 @@ RenderLibraryScreen :: proc(
                                     orui.id(
                                         fmt.tprintf(
                                             "title_%d",
-                                            index,
+                                            game_index,
                                         ),
                                     ),
                                     game.title,
@@ -419,7 +632,7 @@ RenderLibraryScreen :: proc(
                                         orui.id(
                                             fmt.tprintf(
                                                 "progress_%d",
-                                                index,
+                                                game_index,
                                             ),
                                         ),
                                         progress_label,
@@ -439,7 +652,7 @@ RenderLibraryScreen :: proc(
                                         orui.id(
                                             fmt.tprintf(
                                                 "progress_%d",
-                                                index,
+                                                game_index,
                                             ),
                                         ),
                                         resolving_message,
@@ -455,7 +668,7 @@ RenderLibraryScreen :: proc(
                                         orui.id(
                                             fmt.tprintf(
                                                 "progress_%d",
-                                                index,
+                                                game_index,
                                             ),
                                         ),
                                         "Installing through GE-Proton8-25...",
@@ -475,7 +688,7 @@ RenderLibraryScreen :: proc(
                                         orui.id(
                                             fmt.tprintf(
                                                 "progress_%d",
-                                                index,
+                                                game_index,
                                             ),
                                         ),
                                         extracted_message,
@@ -495,7 +708,7 @@ RenderLibraryScreen :: proc(
                                         orui.id(
                                             fmt.tprintf(
                                                 "progress_%d",
-                                                index,
+                                                game_index,
                                             ),
                                         ),
                                         failure_message,
@@ -514,7 +727,7 @@ RenderLibraryScreen :: proc(
                                 orui.id(
                                     fmt.tprintf(
                                         "download_actions_%d",
-                                        index,
+                                        game_index,
                                     ),
                                 ),
                                 {
@@ -532,7 +745,7 @@ RenderLibraryScreen :: proc(
                                     orui.id(
                                         fmt.tprintf(
                                             "badge_%d",
-                                            index,
+                                            game_index,
                                         ),
                                     ),
                                     {
@@ -556,7 +769,7 @@ RenderLibraryScreen :: proc(
                                     orui.id(
                                         fmt.tprintf(
                                             "badgetext_%d",
-                                            index,
+                                            game_index,
                                         ),
                                     ),
                                     badgeText,
@@ -591,7 +804,7 @@ RenderLibraryScreen :: proc(
                             if can_pause {
                                 if orui.button(
                                     orui.id(
-                                        fmt.tprintf("pause_download_%d", index),
+                                        fmt.tprintf("pause_download_%d", game_index),
                                     ),
                                     "Pause",
                                     {
@@ -602,7 +815,7 @@ RenderLibraryScreen :: proc(
                                         corner_radius = orui.corner(5),
                                     },
                                 ) {
-                                    if DownloadPauseGame(&app.download_manager, index) {
+                                    if DownloadPauseGame(&app.download_manager, game_index) {
                                         app.status_message = "Pause requested. Partial data will be preserved."
                                     }
                                 }
@@ -613,7 +826,7 @@ RenderLibraryScreen :: proc(
                                     orui.id(
                                         fmt.tprintf(
                                             "cancel_download_%d",
-                                            index,
+                                            game_index,
                                         ),
                                     ),
                                     "Cancel",
@@ -627,7 +840,7 @@ RenderLibraryScreen :: proc(
                                 ) {
                                     if DownloadCancelGame(
                                         &app.download_manager,
-                                        index,
+                                        game_index,
                                     ) {
                                         app.status_message =
                                             "Download cancellation requested."
@@ -640,7 +853,7 @@ RenderLibraryScreen :: proc(
                                     orui.id(
                                         fmt.tprintf(
                                             "queue_download_%d",
-                                            index,
+                                            game_index,
                                         ),
                                     ),
                                     queue_label,
@@ -654,7 +867,7 @@ RenderLibraryScreen :: proc(
                                 ) {
                                     if DownloadQueueGame(
                                         &app.download_manager,
-                                        index,
+                                        game_index,
                                     ) {
                                         app.status_message =
                                             "Download queued."
@@ -670,7 +883,7 @@ RenderLibraryScreen :: proc(
                     if orui.clicked(rowId) ||
                        orui.activated(rowId) {
 
-                        app.selected_game = index
+                        app.selected_game = game_index
 
                         app.status_message =
                             "Handing off to Real-Debrid API..."
@@ -680,7 +893,7 @@ RenderLibraryScreen :: proc(
                         // crash diagnostics.
                         fmt.printf(
                             "[UI] Selected game index=%d title=%s magnet_length=%d\n",
-                            index,
+                            game_index,
                             game.title,
                             len(game.magnetLink),
                         )
@@ -705,6 +918,18 @@ RenderLibraryScreen :: proc(
                         width = orui.percent(1),
                         background_color = ACCENT_COLOR,
                         corner_radius = orui.corner(4),
+                    },
+                )
+            } else {
+                orui.label(
+                    orui.id("catalog_empty"),
+                    fmt.tprintf(
+                        "No games match \"%s\"",
+                        app.search_query,
+                    ),
+                    {
+                        font_size = 14,
+                        color = TEXT_MUTED,
                     },
                 )
             }
@@ -742,6 +967,73 @@ RenderLibraryScreen :: proc(
                         color = TEXT_MUTED,
                     },
                 )
+
+                {
+                    orui.container(
+                        orui.id("catalog_pagination"),
+                        {
+                            layout = .Flex,
+                            direction = .LeftToRight,
+                            width = orui.fit(),
+                            height = orui.fit(),
+                            align_cross = .Center,
+                            gap = 8,
+                        },
+                    )
+
+                    if orui.button(
+                        orui.id("catalog_previous"),
+                        "Previous",
+                        {
+                            width = orui.fixed(78),
+                            height = orui.fixed(28),
+                            color = TEXT_PRIMARY,
+                            background_color = ROW_BACKGROUND,
+                            corner_radius = orui.corner(5),
+                        },
+                    ) {
+                        if app.catalog_page > 0 {
+                            RequestCatalogPage(
+                                app,
+                                app.catalog_page,
+                            )
+                        }
+                    }
+
+                    page_label := fmt.tprintf(
+                        "Page %d  (%d games)",
+                        app.catalog_page + 1,
+                        filtered_count,
+                    )
+
+                    orui.label(
+                        orui.id("catalog_page_label"),
+                        page_label,
+                        {
+                            font_size = 11,
+                            color = TEXT_MUTED,
+                        },
+                    )
+
+                    if orui.button(
+                        orui.id("catalog_next"),
+                        "Next",
+                        {
+                            width = orui.fixed(78),
+                            height = orui.fixed(28),
+                            color = TEXT_PRIMARY,
+                            background_color = ROW_BACKGROUND,
+                            corner_radius = orui.corner(5),
+                        },
+                    ) {
+                        if app.catalog_has_next {
+                            RequestCatalogPage(
+                                app,
+                                app.catalog_page + 2,
+                            )
+                        }
+                    }
+                }
 
                 orui.label(
                     orui.id("footer msg"),
