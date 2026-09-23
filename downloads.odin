@@ -49,8 +49,10 @@ DownloadEntry :: struct {
     bytes_total:      i64,
     error_message:    string,
     status_message:   string,
+    resolver_attempt: u32,
+    resolver_error:   string,
 
-    cancel_requested: bool,
+    cancel_requested:  bool,
     pause_requested:  bool,
 }
 
@@ -72,8 +74,9 @@ DownloadManager :: struct {
     mutex: sync.Mutex,
     entries: [dynamic]DownloadEntry,
 
-    worker:         ^thread.Thread,
-    stop_requested: bool,
+    worker:          ^thread.Thread,
+    stop_requested:  bool,
+    metadata_cancel: ^durrent.Metadata_Resolver_Cancel_Token,
 }
 
 
@@ -109,7 +112,12 @@ DownloadManagerShutdown :: proc(manager: ^DownloadManager) {
 
     sync.mutex_lock(&manager.mutex)
     manager.stop_requested = true
+    metadata_cancel := manager.metadata_cancel
+    manager.metadata_cancel = nil
     sync.mutex_unlock(&manager.mutex)
+    if metadata_cancel != nil {
+        durrent.Metadata_Resolver_Cancel(metadata_cancel)
+    }
 
     if manager.worker != nil {
         thread.destroy(manager.worker)
@@ -128,6 +136,7 @@ DownloadManagerShutdown :: proc(manager: ^DownloadManager) {
         delete(entry.archive_path)
         delete(entry.error_message)
         delete(entry.status_message)
+        delete(entry.resolver_error)
     }
     delete(manager.entries)
     sync.mutex_unlock(&manager.mutex)
@@ -160,6 +169,28 @@ download_game_info_hash :: proc(game: ^GameRelease) -> string {
         return strings.clone(game.source_info_hash, context.allocator)
     }
     return download_info_hash(game.magnetLink)
+}
+
+
+download_prepare_durrent_magnet_identity :: proc(app: ^App, game_index: int) -> bool {
+    if app == nil || game_index < 0 || game_index >= len(app.games) {
+        return false
+    }
+    if len(app.games[game_index].source_info_hash) > 0 {
+        return true
+    }
+    magnet, parse_error := durrent.Parse_Magnet(app.games[game_index].magnetLink)
+    if parse_error != .None {
+        return false
+    }
+    defer durrent.Destroy_Magnet_Link(&magnet)
+    canonical_hash := download_torrent_hash_to_string(magnet.Info_Hash)
+    defer delete(canonical_hash)
+    app.games[game_index].source_info_hash = strings.clone(
+        canonical_hash,
+        context.allocator,
+    )
+    return true
 }
 
 
@@ -217,6 +248,11 @@ DownloadQueueGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
 
     app := manager.app
     if game_index < 0 || game_index >= len(app.games) {
+        return false
+    }
+    if app.download_provider == .Durrent &&
+       len(app.games[game_index].local_torrent_path) == 0 &&
+       !download_prepare_durrent_magnet_identity(app, game_index) {
         return false
     }
 
@@ -363,7 +399,12 @@ DownloadCancelGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
         case .Resolving, .Downloading, .Extracting, .Installing:
             entry.cancel_requested = true
             entry.pause_requested = false
+            metadata_cancel := manager.metadata_cancel
+            resolving_metadata := entry.state == .Resolving
             sync.mutex_unlock(&manager.mutex)
+            if resolving_metadata && metadata_cancel != nil {
+                durrent.Metadata_Resolver_Cancel(metadata_cancel)
+            }
             return true
         case .NotDownloaded, .Installed, .Extracted, .Cancelled, .Paused, .Failed:
             sync.mutex_unlock(&manager.mutex)
@@ -382,7 +423,7 @@ DownloadPauseGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
     }
 
     sync.mutex_lock(&manager.mutex)
-    defer sync.mutex_unlock(&manager.mutex)
+    metadata_cancel: ^durrent.Metadata_Resolver_Cancel_Token = nil
     for &entry in manager.entries {
         if entry.game_index != game_index {
             continue
@@ -393,9 +434,17 @@ DownloadPauseGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
            entry.state == .Installing {
             entry.pause_requested = true
             entry.cancel_requested = false
+            if entry.state == .Resolving {
+                metadata_cancel = manager.metadata_cancel
+            }
+            sync.mutex_unlock(&manager.mutex)
+            if metadata_cancel != nil {
+                durrent.Metadata_Resolver_Cancel(metadata_cancel)
+            }
             return true
         }
     }
+    sync.mutex_unlock(&manager.mutex)
     return false
 }
 
@@ -918,6 +967,249 @@ download_durrent_peer_id :: proc() -> (peer_id: [20]byte) {
 }
 
 
+download_set_metadata_cancel :: proc(
+    manager: ^DownloadManager,
+    token: ^durrent.Metadata_Resolver_Cancel_Token,
+) {
+    if manager == nil {
+        return
+    }
+    sync.mutex_lock(&manager.mutex)
+    manager.metadata_cancel = token
+    sync.mutex_unlock(&manager.mutex)
+}
+
+
+download_metadata_cache_path :: proc(download_directory, info_hash: string) -> string {
+    if len(download_directory) == 0 || len(info_hash) == 0 {
+        return ""
+    }
+    state_directory := download_state_directory(download_directory)
+    defer delete(state_directory)
+    return fmt.aprintf("%s/torrents/%s.torrent", state_directory, info_hash)
+}
+
+
+download_validate_metadata_cache :: proc(path: string, expected_hash: durrent.Torrent_Hash) -> bool {
+    if len(path) == 0 || !os.is_file(path) {
+        return false
+    }
+    data, read_error := os.read_entire_file_from_path(path, context.allocator)
+    if read_error != nil {
+        return false
+    }
+    defer delete(data)
+    torrent, parse_error := durrent.Parse_Torrent(data[:])
+    if parse_error != .None {
+        return false
+    }
+    defer durrent.Destroy_Torrent(&torrent)
+    return torrent.Info_Hash == expected_hash
+}
+
+
+download_attach_magnet_trackers :: proc(torrent: ^durrent.Torrent, magnet_uri: string) {
+    if torrent == nil || len(magnet_uri) == 0 || len(torrent.Announce_List) > 0 {
+        return
+    }
+    magnet, parse_error := durrent.Parse_Magnet(magnet_uri)
+    if parse_error != .None {
+        return
+    }
+    defer durrent.Destroy_Magnet_Link(&magnet)
+    if len(magnet.Trackers) == 0 {
+        return
+    }
+
+    for tracker_url in magnet.Trackers {
+        copied_url := strings.clone(string(tracker_url), context.allocator)
+        tier: durrent.Torrent_Tracker_Tier
+        append(&tier.URLs, transmute([]byte)copied_url)
+        append(&torrent.Announce_List, tier)
+        copied_url = ""
+    }
+    if len(torrent.Announce) == 0 {
+        copied_announce := strings.clone(string(magnet.Trackers[0]), context.allocator)
+        torrent.Announce = transmute([]byte)copied_announce
+        copied_announce = ""
+    }
+}
+
+
+download_write_metadata_cache :: proc(path: string, data: []byte) -> bool {
+    if len(path) == 0 || len(data) == 0 {
+        return false
+    }
+    separator := strings.last_index(path, "/")
+    if separator < 0 {
+        return false
+    }
+    directory := path[:separator]
+    if !os.exists(directory) && os.make_directory_all(directory) != nil {
+        return false
+    }
+    temporary_path := fmt.aprintf("%s.tmp", path)
+    defer delete(temporary_path)
+    if os.write_entire_file(temporary_path, data) != nil {
+        return false
+    }
+    return os.rename(temporary_path, path) == nil
+}
+
+
+download_set_entry_local_torrent_path :: proc(
+    manager: ^DownloadManager,
+    entry_index: int,
+    path: string,
+) {
+    if manager == nil {
+        return
+    }
+    sync.mutex_lock(&manager.mutex)
+    if entry_index >= 0 && entry_index < len(manager.entries) {
+        delete(manager.entries[entry_index].local_torrent_path)
+        manager.entries[entry_index].local_torrent_path = strings.clone(
+            path,
+            context.allocator,
+        )
+    }
+    sync.mutex_unlock(&manager.mutex)
+}
+
+
+download_set_resolver_status :: proc(
+    manager: ^DownloadManager,
+    entry_index: int,
+    attempt: u32,
+    error_message: string,
+) {
+    if manager == nil {
+        return
+    }
+    sync.mutex_lock(&manager.mutex)
+    if entry_index >= 0 && entry_index < len(manager.entries) {
+        manager.entries[entry_index].resolver_attempt = attempt
+        delete(manager.entries[entry_index].resolver_error)
+        manager.entries[entry_index].resolver_error = strings.clone(
+            error_message,
+            context.allocator,
+        )
+    }
+    sync.mutex_unlock(&manager.mutex)
+}
+
+
+download_copy_entry_magnet :: proc(manager: ^DownloadManager, entry_index: int) -> string {
+    if manager == nil {
+        return ""
+    }
+    sync.mutex_lock(&manager.mutex)
+    defer sync.mutex_unlock(&manager.mutex)
+    if entry_index < 0 || entry_index >= len(manager.entries) {
+        return ""
+    }
+    return strings.clone(manager.entries[entry_index].magnet_link, context.allocator)
+}
+
+
+download_metadata_error_message :: proc(error: durrent.Metadata_Resolver_Error) -> string {
+    switch error {
+    case .Invalid_Magnet: return "The game magnet link is invalid."
+    case .Cancelled: return "Magnet metadata resolution was cancelled."
+    case .Timed_Out: return "Magnet metadata resolution timed out."
+    case .No_Peers: return "No peers were found for the magnet."
+    case .Tracker: return "The magnet trackers could not be reached."
+    case .DHT: return "DHT peer discovery failed."
+    case .Metadata: return "Peers did not provide valid torrent metadata."
+    case .Out_Of_Memory: return "Not enough memory to resolve torrent metadata."
+    case .None: return ""
+    }
+    return "Magnet metadata resolution failed."
+}
+
+
+download_resolve_durrent_torrent :: proc(
+    manager: ^DownloadManager,
+    entry_index: int,
+) -> (torrent_path, error_message: string, cancelled: bool) {
+    app := manager.app
+    if app == nil {
+        return "", "Download manager is unavailable.", false
+    }
+    magnet_uri := download_copy_entry_magnet(manager, entry_index)
+    defer delete(magnet_uri)
+    magnet, parse_error := durrent.Parse_Magnet(magnet_uri)
+    if parse_error != .None {
+        return "", "The game magnet link is invalid.", false
+    }
+    defer durrent.Destroy_Magnet_Link(&magnet)
+
+    info_hash := download_torrent_hash_to_string(magnet.Info_Hash)
+    defer delete(info_hash)
+    cache_path := download_metadata_cache_path(app.download_path, info_hash)
+    if download_validate_metadata_cache(cache_path, magnet.Info_Hash) {
+        download_set_entry_local_torrent_path(manager, entry_index, cache_path)
+        sync.mutex_lock(&manager.mutex)
+        game_index := manager.entries[entry_index].game_index
+        sync.mutex_unlock(&manager.mutex)
+        if game_index >= 0 && game_index < len(app.games) {
+            delete(app.games[game_index].local_torrent_path)
+            app.games[game_index].local_torrent_path = strings.clone(cache_path, context.allocator)
+            delete(app.games[game_index].source_info_hash)
+            app.games[game_index].source_info_hash = strings.clone(info_hash, context.allocator)
+        }
+        download_write_manifest(manager, entry_index, "metadata_ready", "Cached torrent metadata validated.")
+        return cache_path, "", false
+    }
+    if os.exists(cache_path) {
+        download_remove_local_path(cache_path, "invalid metadata cache")
+    }
+
+    download_set_state(manager, entry_index, .Resolving)
+    download_set_message(manager, entry_index, "Resolving magnet metadata...")
+    download_set_resolver_status(manager, entry_index, 1, "")
+    download_write_manifest(manager, entry_index, "metadata_resolving", "Resolving magnet metadata.")
+
+    cancel_token: durrent.Metadata_Resolver_Cancel_Token
+    download_set_metadata_cancel(manager, &cancel_token)
+    options := durrent.Metadata_Resolver_Default_Options()
+    options.Cancel = &cancel_token
+    metadata, resolver_error := durrent.Resolve_Magnet_Metadata(
+        &magnet,
+        download_durrent_peer_id(),
+        options,
+    )
+    download_set_metadata_cancel(manager, nil)
+    if resolver_error != .None {
+        if resolver_error == .Cancelled ||
+           download_should_cancel(manager, entry_index) ||
+           download_manager_stop_requested(manager) {
+            return "", "Magnet metadata resolution was cancelled.", true
+        }
+        message := download_metadata_error_message(resolver_error)
+        download_set_resolver_status(manager, entry_index, 1, message)
+        return "", message, false
+    }
+    defer delete(metadata)
+
+    if !download_write_metadata_cache(cache_path, metadata) {
+        return "", "Could not cache the resolved torrent metadata.", false
+    }
+    download_set_entry_local_torrent_path(manager, entry_index, cache_path)
+    sync.mutex_lock(&manager.mutex)
+    game_index := manager.entries[entry_index].game_index
+    sync.mutex_unlock(&manager.mutex)
+    if game_index >= 0 && game_index < len(app.games) {
+        delete(app.games[game_index].local_torrent_path)
+        app.games[game_index].local_torrent_path = strings.clone(cache_path, context.allocator)
+        delete(app.games[game_index].source_info_hash)
+        app.games[game_index].source_info_hash = strings.clone(info_hash, context.allocator)
+    }
+    download_write_manifest(manager, entry_index, "metadata_ready", "Magnet metadata cached.")
+    return cache_path, "", false
+}
+
+
 download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: int) {
     app := manager.app
     if app == nil {
@@ -954,11 +1246,29 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
     }
 
     torrent_path := download_copy_local_torrent_path(manager, entry_index)
-    defer delete(torrent_path)
     if len(torrent_path) == 0 {
-        download_fail_entry(manager, entry_index, "A local .torrent file is missing.")
-        return
+        resolved_path, resolve_error, cancelled := download_resolve_durrent_torrent(
+            manager,
+            entry_index,
+        )
+        if cancelled {
+            if download_should_pause(manager, entry_index) || download_manager_stop_requested(manager) {
+                download_pause_entry(manager, entry_index, nil)
+            } else {
+                download_cancel_entry(manager, entry_index, nil)
+            }
+            return
+        }
+        if len(resolve_error) > 0 {
+            download_fail_entry(manager, entry_index, resolve_error)
+            delete(resolve_error)
+            delete(resolved_path)
+            return
+        }
+        delete(torrent_path)
+        torrent_path = resolved_path
     }
+    defer delete(torrent_path)
 
     data, read_error := os.read_entire_file_from_path(
         torrent_path,
@@ -976,6 +1286,9 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
         return
     }
     defer durrent.Destroy_Torrent(&torrent)
+    source_magnet := download_copy_entry_magnet(manager, entry_index)
+    defer delete(source_magnet)
+    download_attach_magnet_trackers(&torrent, source_magnet)
 
     if download_should_cancel(manager, entry_index) {
         download_remove_durrent_artifacts(app.download_path, torrent_path)
@@ -2419,6 +2732,12 @@ download_normalize_magnet :: proc(value: string) -> string {
 
 
 download_info_hash :: proc(magnet: string) -> string {
+    parsed_magnet, parse_error := durrent.Parse_Magnet(magnet)
+    if parse_error == .None {
+        defer durrent.Destroy_Magnet_Link(&parsed_magnet)
+        return download_torrent_hash_to_string(parsed_magnet.Info_Hash)
+    }
+
     lower := strings.to_lower(magnet, context.allocator)
     defer delete(lower)
 
@@ -2513,12 +2832,11 @@ restore_persisted_download_state_file :: proc(
 
     provider := download_provider_from_manifest(provider_name, app.download_provider)
     delete(provider_name)
-    is_local_manifest := provider == .Durrent &&
-        len(info_hash) > 0 && len(torrent_path) > 0
+    is_local_identity := provider == .Durrent && len(info_hash) > 0
 
-    // Current manifests require title and either a magnet or the local
-    // torrent identity/path used by Durrent.
-    if len(title) == 0 || (!is_local_manifest && len(magnet) == 0) {
+    // Current manifests require title and either a magnet or the canonical
+    // Durrent identity. A resolver may fail before a cache path exists.
+    if len(title) == 0 || (!is_local_identity && len(magnet) == 0) {
         delete(title)
         delete(magnet)
         delete(info_hash)
@@ -2530,7 +2848,7 @@ restore_persisted_download_state_file :: proc(
         magnet = download_normalize_magnet(magnet)
     }
     existing_index := FindCachedGameIndex(app, magnet)
-    if existing_index < 0 && is_local_manifest {
+    if existing_index < 0 && is_local_identity {
         for game, game_index in app.games {
             if game.source_info_hash == info_hash {
                 existing_index = game_index
@@ -2616,6 +2934,8 @@ download_write_manifest :: proc(manager: ^DownloadManager, entry_index: int, pha
     output_path := strings.clone(manager.entries[entry_index].output_path, context.allocator)
     part_path := strings.clone(manager.entries[entry_index].part_path, context.allocator)
     provider_job_id := strings.clone(manager.entries[entry_index].provider_job_id, context.allocator)
+    resolver_attempt := manager.entries[entry_index].resolver_attempt
+    resolver_error := strings.clone(manager.entries[entry_index].resolver_error, context.allocator)
     provider_name := manager.entries[entry_index].provider == .Durrent ? "durrent" : "real-debrid"
     torrent_path := strings.clone(manager.entries[entry_index].local_torrent_path, context.allocator)
     download_directory := strings.clone(manager.app.download_path, context.allocator)
@@ -2628,6 +2948,7 @@ download_write_manifest :: proc(manager: ^DownloadManager, entry_index: int, pha
     defer delete(output_path)
     defer delete(part_path)
     defer delete(provider_job_id)
+    defer delete(resolver_error)
     defer delete(torrent_path)
     defer delete(download_directory)
 
@@ -2643,11 +2964,13 @@ download_write_manifest :: proc(manager: ^DownloadManager, entry_index: int, pha
     temp_path := fmt.aprintf("%s.tmp", manifest_path)
     defer delete(temp_path)
     contents := fmt.aprintf(
-        "phase=%s\nprovider=%s\ninfo_hash=%s\ntorrent_path=%s\ntitle=%s\nmagnet=%s\narchive_path=%s\noutput_path=%s\npart_path=%s\nprovider_job_id=%s\nmessage=%s\n",
+        "phase=%s\nprovider=%s\ninfo_hash=%s\ntorrent_path=%s\nresolver_attempt=%d\nresolver_error=%s\ntitle=%s\nmagnet=%s\narchive_path=%s\noutput_path=%s\npart_path=%s\nprovider_job_id=%s\nmessage=%s\n",
         phase,
         provider_name,
         info_hash,
         torrent_path,
+        resolver_attempt,
+        resolver_error,
         game_title,
         magnet_link,
         archive_path,
