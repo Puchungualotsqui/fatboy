@@ -703,6 +703,13 @@ RenderLibraryScreen :: proc(
                                         download_snapshot.bytes_downloaded / (1024 * 1024),
                                         download_snapshot.bytes_total / (1024 * 1024),
                                     )
+                                    if download_snapshot.speed_bytes_per_second > 0 {
+                                        progress_label = fmt.tprintf(
+                                            "%s  %.1f MiB/s",
+                                            progress_label,
+                                            download_snapshot.speed_bytes_per_second / f64(1024 * 1024),
+                                        )
+                                    }
                                     orui.label(
                                         orui.id(
                                             fmt.tprintf(
@@ -721,7 +728,7 @@ RenderLibraryScreen :: proc(
                                           download_snapshot.state == .Resolving {
                                     resolving_message := download_snapshot.status_message
                                     if len(resolving_message) == 0 {
-                                        resolving_message = "Preparing Real-Debrid torrent..."
+                                        resolving_message = "Preparing download..."
                                     }
                                     orui.label(
                                         orui.id(
@@ -960,8 +967,7 @@ RenderLibraryScreen :: proc(
 
                         app.selected_game = game_index
 
-                        app.status_message =
-                            "Handing off to Real-Debrid API..."
+                        app.status_message = app.download_provider == .Durrent ? "Preparing local Durrent download..." : "Handing off to Real-Debrid API..."
 
                         // Magnet is intentionally not printed here.
                         // It can be very long and isn't needed for

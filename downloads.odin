@@ -44,10 +44,11 @@ DownloadEntry :: struct {
     archive_path:  string,
 
     state:            DownloadState,
-    progress:         f64,
-    bytes_downloaded: i64,
-    bytes_total:      i64,
-    error_message:    string,
+    progress:              f64,
+    bytes_downloaded:      i64,
+    bytes_total:            i64,
+    speed_bytes_per_second: f64,
+    error_message:          string,
     status_message:   string,
     resolver_attempt: u32,
     resolver_error:   string,
@@ -60,10 +61,11 @@ DownloadEntry :: struct {
 DownloadSnapshot :: struct {
     found:             bool,
     state:             DownloadState,
-    progress:         f64,
-    bytes_downloaded: i64,
-    bytes_total:      i64,
-    status_message:   string,
+    progress:              f64,
+    bytes_downloaded:      i64,
+    bytes_total:            i64,
+    speed_bytes_per_second: f64,
+    status_message:         string,
     error_message:    string,
 }
 
@@ -496,6 +498,7 @@ DownloadSnapshotForGame :: proc(manager: ^DownloadManager, game_index: int) -> D
             result.progress = entry.progress
             result.bytes_downloaded = entry.bytes_downloaded
             result.bytes_total = entry.bytes_total
+            result.speed_bytes_per_second = entry.speed_bytes_per_second
             result.status_message = strings.clone(entry.status_message, context.temp_allocator)
             result.error_message = strings.clone(entry.error_message, context.temp_allocator)
             sync.mutex_unlock(&manager.mutex)
@@ -953,6 +956,20 @@ download_find_torrent_archive :: proc(
 }
 
 
+download_torrent_install_target :: proc(
+    torrent: ^durrent.Torrent,
+    output_directory: string,
+) -> string {
+    if torrent == nil {
+        return ""
+    }
+    if torrent.Multi_File {
+        return fmt.aprintf("%s/%s", output_directory, string(torrent.Name))
+    }
+    return download_torrent_file_path(torrent, output_directory, 0)
+}
+
+
 download_remove_durrent_artifacts :: proc(
     output_directory, torrent_path: string,
 ) {
@@ -1378,6 +1395,7 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
         }
         if download_should_pause(manager, entry_index) ||
            download_manager_stop_requested(manager) {
+            _ = durrent.Torrent_Session_Loop_Pause(&loop)
             _ = durrent.Torrent_Session_Loop_Shutdown(&loop)
             download_pause_entry(manager, entry_index, nil)
             return
@@ -1403,6 +1421,11 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
             completed_bytes,
             total_bytes,
         )
+        download_set_speed(
+            manager,
+            entry_index,
+            stats.Download_Bytes_Per_Second,
+        )
 
         if stats.State == .Failed {
             _ = durrent.Torrent_Session_Loop_Shutdown(&loop)
@@ -1424,7 +1447,43 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
 
     archive_path := download_find_torrent_archive(&torrent, app.download_path)
     if len(archive_path) == 0 {
-        download_fail_entry(manager, entry_index, "The completed torrent did not contain a supported archive.")
+        install_target := download_torrent_install_target(&torrent, app.download_path)
+        defer delete(install_target)
+        if len(install_target) == 0 || !os.exists(install_target) {
+            download_fail_entry(manager, entry_index, "The completed torrent did not contain an archive or install directory.")
+            return
+        }
+        download_set_paths(manager, entry_index, install_target, "")
+        download_set_progress(
+            manager,
+            entry_index,
+            1,
+            i64(torrent.Total_Length),
+            i64(torrent.Total_Length),
+        )
+        info_hash := ""
+        sync.mutex_lock(&manager.mutex)
+        if entry_index >= 0 && entry_index < len(manager.entries) {
+            info_hash = strings.clone(manager.entries[entry_index].info_hash, context.allocator)
+        }
+        sync.mutex_unlock(&manager.mutex)
+        defer delete(info_hash)
+        marker_path := download_marker_path(app.download_path, info_hash)
+        defer delete(marker_path)
+        marked, marker_error := download_mark_entry_complete(
+            manager,
+            entry_index,
+            marker_path,
+            install_target,
+            i64(torrent.Total_Length),
+        )
+        if !marked {
+            download_fail_entry(manager, entry_index, marker_error)
+            delete(marker_error)
+            return
+        }
+        download_set_message(manager, entry_index, "Durrent content is ready.")
+        download_write_manifest(manager, entry_index, "completed", "Durrent content is ready.")
         return
     }
     defer delete(archive_path)
@@ -2472,6 +2531,15 @@ download_set_progress :: proc(manager: ^DownloadManager, entry_index: int, progr
     manager.entries[entry_index].bytes_downloaded = downloaded
     if total > 0 {
         manager.entries[entry_index].bytes_total = total
+    }
+}
+
+
+download_set_speed :: proc(manager: ^DownloadManager, entry_index: int, speed_bytes_per_second: f64) {
+    sync.mutex_lock(&manager.mutex)
+    defer sync.mutex_unlock(&manager.mutex)
+    if entry_index >= 0 && entry_index < len(manager.entries) {
+        manager.entries[entry_index].speed_bytes_per_second = speed_bytes_per_second
     }
 }
 
