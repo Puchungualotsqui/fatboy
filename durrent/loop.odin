@@ -33,6 +33,7 @@ Torrent_Loop_Stats :: struct {
 	State:                       Torrent_Loop_State,
 	Peer_Count:                  u32,
 	Connected_Peers:             u32,
+	Completed_Bytes:             u64,
 	Bytes_Downloaded:            u64,
 	Bytes_Uploaded:              u64,
 	Download_Bytes_Per_Second:   f64,
@@ -245,9 +246,15 @@ Torrent_Session_Loop_Snapshot :: proc(loop: ^Torrent_Session_Loop) -> (Torrent_L
 			connected += 1
 		}
 	}
+	completed_pieces := Bitfield_Count(&loop.Storage.Pieces)
+	completed_bytes := u64(completed_pieces) * loop.Storage.Piece_Length
+	if completed_bytes > loop.Storage.Total_Length {
+		completed_bytes = loop.Storage.Total_Length
+	}
 	return Torrent_Loop_Stats{
 		State = loop.State,
 		Peer_Count = u32(len(loop.Peers)),
+		Completed_Bytes = completed_bytes,
 		Connected_Peers = connected,
 		Bytes_Downloaded = loop.Bytes_Downloaded,
 		Bytes_Uploaded = loop.Bytes_Uploaded,

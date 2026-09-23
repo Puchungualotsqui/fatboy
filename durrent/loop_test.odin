@@ -31,6 +31,7 @@ torrent_session_loop_tick_and_seeding_test :: proc(t: ^testing.T) {
 	testing.expect_value(t, stats.State, Torrent_Loop_State.Paused)
 	testing.expect_value(t, stats.Peer_Count, u32(0))
 	testing.expect(t, !stats.Seeding)
+	testing.expect_value(t, stats.Completed_Bytes, u64(0))
 
 	testing.expect_value(t, Torrent_Storage_Write_Piece(&loop.Storage, 0, []byte{'a', 'b', 'c', 'd'}), Torrent_Storage_Error.None)
 	verified, verify_error := Torrent_Storage_Verify_Piece(&loop.Storage, 0)
@@ -49,6 +50,7 @@ torrent_session_loop_tick_and_seeding_test :: proc(t: ^testing.T) {
 	testing.expect_value(t, snapshot_error, Torrent_Loop_Error.None)
 	testing.expect_value(t, stats.State, Torrent_Loop_State.Seeding)
 	testing.expect(t, stats.Seeding)
+	testing.expect_value(t, stats.Completed_Bytes, u64(8))
 }
 
 @(test)
