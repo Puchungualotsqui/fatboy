@@ -60,6 +60,7 @@ main :: proc() {
     // -----------------------------------------------------
 
     app: App
+    app.download_provider = .RealDebrid
     app.games = make([dynamic]GameRelease, 0, CATALOG_GAME_RESERVE)
     app.cover_cache_needs_enforcement = true
 
@@ -222,9 +223,16 @@ main :: proc() {
         SETTINGS_VERSION,
     )
 
-    if LoadSettings(&app) && EnsureRealDebridAccessToken(&app) {
+    settings_loaded := LoadSettings(&app)
+    provider_ready := settings_loaded
+    if settings_loaded && app.download_provider == .RealDebrid {
+        provider_ready = EnsureRealDebridAccessToken(&app)
+    }
+
+    if provider_ready {
         fmt.printf(
-            "[BOOT] Existing settings found; download folder=%s\n",
+            "[BOOT] Existing settings found; provider=%s download folder=%s\n",
+            app.download_provider == .Durrent ? "durrent" : "real-debrid",
             app.download_path,
         )
 
@@ -232,10 +240,12 @@ main :: proc() {
         app.load_status =
             "Syncing with FitGirl API..."
     } else {
-        ClearRealDebridCredentials(&app)
+        if app.download_provider == .RealDebrid {
+            ClearRealDebridCredentials(&app)
+        }
 
         fmt.println(
-            "[BOOT] Settings unavailable or Real-Debrid token expired. Launching setup screen.",
+            "[BOOT] Settings unavailable or provider authentication failed. Launching setup screen.",
         )
 
         app.screen = .SetupKey
@@ -288,7 +298,9 @@ main :: proc() {
         // Authentication and background loader completion
         // -------------------------------------------------
 
-        ProcessRealDebridAuth(&app)
+        if app.download_provider == .RealDebrid || app.auth_thread != nil {
+            ProcessRealDebridAuth(&app)
+        }
 
         if app.screen == .Loading || app.loader_thread != nil {
             ProcessFinishedLoader(&app)

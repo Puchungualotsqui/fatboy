@@ -10,10 +10,11 @@ import rl "vendor:raylib"
 
 
 SETTINGS_FILE           :: "settings.bin"
-SETTINGS_VERSION        :: u32(3)
-SETTINGS_V2_HEADER_SIZE  :: 36
-SETTINGS_HEADER_SIZE    :: 40
-SETTINGS_RAM_LIMIT_FLAG :: u32(1)
+SETTINGS_VERSION             :: u32(4)
+SETTINGS_V2_HEADER_SIZE       :: 36
+SETTINGS_HEADER_SIZE          :: 40
+SETTINGS_RAM_LIMIT_FLAG       :: u32(1)
+SETTINGS_DURRENT_PROVIDER_FLAG :: u32(2)
 
 EnsureDownloadDirectory :: proc(path: string) -> bool {
     if len(path) == 0 {
@@ -76,12 +77,16 @@ OpenDownloadDirectory :: proc(path: string) -> bool {
 
 
 SaveSettings :: proc(app: ^App) -> bool {
-    if app == nil ||
-       len(app.rd_key) == 0 ||
-       len(app.rd_refresh_token) == 0 ||
-       len(app.rd_client_id) == 0 ||
-       len(app.rd_client_secret) == 0 ||
-       len(app.download_path) == 0 {
+    if app == nil || len(app.download_path) == 0 {
+        return false
+    }
+
+    requires_realdebrid := app.download_provider == .RealDebrid
+    if requires_realdebrid &&
+       (len(app.rd_key) == 0 ||
+        len(app.rd_refresh_token) == 0 ||
+        len(app.rd_client_id) == 0 ||
+        len(app.rd_client_secret) == 0) {
         return false
     }
 
@@ -122,6 +127,9 @@ SaveSettings :: proc(app: ^App) -> bool {
     settings_flags: u32 = 0
     if app.use_ram_limit {
         settings_flags |= SETTINGS_RAM_LIMIT_FLAG
+    }
+    if app.download_provider == .Durrent {
+        settings_flags |= SETTINGS_DURRENT_PROVIDER_FLAG
     }
     endian.put_u32(settings_data[36:40], .Little, settings_flags)
 
@@ -231,6 +239,7 @@ LoadSettings :: proc(app: ^App) -> bool {
     }
 
     use_ram_limit := false
+    download_provider := DownloadProvider(.RealDebrid)
     if version >= 3 {
         settings_flags, flags_ok := endian.get_u32(settings_data[36:40], .Little)
         if !flags_ok {
@@ -238,6 +247,9 @@ LoadSettings :: proc(app: ^App) -> bool {
             return false
         }
         use_ram_limit = (settings_flags & SETTINGS_RAM_LIMIT_FLAG) != 0
+        if version >= 4 && (settings_flags & SETTINGS_DURRENT_PROVIDER_FLAG) != 0 {
+            download_provider = .Durrent
+        }
     }
 
     access_len_u32, access_ok := endian.get_u32(settings_data[8:12], .Little)
@@ -287,15 +299,18 @@ LoadSettings :: proc(app: ^App) -> bool {
     loaded_client_id := strings.clone(string(settings_data[client_id_start:client_id_start+client_id_len]), context.allocator)
     loaded_client_secret := strings.clone(string(settings_data[client_secret_start:client_secret_start+client_secret_len]), context.allocator)
 
-    if len(loaded_access) == 0 || len(loaded_path) == 0 ||
-       len(loaded_refresh) == 0 || len(loaded_client_id) == 0 ||
-       len(loaded_client_secret) == 0 {
+    if len(loaded_path) == 0 ||
+       (download_provider == .RealDebrid &&
+        (len(loaded_access) == 0 ||
+         len(loaded_refresh) == 0 ||
+         len(loaded_client_id) == 0 ||
+         len(loaded_client_secret) == 0)) {
         delete(loaded_access)
         delete(loaded_path)
         delete(loaded_refresh)
         delete(loaded_client_id)
         delete(loaded_client_secret)
-        fmt.printf("[SETTINGS] Ignoring %s with missing OAuth values\n", SETTINGS_FILE)
+        fmt.printf("[SETTINGS] Ignoring %s with missing provider settings\n", SETTINGS_FILE)
         return false
     }
 
@@ -322,8 +337,14 @@ LoadSettings :: proc(app: ^App) -> bool {
     app.rd_client_secret = loaded_client_secret
     app.rd_token_expires_at = i64(expires_u64)
     app.use_ram_limit = use_ram_limit
+    app.download_provider = download_provider
 
-    fmt.printf("[SETTINGS] Loaded version %d from %s\n", version, SETTINGS_FILE)
+    fmt.printf(
+        "[SETTINGS] Loaded version %d from %s (provider=%s)\n",
+        version,
+        SETTINGS_FILE,
+        download_provider == .Durrent ? "durrent" : "real-debrid",
+    )
     return true
 }
 
@@ -385,7 +406,7 @@ RenderSetupScreen :: proc(
 
             orui.label(
                 orui.id("setup_desc"),
-                "Connect your Real-Debrid account and choose the default folder for downloaded games. You only need to do this once.",
+                "Choose a download provider and the default folder for downloaded games. You only need to do this once.",
                 {
                     font_size = 14,
                     color = TEXT_MUTED,
@@ -394,8 +415,8 @@ RenderSetupScreen :: proc(
             )
 
             orui.label(
-                orui.id("api_key_label"),
-                "Real-Debrid account",
+                orui.id("provider_label"),
+                "Download provider",
                 {
                     font_size = 12,
                     color = TEXT_MUTED,
@@ -404,7 +425,61 @@ RenderSetupScreen :: proc(
 
             {
                 orui.container(
-                    orui.id("rd_connection_panel"),
+                    orui.id("provider_selector"),
+                    {
+                        layout = .Flex,
+                        direction = .LeftToRight,
+                        width = orui.grow(),
+                        height = orui.fixed(36),
+                        gap = 8,
+                    },
+                )
+
+                if orui.button(
+                    orui.id("btn_provider_realdebrid"),
+                    "Real-Debrid",
+                    {
+                        width = orui.grow(),
+                        height = orui.grow(),
+                        background_color = app.download_provider == .RealDebrid ? ACCENT_COLOR : ROW_HOVER_BACKGROUND,
+                        color = app.download_provider == .RealDebrid ? APP_BACKGROUND : TEXT_PRIMARY,
+                        corner_radius = orui.corner(5),
+                    },
+                ) {
+                    app.download_provider = .RealDebrid
+                }
+
+                if orui.button(
+                    orui.id("btn_provider_durrent"),
+                    "Durrent (local)",
+                    {
+                        width = orui.grow(),
+                        height = orui.grow(),
+                        background_color = app.download_provider == .Durrent ? ACCENT_COLOR : ROW_HOVER_BACKGROUND,
+                        color = app.download_provider == .Durrent ? APP_BACKGROUND : TEXT_PRIMARY,
+                        corner_radius = orui.corner(5),
+                    },
+                ) {
+                    if app.auth_thread != nil {
+                        CancelRealDebridAuth(app)
+                    }
+                    app.download_provider = .Durrent
+                }
+            }
+
+            if app.download_provider == .RealDebrid {
+                orui.label(
+                    orui.id("api_key_label"),
+                    "Real-Debrid account",
+                    {
+                        font_size = 12,
+                        color = TEXT_MUTED,
+                    },
+                )
+
+                {
+                    orui.container(
+                        orui.id("rd_connection_panel"),
                     {
                         layout = .Flex,
                         direction = .TopToBottom,
@@ -531,8 +606,9 @@ RenderSetupScreen :: proc(
                                 "Could not start Real-Debrid connection."
                         }
                     }
+                    }
+                    DestroyRealDebridAuthSnapshot(&auth_snapshot)
                 }
-                DestroyRealDebridAuthSnapshot(&auth_snapshot)
             }
 
             orui.label(
@@ -689,17 +765,18 @@ RenderSetupScreen :: proc(
             )
 
             download_path_text := strings.trim_space(app.download_path)
-            auth_ready :=
-                len(app.rd_key) > 0 &&
-                len(app.rd_refresh_token) > 0 &&
-                len(app.rd_client_id) > 0 &&
-                len(app.rd_client_secret) > 0
+            auth_ready := app.download_provider == .Durrent ||
+                (len(app.rd_key) > 0 &&
+                 len(app.rd_refresh_token) > 0 &&
+                 len(app.rd_client_id) > 0 &&
+                 len(app.rd_client_secret) > 0)
             path_ready := len(download_path_text) > 0
 
             if !auth_ready || !path_ready {
+                warning_text := app.download_provider == .Durrent ? "Choose a download folder to continue." : "Connect Real-Debrid and choose a download folder to continue."
                 orui.label(
                     orui.id("setup_warn"),
-                    "Connect Real-Debrid and choose a download folder to continue.",
+                    warning_text,
                     {
                         font_size = 12,
                         color = STATUS_ERR,
@@ -726,8 +803,7 @@ RenderSetupScreen :: proc(
                     download_path_text = strings.trim_space(download_path_text)
 
                     if !auth_ready || len(download_path_text) == 0 {
-                        app.status_message =
-                            "Connect Real-Debrid and choose a download folder."
+                        app.status_message = app.download_provider == .Durrent ? "Choose a download folder." : "Connect Real-Debrid and choose a download folder."
                         return
                     }
 
@@ -767,7 +843,7 @@ RenderSetupScreen :: proc(
                         app.screen = .Library
                     } else {
                         fmt.println(
-                            "[UI] Starting loader after Real-Debrid connection",
+                            "[UI] Starting loader after provider setup",
                         )
 
                         app.screen = .Loading

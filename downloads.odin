@@ -12,6 +12,7 @@ import "core:time"
 import "base:runtime"
 
 import curl "vendor:curl"
+import durrent "./durrent"
 
 
 DownloadState :: enum {
@@ -35,8 +36,10 @@ DownloadEntry :: struct {
     game_title:  string,
     magnet_link: string,
 
-    rd_torrent_id: string,
-    output_path:   string,
+    provider:           DownloadProvider,
+    provider_job_id:    string,
+    local_torrent_path: string,
+    output_path:        string,
     part_path:     string,
     archive_path:  string,
 
@@ -118,7 +121,8 @@ DownloadManagerShutdown :: proc(manager: ^DownloadManager) {
         delete(entry.info_hash)
         delete(entry.game_title)
         delete(entry.magnet_link)
-        delete(entry.rd_torrent_id)
+        delete(entry.provider_job_id)
+        delete(entry.local_torrent_path)
         delete(entry.output_path)
         delete(entry.part_path)
         delete(entry.archive_path)
@@ -136,6 +140,76 @@ DownloadManagerShutdown :: proc(manager: ^DownloadManager) {
 // Queue API
 // ---------------------------------------------------------
 
+download_torrent_hash_to_string :: proc(info_hash: durrent.Torrent_Hash) -> string {
+    hex := "0123456789abcdef"
+    result: strings.Builder
+    strings.builder_init(&result, context.allocator)
+    for value in info_hash {
+        strings.write_byte(&result, hex[value >> 4])
+        strings.write_byte(&result, hex[value & 0x0f])
+    }
+    return strings.to_string(result)
+}
+
+
+download_game_info_hash :: proc(game: ^GameRelease) -> string {
+    if game == nil {
+        return ""
+    }
+    if len(game.source_info_hash) > 0 {
+        return strings.clone(game.source_info_hash, context.allocator)
+    }
+    return download_info_hash(game.magnetLink)
+}
+
+
+// DownloadQueueLocalTorrent is the phase-2 local-provider entry point. The
+// caller supplies a verified local .torrent path; magnet metadata discovery is
+// intentionally outside this slice.
+DownloadQueueLocalTorrent :: proc(
+    manager: ^DownloadManager,
+    game_index: int,
+    torrent_path: string,
+) -> bool {
+    if manager == nil || manager.app == nil ||
+       manager.app.download_provider != .Durrent ||
+       game_index < 0 || game_index >= len(manager.app.games) ||
+       len(torrent_path) == 0 {
+        return false
+    }
+
+    data, read_error := os.read_entire_file_from_path(
+        torrent_path,
+        context.allocator,
+    )
+    if read_error != nil {
+        return false
+    }
+    defer delete(data)
+
+    torrent, parse_error := durrent.Parse_Torrent(data[:])
+    if parse_error != .None {
+        return false
+    }
+    defer durrent.Destroy_Torrent(&torrent)
+
+    info_hash := download_torrent_hash_to_string(torrent.Info_Hash)
+    defer delete(info_hash)
+    delete(manager.app.games[game_index].local_torrent_path)
+    delete(manager.app.games[game_index].source_info_hash)
+    manager.app.games[game_index].local_torrent_path = strings.clone(
+        torrent_path,
+        context.allocator,
+    )
+    manager.app.games[game_index].source_info_hash = strings.clone(
+        info_hash,
+        context.allocator,
+    )
+
+    return DownloadQueueGame(manager, game_index)
+}
+
+
 DownloadQueueGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
     if manager == nil || manager.app == nil {
         return false
@@ -146,10 +220,10 @@ DownloadQueueGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
         return false
     }
 
-    info_hash := download_info_hash(app.games[game_index].magnetLink)
+    info_hash := download_game_info_hash(&app.games[game_index])
     defer delete(info_hash)
 
-    manifest_phase, manifest_archive, manifest_torrent := download_read_manifest_for_game(manager, game_index)
+    manifest_phase, manifest_archive, manifest_torrent, manifest_provider := download_read_manifest_for_game(manager, game_index)
     defer delete(manifest_phase)
     defer delete(manifest_archive)
     defer delete(manifest_torrent)
@@ -219,7 +293,9 @@ DownloadQueueGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
             info_hash = strings.clone(info_hash, context.allocator),
             game_title = strings.clone(app.games[game_index].title, context.allocator),
             magnet_link = strings.clone(app.games[game_index].magnetLink, context.allocator),
-            rd_torrent_id = resume_manifest ? strings.clone(manifest_torrent, context.allocator) : "",
+            provider = manifest_provider,
+            provider_job_id = resume_manifest ? strings.clone(manifest_torrent, context.allocator) : "",
+            local_torrent_path = strings.clone(app.games[game_index].local_torrent_path, context.allocator),
             output_path = cleanup_manifest ? strings.clone(manifest_archive, context.allocator) : "",
             part_path = stale_failed_manifest ? strings.clone(stale_failed_part, context.allocator) : "",
             archive_path = cleanup_manifest ? strings.clone(manifest_archive, context.allocator) : "",
@@ -253,7 +329,8 @@ DownloadCancelGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
         case .Queued:
             entry.state = .Cancelled
             entry.cancel_requested = true
-            torrent_id := strings.clone(entry.rd_torrent_id, context.allocator)
+            provider_job_id := strings.clone(entry.provider_job_id, context.allocator)
+            local_torrent_path := strings.clone(entry.local_torrent_path, context.allocator)
             delete(entry.status_message)
             entry.status_message = strings.clone(
                 "Cancelled; local partial files were removed.",
@@ -264,13 +341,23 @@ DownloadCancelGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
             // A queued retry may still reference files from an earlier
             // attempt, even though its worker has not started yet. If its
             // manifest restored a remote torrent, release that torrent too.
-            if manager.app != nil && len(torrent_id) > 0 && len(manager.app.rd_key) > 0 {
+            if manager.app != nil &&
+               entry.provider == .RealDebrid &&
+               len(provider_job_id) > 0 &&
+               len(manager.app.rd_key) > 0 {
                 token := strings.clone(manager.app.rd_key, context.allocator)
                 client := NewRealDebridClient(token)
-                download_delete_remote_torrent(&client, torrent_id)
+                download_delete_remote_torrent(&client, provider_job_id)
                 delete(token)
             }
-            delete(torrent_id)
+            delete(provider_job_id)
+            if entry.provider == .Durrent {
+                download_remove_durrent_artifacts(
+                    manager.app.download_path,
+                    local_torrent_path,
+                )
+            }
+            delete(local_torrent_path)
             download_remove_local_artifacts(manager, entry_index)
             return true
         case .Resolving, .Downloading, .Extracting, .Installing:
@@ -334,7 +421,7 @@ DownloadSnapshotForGame :: proc(manager: ^DownloadManager, game_index: int) -> D
 
     info_hash := ""
     if game_index >= 0 && game_index < len(manager.app.games) {
-        info_hash = download_info_hash(manager.app.games[game_index].magnetLink)
+        info_hash = download_game_info_hash(&manager.app.games[game_index])
     }
     defer delete(info_hash)
 
@@ -368,7 +455,7 @@ DownloadSnapshotForGame :: proc(manager: ^DownloadManager, game_index: int) -> D
     }
     sync.mutex_unlock(&manager.mutex)
 
-    phase, manifest_archive, manifest_torrent := download_read_manifest_for_game(manager, game_index)
+    phase, manifest_archive, manifest_torrent, _ := download_read_manifest_for_game(manager, game_index)
     defer delete(phase)
     defer delete(manifest_archive)
     defer delete(manifest_torrent)
@@ -425,7 +512,7 @@ DownloadOutputPathForGame :: proc(manager: ^DownloadManager, game_index: int) ->
         return ""
     }
 
-    info_hash := download_info_hash(app.games[game_index].magnetLink)
+    info_hash := download_game_info_hash(&app.games[game_index])
     defer delete(info_hash)
     marker_path := download_marker_path(app.download_path, info_hash)
     defer delete(marker_path)
@@ -701,6 +788,321 @@ download_resume_archive_entry :: proc(
 
 
 download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
+    if manager == nil || manager.app == nil {
+        return
+    }
+
+    provider := DownloadProvider.RealDebrid
+    sync.mutex_lock(&manager.mutex)
+    if entry_index >= 0 && entry_index < len(manager.entries) {
+        provider = manager.entries[entry_index].provider
+    }
+    sync.mutex_unlock(&manager.mutex)
+
+    switch provider {
+    case .RealDebrid:
+        download_process_realdebrid_entry(manager, entry_index)
+    case .Durrent:
+        download_process_durrent_entry(manager, entry_index)
+    }
+}
+
+
+download_manager_stop_requested :: proc(manager: ^DownloadManager) -> bool {
+    if manager == nil {
+        return true
+    }
+    sync.mutex_lock(&manager.mutex)
+    defer sync.mutex_unlock(&manager.mutex)
+    return manager.stop_requested
+}
+
+
+download_copy_local_torrent_path :: proc(manager: ^DownloadManager, entry_index: int) -> string {
+    sync.mutex_lock(&manager.mutex)
+    defer sync.mutex_unlock(&manager.mutex)
+    if entry_index < 0 || entry_index >= len(manager.entries) {
+        return ""
+    }
+    return strings.clone(manager.entries[entry_index].local_torrent_path, context.allocator)
+}
+
+
+download_torrent_file_path :: proc(
+    torrent: ^durrent.Torrent,
+    output_directory: string,
+    file_index: int,
+) -> string {
+    if torrent == nil || file_index < 0 || file_index >= len(torrent.Files) {
+        return ""
+    }
+
+    result := fmt.aprintf("%s/%s", output_directory, string(torrent.Name))
+    if !torrent.Multi_File {
+        return result
+    }
+
+    for component in torrent.Files[file_index].Path {
+        next := fmt.aprintf("%s/%s", result, string(component))
+        delete(result)
+        result = next
+    }
+    return result
+}
+
+
+download_find_torrent_archive :: proc(
+    torrent: ^durrent.Torrent,
+    output_directory: string,
+) -> string {
+    if torrent == nil {
+        return ""
+    }
+    for file_index := 0; file_index < len(torrent.Files); file_index += 1 {
+        path := download_torrent_file_path(torrent, output_directory, file_index)
+        if DownloadPathIsArchive(path) {
+            return path
+        }
+        delete(path)
+    }
+    return ""
+}
+
+
+download_remove_durrent_artifacts :: proc(
+    output_directory, torrent_path: string,
+) {
+    if len(output_directory) == 0 || len(torrent_path) == 0 {
+        return
+    }
+    data, read_error := os.read_entire_file_from_path(
+        torrent_path,
+        context.allocator,
+    )
+    if read_error != nil {
+        return
+    }
+    defer delete(data)
+    torrent, parse_error := durrent.Parse_Torrent(data[:])
+    if parse_error != .None {
+        return
+    }
+    defer durrent.Destroy_Torrent(&torrent)
+
+    output_root := fmt.aprintf("%s/%s", output_directory, string(torrent.Name))
+    defer delete(output_root)
+    if os.is_directory(output_root) {
+        if remove_error := os.remove_all(output_root); remove_error != nil {
+            fmt.printf("[DOWNLOAD] WARNING: could not remove Durrent torrent data %s: %v\n", output_root, remove_error)
+        }
+    } else {
+        download_remove_local_path(output_root, "Durrent torrent data")
+    }
+
+    resume_path := fmt.aprintf(
+        "%s/.%s.durrent.resume",
+        output_directory,
+        string(torrent.Name),
+    )
+    defer delete(resume_path)
+    download_remove_local_path(resume_path, "Durrent resume data")
+}
+
+
+download_durrent_peer_id :: proc() -> (peer_id: [20]byte) {
+    value := "-FB0100-DURRENT-01"
+    for index := 0; index < len(value) && index < len(peer_id); index += 1 {
+        peer_id[index] = value[index]
+    }
+    return peer_id
+}
+
+
+download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: int) {
+    app := manager.app
+    if app == nil {
+        return
+    }
+
+    sync.mutex_lock(&manager.mutex)
+    if entry_index < 0 || entry_index >= len(manager.entries) {
+        sync.mutex_unlock(&manager.mutex)
+        return
+    }
+    game_index := manager.entries[entry_index].game_index
+    sync.mutex_unlock(&manager.mutex)
+
+    resume_phase, resume_archive, _, _ := download_read_manifest_for_game(manager, game_index)
+    defer delete(resume_phase)
+    defer delete(resume_archive)
+    if (resume_phase == "archive_ready" ||
+        resume_phase == "extracting" ||
+        resume_phase == "extracted" ||
+        resume_phase == "installing" ||
+        resume_phase == "paused" ||
+        resume_phase == "failed") &&
+       len(resume_archive) > 0 && os.exists(resume_archive) {
+        download_resume_archive_entry(
+            manager,
+            entry_index,
+            resume_archive,
+            "",
+            resume_phase,
+            nil,
+        )
+        return
+    }
+
+    torrent_path := download_copy_local_torrent_path(manager, entry_index)
+    defer delete(torrent_path)
+    if len(torrent_path) == 0 {
+        download_fail_entry(manager, entry_index, "A local .torrent file is missing.")
+        return
+    }
+
+    data, read_error := os.read_entire_file_from_path(
+        torrent_path,
+        context.allocator,
+    )
+    if read_error != nil {
+        download_fail_entry(manager, entry_index, "Could not read the local .torrent file.")
+        return
+    }
+    defer delete(data)
+
+    torrent, parse_error := durrent.Parse_Torrent(data[:])
+    if parse_error != .None {
+        download_fail_entry(manager, entry_index, "The local .torrent file is invalid.")
+        return
+    }
+    defer durrent.Destroy_Torrent(&torrent)
+
+    if download_should_cancel(manager, entry_index) {
+        download_remove_durrent_artifacts(app.download_path, torrent_path)
+        download_cancel_entry(manager, entry_index, nil)
+        return
+    }
+    if download_should_pause(manager, entry_index) ||
+       download_manager_stop_requested(manager) {
+        download_pause_entry(manager, entry_index, nil)
+        return
+    }
+
+    download_set_state(manager, entry_index, .Resolving)
+    download_set_message(manager, entry_index, "Opening local torrent...")
+    download_write_manifest(manager, entry_index, "resolving", "Opening local torrent.")
+    if !EnsureDownloadDirectory(app.download_path) {
+        download_fail_entry(manager, entry_index, "Download folder is not usable.")
+        return
+    }
+
+    loop: durrent.Torrent_Session_Loop
+    open_error := durrent.Torrent_Session_Loop_Open(
+        &loop,
+        &torrent,
+        app.download_path,
+        download_durrent_peer_id(),
+        0,
+    )
+    if open_error != .None {
+        download_fail_entry(manager, entry_index, "Could not open the local torrent session.")
+        return
+    }
+
+    start_error := durrent.Torrent_Session_Loop_Start(&loop)
+    if start_error != .None {
+        _ = durrent.Torrent_Session_Loop_Shutdown(&loop)
+        download_fail_entry(manager, entry_index, "Could not start the local torrent session.")
+        return
+    }
+
+    download_set_state(manager, entry_index, .Downloading)
+    download_set_message(manager, entry_index, "Downloading through Durrent...")
+    download_write_manifest(manager, entry_index, "local_downloading", "Downloading through Durrent.")
+
+    completed := false
+    for {
+        if download_should_cancel(manager, entry_index) {
+            _ = durrent.Torrent_Session_Loop_Shutdown(&loop)
+            download_remove_durrent_artifacts(app.download_path, torrent_path)
+            download_cancel_entry(manager, entry_index, nil)
+            return
+        }
+        if download_should_pause(manager, entry_index) ||
+           download_manager_stop_requested(manager) {
+            _ = durrent.Torrent_Session_Loop_Shutdown(&loop)
+            download_pause_entry(manager, entry_index, nil)
+            return
+        }
+
+        stats, snapshot_error := durrent.Torrent_Session_Loop_Snapshot(&loop)
+        if snapshot_error != .None {
+            _ = durrent.Torrent_Session_Loop_Shutdown(&loop)
+            download_fail_entry(manager, entry_index, "Could not read the Durrent session state.")
+            return
+        }
+
+        total_bytes := i64(torrent.Total_Length)
+        completed_bytes := i64(stats.Completed_Bytes)
+        fraction := f64(0)
+        if total_bytes > 0 {
+            fraction = f64(completed_bytes) / f64(total_bytes)
+        }
+        download_set_progress(
+            manager,
+            entry_index,
+            fraction,
+            completed_bytes,
+            total_bytes,
+        )
+
+        if stats.State == .Failed {
+            _ = durrent.Torrent_Session_Loop_Shutdown(&loop)
+            download_fail_entry(manager, entry_index, "Durrent reported a torrent failure.")
+            return
+        }
+        if stats.Seeding || stats.Completed_Bytes >= torrent.Total_Length {
+            completed = true
+            break
+        }
+        time.sleep(250 * time.Millisecond)
+    }
+
+    _ = durrent.Torrent_Session_Loop_Shutdown(&loop)
+    if !completed {
+        download_fail_entry(manager, entry_index, "Durrent stopped before the torrent completed.")
+        return
+    }
+
+    archive_path := download_find_torrent_archive(&torrent, app.download_path)
+    if len(archive_path) == 0 {
+        download_fail_entry(manager, entry_index, "The completed torrent did not contain a supported archive.")
+        return
+    }
+    defer delete(archive_path)
+
+    download_set_paths(manager, entry_index, archive_path, "")
+    download_set_archive_path(manager, entry_index, archive_path)
+    download_set_progress(
+        manager,
+        entry_index,
+        1,
+        i64(torrent.Total_Length),
+        i64(torrent.Total_Length),
+    )
+    download_write_manifest(manager, entry_index, "archive_ready", "Archive downloaded; preparing extraction.")
+    download_resume_archive_entry(
+        manager,
+        entry_index,
+        archive_path,
+        "",
+        "archive_ready",
+        nil,
+    )
+}
+
+
+download_process_realdebrid_entry :: proc(manager: ^DownloadManager, entry_index: int) {
     app := manager.app
     if app == nil {
         return
@@ -722,7 +1124,7 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
     // A fully downloaded archive must remain installable even if the
     // Real-Debrid token expired after the download completed. Resume the
     // archive/runtime/install path before contacting the API again.
-    resume_phase, resume_archive, resume_torrent := download_read_manifest_for_game(manager, game_index)
+    resume_phase, resume_archive, resume_torrent, _ := download_read_manifest_for_game(manager, game_index)
     defer delete(resume_phase)
     defer delete(resume_archive)
     defer delete(resume_torrent)
@@ -807,7 +1209,7 @@ download_process_entry :: proc(manager: ^DownloadManager, entry_index: int) {
         return
     }
 
-    download_set_torrent_id(manager, entry_index, created.id)
+    download_set_provider_job_id(manager, entry_index, created.id)
     torrent_id := strings.clone(created.id, context.allocator)
     DestroyRealDebridTorrentCreated(&created)
 
@@ -1663,7 +2065,7 @@ download_set_message :: proc(manager: ^DownloadManager, entry_index: int, messag
 }
 
 
-download_set_torrent_id :: proc(manager: ^DownloadManager, entry_index: int, torrent_id: string) {
+download_set_provider_job_id :: proc(manager: ^DownloadManager, entry_index: int, provider_job_id: string) {
     sync.mutex_lock(&manager.mutex)
     defer sync.mutex_unlock(&manager.mutex)
 
@@ -1671,9 +2073,9 @@ download_set_torrent_id :: proc(manager: ^DownloadManager, entry_index: int, tor
         return
     }
 
-    delete(manager.entries[entry_index].rd_torrent_id)
-    manager.entries[entry_index].rd_torrent_id = strings.clone(
-        torrent_id,
+    delete(manager.entries[entry_index].provider_job_id)
+    manager.entries[entry_index].provider_job_id = strings.clone(
+        provider_job_id,
         context.allocator,
     )
 }
@@ -1775,10 +2177,10 @@ download_fail_entry_from_rd :: proc(manager: ^DownloadManager, entry_index: int,
 
 
 download_pause_entry :: proc(manager: ^DownloadManager, entry_index: int, client: ^RealDebridClient) {
-    torrent_id := download_copy_torrent_id(manager, entry_index)
-    defer delete(torrent_id)
-    if client != nil && len(torrent_id) > 0 {
-        download_delete_remote_torrent(client, torrent_id)
+    provider_job_id := download_copy_provider_job_id(manager, entry_index)
+    defer delete(provider_job_id)
+    if client != nil && len(provider_job_id) > 0 {
+        download_delete_remote_torrent(client, provider_job_id)
     }
 
     resume_phase := "paused"
@@ -1926,11 +2328,11 @@ download_remove_local_artifacts :: proc(manager: ^DownloadManager, entry_index: 
 
 download_cancel_entry :: proc(manager: ^DownloadManager, entry_index: int, client: ^RealDebridClient) {
     paused := download_should_pause(manager, entry_index)
-    torrent_id := download_copy_torrent_id(manager, entry_index)
-    defer delete(torrent_id)
+    provider_job_id := download_copy_provider_job_id(manager, entry_index)
+    defer delete(provider_job_id)
 
-    if client != nil && len(torrent_id) > 0 {
-        download_delete_remote_torrent(client, torrent_id)
+    if client != nil && len(provider_job_id) > 0 {
+        download_delete_remote_torrent(client, provider_job_id)
     }
 
     if paused {
@@ -1965,14 +2367,14 @@ download_delete_remote_torrent :: proc(client: ^RealDebridClient, torrent_id: st
 }
 
 
-download_copy_torrent_id :: proc(manager: ^DownloadManager, entry_index: int) -> string {
+download_copy_provider_job_id :: proc(manager: ^DownloadManager, entry_index: int) -> string {
     sync.mutex_lock(&manager.mutex)
     defer sync.mutex_unlock(&manager.mutex)
 
     if entry_index < 0 || entry_index >= len(manager.entries) {
         return ""
     }
-    return strings.clone(manager.entries[entry_index].rd_torrent_id, context.allocator)
+    return strings.clone(manager.entries[entry_index].provider_job_id, context.allocator)
 }
 
 
@@ -2104,21 +2506,43 @@ restore_persisted_download_state_file :: proc(
     text := string(data[:])
     title := download_manifest_value(text, "title")
     magnet := download_manifest_value(text, "magnet")
+    provider_name := download_manifest_value(text, "provider")
+    info_hash := download_manifest_value(text, "info_hash")
+    torrent_path := download_manifest_value(text, "torrent_path")
     delete(data)
 
-    // State metadata is part of the current manifest format. Ignore files
-    // without it rather than guessing from legacy filenames or paths.
-    if len(title) == 0 || len(magnet) == 0 {
+    provider := download_provider_from_manifest(provider_name, app.download_provider)
+    delete(provider_name)
+    is_local_manifest := provider == .Durrent &&
+        len(info_hash) > 0 && len(torrent_path) > 0
+
+    // Current manifests require title and either a magnet or the local
+    // torrent identity/path used by Durrent.
+    if len(title) == 0 || (!is_local_manifest && len(magnet) == 0) {
         delete(title)
         delete(magnet)
+        delete(info_hash)
+        delete(torrent_path)
         return
     }
 
-    magnet = download_normalize_magnet(magnet)
+    if len(magnet) > 0 {
+        magnet = download_normalize_magnet(magnet)
+    }
     existing_index := FindCachedGameIndex(app, magnet)
+    if existing_index < 0 && is_local_manifest {
+        for game, game_index in app.games {
+            if game.source_info_hash == info_hash {
+                existing_index = game_index
+                break
+            }
+        }
+    }
     if existing_index >= 0 {
         delete(title)
         delete(magnet)
+        delete(info_hash)
+        delete(torrent_path)
         return
     }
 
@@ -2132,6 +2556,8 @@ restore_persisted_download_state_file :: proc(
     append(&app.games, GameRelease{
         title = title,
         magnetLink = magnet,
+        local_torrent_path = torrent_path,
+        source_info_hash = info_hash,
         coverPath = cover_path,
         state_placeholder = true,
     })
@@ -2189,7 +2615,9 @@ download_write_manifest :: proc(manager: ^DownloadManager, entry_index: int, pha
     archive_path := strings.clone(manager.entries[entry_index].archive_path, context.allocator)
     output_path := strings.clone(manager.entries[entry_index].output_path, context.allocator)
     part_path := strings.clone(manager.entries[entry_index].part_path, context.allocator)
-    torrent_id := strings.clone(manager.entries[entry_index].rd_torrent_id, context.allocator)
+    provider_job_id := strings.clone(manager.entries[entry_index].provider_job_id, context.allocator)
+    provider_name := manager.entries[entry_index].provider == .Durrent ? "durrent" : "real-debrid"
+    torrent_path := strings.clone(manager.entries[entry_index].local_torrent_path, context.allocator)
     download_directory := strings.clone(manager.app.download_path, context.allocator)
     sync.mutex_unlock(&manager.mutex)
 
@@ -2199,7 +2627,8 @@ download_write_manifest :: proc(manager: ^DownloadManager, entry_index: int, pha
     defer delete(archive_path)
     defer delete(output_path)
     defer delete(part_path)
-    defer delete(torrent_id)
+    defer delete(provider_job_id)
+    defer delete(torrent_path)
     defer delete(download_directory)
 
     if len(archive_path) == 0 {
@@ -2214,14 +2643,17 @@ download_write_manifest :: proc(manager: ^DownloadManager, entry_index: int, pha
     temp_path := fmt.aprintf("%s.tmp", manifest_path)
     defer delete(temp_path)
     contents := fmt.aprintf(
-        "phase=%s\ntitle=%s\nmagnet=%s\narchive_path=%s\noutput_path=%s\npart_path=%s\ntorrent_id=%s\nmessage=%s\n",
+        "phase=%s\nprovider=%s\ninfo_hash=%s\ntorrent_path=%s\ntitle=%s\nmagnet=%s\narchive_path=%s\noutput_path=%s\npart_path=%s\nprovider_job_id=%s\nmessage=%s\n",
         phase,
+        provider_name,
+        info_hash,
+        torrent_path,
         game_title,
         magnet_link,
         archive_path,
         output_path,
         part_path,
-        torrent_id,
+        provider_job_id,
         message,
     )
     defer delete(contents)
@@ -2238,26 +2670,48 @@ download_write_manifest :: proc(manager: ^DownloadManager, entry_index: int, pha
 }
 
 
-download_read_manifest_for_game :: proc(manager: ^DownloadManager, game_index: int) -> (phase, archive_path, torrent_id: string) {
+download_provider_from_manifest :: proc(value: string, fallback: DownloadProvider) -> DownloadProvider {
+    if value == "durrent" {
+        return .Durrent
+    }
+    if value == "real-debrid" {
+        return .RealDebrid
+    }
+    return fallback
+}
+
+
+download_read_manifest_for_game :: proc(manager: ^DownloadManager, game_index: int) -> (phase, archive_path, provider_job_id: string, provider: DownloadProvider) {
+    provider = .RealDebrid
     if manager == nil || manager.app == nil ||
        game_index < 0 || game_index >= len(manager.app.games) {
-        return "", "", ""
+        return "", "", "", provider
     }
+    provider = manager.app.download_provider
 
-    info_hash := download_info_hash(manager.app.games[game_index].magnetLink)
+    info_hash := download_game_info_hash(&manager.app.games[game_index])
     defer delete(info_hash)
     path := download_manifest_path(manager.app.download_path, info_hash)
     defer delete(path)
     data, read_err := os.read_entire_file_from_path(path, context.allocator)
     if read_err != nil {
-        return "", "", ""
+        return "", "", "", provider
     }
     defer delete(data)
     text := string(data[:])
     phase = download_manifest_value(text, "phase")
     archive_path = download_manifest_value(text, "archive_path")
-    torrent_id = download_manifest_value(text, "torrent_id")
-    return phase, archive_path, torrent_id
+    provider_name := download_manifest_value(text, "provider")
+    provider = download_provider_from_manifest(provider_name, provider)
+    delete(provider_name)
+    provider_job_id = download_manifest_value(text, "provider_job_id")
+    if len(provider_job_id) == 0 {
+        // Current pre-provider manifests used this generic key for the
+        // Real-Debrid job id. Keep those resumable while new manifests use
+        // provider_job_id explicitly.
+        provider_job_id = download_manifest_value(text, "torrent_id")
+    }
+    return phase, archive_path, provider_job_id, provider
 }
 
 
@@ -2266,7 +2720,7 @@ download_manifest_value_from_file :: proc(manager: ^DownloadManager, game_index:
        game_index < 0 || game_index >= len(manager.app.games) {
         return ""
     }
-    info_hash := download_info_hash(manager.app.games[game_index].magnetLink)
+    info_hash := download_game_info_hash(&manager.app.games[game_index])
     defer delete(info_hash)
     path := download_manifest_path(manager.app.download_path, info_hash)
     defer delete(path)
@@ -2316,7 +2770,7 @@ download_cleanup_startup_game :: proc(manager: ^DownloadManager, game_index: int
        game_index < 0 || game_index >= len(manager.app.games) {
         return
     }
-    phase, archive_path, _ := download_read_manifest_for_game(manager, game_index)
+    phase, archive_path, _, _ := download_read_manifest_for_game(manager, game_index)
     defer delete(phase)
     defer delete(archive_path)
     if len(phase) == 0 {

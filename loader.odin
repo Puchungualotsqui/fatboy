@@ -721,13 +721,13 @@ FindCachedGameIndex :: proc(app: ^App, magnet_link: string) -> int {
     target_hash := download_info_hash(magnet_link)
     defer delete(target_hash)
 
-    for game, game_index in app.games {
+    for &game, game_index in app.games {
         if game.magnetLink == magnet_link {
             return game_index
         }
 
         if len(target_hash) > 0 {
-            game_hash := download_info_hash(game.magnetLink)
+            game_hash := download_game_info_hash(&game)
             same_hash := game_hash == target_hash
             delete(game_hash)
             if same_hash {
@@ -762,8 +762,18 @@ CatalogAppendLoadedPage :: proc(
 
         if existing_index >= 0 {
             if app.games[existing_index].state_placeholder {
+                local_torrent_path := strings.clone(
+                    app.games[existing_index].local_torrent_path,
+                    context.allocator,
+                )
+                source_info_hash := strings.clone(
+                    app.games[existing_index].source_info_hash,
+                    context.allocator,
+                )
                 DestroyGame(&app.games[existing_index])
                 app.games[existing_index] = loader_data.games[game_index]
+                app.games[existing_index].local_torrent_path = local_torrent_path
+                app.games[existing_index].source_info_hash = source_info_hash
                 app.games[existing_index].state_placeholder = false
                 loader_data.games[game_index] = {}
             } else {

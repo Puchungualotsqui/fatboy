@@ -46,10 +46,18 @@ AppScreen :: enum {
 }
 
 
+DownloadProvider :: enum {
+    RealDebrid,
+    Durrent,
+}
+
+
 GameRelease :: struct {
-    title:          string,
-    magnetLink:     string,
-    coverUrl:       string,
+    title:              string,
+    magnetLink:         string,
+    local_torrent_path: string,
+    source_info_hash:   string,
+    coverUrl:           string,
     coverPath:      string,
     coverTex:       rl.Texture2D,
     cover_loading:      bool,
@@ -92,6 +100,7 @@ LoaderData :: struct {
 
 App :: struct {
     screen:               AppScreen,
+    download_provider:    DownloadProvider,
     rd_key:               string,
     rd_refresh_token:     string,
     rd_client_id:         string,
@@ -176,6 +185,16 @@ DestroyGame :: proc(game: ^GameRelease) {
     if len(game.magnetLink) > 0 {
         delete(game.magnetLink)
         game.magnetLink = ""
+    }
+
+    if len(game.local_torrent_path) > 0 {
+        delete(game.local_torrent_path)
+        game.local_torrent_path = ""
+    }
+
+    if len(game.source_info_hash) > 0 {
+        delete(game.source_info_hash)
+        game.source_info_hash = ""
     }
 
     if len(game.coverUrl) > 0 {
