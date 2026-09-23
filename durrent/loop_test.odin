@@ -54,6 +54,28 @@ torrent_session_loop_tick_and_seeding_test :: proc(t: ^testing.T) {
 }
 
 @(test)
+torrent_session_loop_pause_and_resume_test :: proc(t: ^testing.T) {
+	base, base_error := os.make_directory_temp("", "durrent-loop-pause-*", context.allocator)
+	testing.expect_value(t, base_error, nil)
+	defer os.remove_all(base)
+	defer delete(base)
+
+	torrent := storage_test_single_torrent()
+	defer Destroy_Torrent(&torrent)
+	loop: Torrent_Session_Loop
+	defer Torrent_Session_Loop_Destroy(&loop)
+	testing.expect_value(t, Torrent_Session_Loop_Open(&loop, &torrent, base, loop_test_peer_id(), 0), Torrent_Loop_Error.None)
+	testing.expect_value(t, Torrent_Session_Loop_Start(&loop), Torrent_Loop_Error.None)
+	testing.expect_value(t, Torrent_Session_Loop_Pause(&loop), Torrent_Loop_Error.None)
+	stats, snapshot_error := Torrent_Session_Loop_Snapshot(&loop)
+	testing.expect_value(t, snapshot_error, Torrent_Loop_Error.None)
+	testing.expect_value(t, stats.State, Torrent_Loop_State.Paused)
+	testing.expect_value(t, Torrent_Session_Loop_Resume(&loop), Torrent_Loop_Error.None)
+	testing.expect_value(t, Torrent_Session_Loop_Shutdown(&loop), Torrent_Loop_Error.None)
+}
+
+
+@(test)
 torrent_session_loop_worker_shutdown_test :: proc(t: ^testing.T) {
 	base, base_error := os.make_directory_temp("", "durrent-loop-worker-*", context.allocator)
 	testing.expect_value(t, base_error, nil)

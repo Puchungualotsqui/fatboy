@@ -264,6 +264,69 @@ Torrent_Session_Loop_Snapshot :: proc(loop: ^Torrent_Session_Loop) -> (Torrent_L
 	}, .None
 }
 
+Torrent_Session_Loop_Pause :: proc(loop: ^Torrent_Session_Loop) -> Torrent_Loop_Error {
+	if loop == nil {
+		return .Invalid_Loop
+	}
+	sync.mutex_lock(&loop.Mutex)
+	if loop.State == .Closed || loop.State == .Paused {
+		sync.mutex_unlock(&loop.Mutex)
+		return .None
+	}
+	if loop.State != .Running && loop.State != .Seeding && loop.State != .Completed {
+		sync.mutex_unlock(&loop.Mutex)
+		return .Invalid_State
+	}
+	loop.Stop_Requested = true
+	loop.State = .Paused
+	worker := loop.Worker
+	loop.Worker = nil
+	sync.mutex_unlock(&loop.Mutex)
+
+	if worker != nil {
+		thread.destroy(worker)
+	}
+	loop_close_listeners(loop)
+	if loop.DHT_Worker != nil {
+		sync.mutex_lock(&loop.Mutex)
+		loop.DHT_Stop_Requested = true
+		dht_worker := loop.DHT_Worker
+		loop.DHT_Worker = nil
+		sync.mutex_unlock(&loop.Mutex)
+		thread.destroy(dht_worker)
+	}
+	Destroy_DHT_Lookup_Result(&loop.DHT_Result)
+	delete(loop.DHT_Bootstrap)
+	if loop.DHT_Enabled {
+		DHT_Client_Destroy(&loop.DHT)
+		loop.DHT_Enabled = false
+	}
+
+	sync.mutex_lock(&loop.Mutex)
+	for peer in loop.Peers {
+		if peer.Registered {
+			_ = Piece_Scheduler_Remove_Peer(&loop.Scheduler, peer.ID)
+		}
+		Destroy_Peer_Session(&peer.Session)
+		delete(peer.Address)
+		free(peer)
+	}
+	delete(loop.Peers)
+	loop.Peers = nil
+	_ = Torrent_Storage_Flush(&loop.Storage)
+	sync.mutex_unlock(&loop.Mutex)
+	return .None
+}
+
+
+Torrent_Session_Loop_Resume :: proc(loop: ^Torrent_Session_Loop) -> Torrent_Loop_Error {
+	if loop == nil {
+		return .Invalid_Loop
+	}
+	return Torrent_Session_Loop_Start(loop)
+}
+
+
 Torrent_Session_Loop_Shutdown :: proc(loop: ^Torrent_Session_Loop) -> Torrent_Loop_Error {
 	if loop == nil {
 		return .Invalid_Loop
