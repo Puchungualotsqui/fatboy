@@ -30,6 +30,33 @@ Tracker_Manager_Error :: enum {
 	Out_Of_Memory,
 }
 
+Tracker_Manager_Init_Magnet :: proc(
+	manager: ^Tracker_Manager,
+	magnet: ^Magnet_Link,
+	request: Tracker_Announce_Request,
+) -> Tracker_Manager_Error {
+	if manager == nil || magnet == nil {
+		return .Invalid_Manager
+	}
+	Tracker_Manager_Destroy(manager)
+	sync.mutex_lock(&manager.Mutex)
+	defer sync.mutex_unlock(&manager.Mutex)
+	manager.Request = request
+	manager.Event = .Started
+	for tracker_url in magnet.Trackers {
+		copy, copy_ok := torrent_clone(tracker_url)
+		if !copy_ok {
+			tracker_manager_clear_locked(manager)
+			return .Out_Of_Memory
+		}
+		tier: Tracker_Manager_Tier
+		append(&tier.URLs, copy)
+		append(&manager.Tiers, tier)
+	}
+	return .None if len(manager.Tiers) > 0 else .No_Trackers
+}
+
+
 Tracker_Manager_Init :: proc(
 	manager: ^Tracker_Manager,
 	torrent: ^Torrent,

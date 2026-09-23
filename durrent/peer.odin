@@ -12,6 +12,11 @@ Peer_State :: enum {
 	Failed,
 }
 
+Peer_Session_Mode :: enum {
+	Torrent,
+	Metadata,
+}
+
 Peer_Error :: enum {
 	None,
 	Invalid_Peer,
@@ -55,6 +60,7 @@ Peer_Session :: struct {
 	Mutex:             sync.Mutex,
 	Transport:         Peer_Transport,
 	State:             Peer_State,
+	Mode:              Peer_Session_Mode,
 	Error:             Peer_Error,
 	Expected_Info_Hash: Torrent_Hash,
 	Local_Peer_ID:     [20]byte,
@@ -90,6 +96,7 @@ Peer_Session_Init :: proc(
 	}
 	session.Expected_Info_Hash = info_hash
 	session.Local_Peer_ID = peer_id
+	session.Mode = .Torrent
 	session.Piece_Count = piece_count
 	session.Piece_Length = piece_length
 	session.Total_Length = total_length
@@ -99,6 +106,28 @@ Peer_Session_Init :: proc(
 	session.State = .New
 	return .None
 }
+
+Peer_Session_Init_Metadata :: proc(
+	session: ^Peer_Session,
+	info_hash: Torrent_Hash,
+	peer_id: [20]byte,
+) -> Peer_Error {
+	if session == nil {
+		return .Invalid_Peer
+	}
+	Destroy_Peer_Session(session)
+	session.Expected_Info_Hash = info_hash
+	session.Local_Peer_ID = peer_id
+	session.Mode = .Metadata
+	session.Piece_Count = 0
+	session.Piece_Length = 1
+	session.Total_Length = 0
+	session.Remote_Choking = true
+	session.Local_Choking = true
+	session.State = .New
+	return .None
+}
+
 
 Destroy_Peer_Session :: proc(session: ^Peer_Session) {
 	if session == nil {
@@ -452,26 +481,30 @@ peer_session_message_locked :: proc(session: ^Peer_Session, message: Wire_Messag
 	case .Not_Interested:
 		session.Remote_Interested = false
 	case .Have:
-		if message.Index >= session.Piece_Count {
-			return .Invalid_Piece
+		if session.Mode != .Metadata {
+			if message.Index >= session.Piece_Count {
+				return .Invalid_Piece
+			}
+			Bitfield_Set_Piece(&session.Remote_Pieces, message.Index)
 		}
-		Bitfield_Set_Piece(&session.Remote_Pieces, message.Index)
 	case .Bitfield:
-		if !peer_bitfield_valid(message.Payload, session.Piece_Count) {
-			return .Invalid_Bitfield
+		if session.Mode != .Metadata {
+			if !peer_bitfield_valid(message.Payload, session.Piece_Count) {
+				return .Invalid_Bitfield
+			}
+			bitfield, bitfield_error := Bitfield_From_Raw(message.Payload, session.Piece_Count)
+			if bitfield_error != .None {
+				return .Invalid_Bitfield
+			}
+			Destroy_Bitfield(&session.Remote_Pieces)
+			session.Remote_Pieces = bitfield
 		}
-		bitfield, bitfield_error := Bitfield_From_Raw(message.Payload, session.Piece_Count)
-		if bitfield_error != .None {
-			return .Invalid_Bitfield
-		}
-		Destroy_Bitfield(&session.Remote_Pieces)
-		session.Remote_Pieces = bitfield
 	case .Request, .Cancel:
-		if !peer_block_valid(session, message.Index, message.Begin, message.Length) {
+		if session.Mode != .Metadata && !peer_block_valid(session, message.Index, message.Begin, message.Length) {
 			return .Invalid_Piece
 		}
 	case .Piece:
-		if !peer_piece_payload_valid(session, message.Index, message.Begin, message.Payload) {
+		if session.Mode != .Metadata && !peer_piece_payload_valid(session, message.Index, message.Begin, message.Payload) {
 			return .Invalid_Piece
 		}
 	case .Port, .Extended:

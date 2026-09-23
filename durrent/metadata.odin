@@ -1,5 +1,6 @@
 package durrent
 
+import "core:crypto/hash"
 import "core:sync"
 
 Metadata_Piece_Size :: u32(16 * 1024)
@@ -119,35 +120,48 @@ Metadata_Downloader_Is_Complete :: proc(downloader: ^Metadata_Downloader) -> boo
 	return downloader.Complete
 }
 
-Metadata_Downloader_Finish :: proc(downloader: ^Metadata_Downloader) -> (Torrent, Metadata_Error) {
+Metadata_Downloader_Finish_Bencoded :: proc(downloader: ^Metadata_Downloader) -> ([]byte, Metadata_Error) {
 	if downloader == nil {
-		return Torrent{}, .Invalid_Downloader
+		return nil, .Invalid_Downloader
 	}
 	sync.mutex_lock(&downloader.Mutex)
 	if !downloader.Complete {
 		sync.mutex_unlock(&downloader.Mutex)
-		return Torrent{}, .Incomplete
+		return nil, .Incomplete
 	}
 	data, alloc_error := torrent_clone(downloader.Data)
 	info_hash := downloader.Info_Hash
 	sync.mutex_unlock(&downloader.Mutex)
 	if !alloc_error {
-		return Torrent{}, .Out_Of_Memory
+		return nil, .Out_Of_Memory
 	}
+
+	computed_hash: Torrent_Hash
+	hash.hash_bytes_to_buffer(hash.Algorithm.Insecure_SHA1, data, computed_hash[:])
+	if computed_hash != info_hash {
+		delete(data)
+		return nil, .Hash_Mismatch
+	}
+
 	metainfo: [dynamic]byte
 	prefix := "d4:info"
 	append(&metainfo, ..transmute([]byte)prefix)
 	append(&metainfo, ..data)
 	append(&metainfo, 'e')
 	delete(data)
-	torrent, torrent_error := Parse_Torrent(metainfo[:])
+	return metainfo[:], .None
+}
+
+
+Metadata_Downloader_Finish :: proc(downloader: ^Metadata_Downloader) -> (Torrent, Metadata_Error) {
+	metainfo, metadata_error := Metadata_Downloader_Finish_Bencoded(downloader)
+	if metadata_error != .None {
+		return Torrent{}, metadata_error
+	}
+	torrent, torrent_error := Parse_Torrent(metainfo)
 	delete(metainfo)
 	if torrent_error != .None {
 		return Torrent{}, .Invalid_Metadata
-	}
-	if torrent.Info_Hash != info_hash {
-		Destroy_Torrent(&torrent)
-		return Torrent{}, .Hash_Mismatch
 	}
 	return torrent, .None
 }

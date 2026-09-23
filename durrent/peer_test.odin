@@ -80,6 +80,34 @@ peer_handshake_and_fragmented_messages_test :: proc(t: ^testing.T) {
 }
 
 @(test)
+peer_metadata_mode_accepts_unknown_piece_geometry_test :: proc(t: ^testing.T) {
+	peer_id: [20]byte
+	metadata_session: Peer_Session
+	testing.expect_value(
+		t,
+		Peer_Session_Init_Metadata(&metadata_session, peer_test_hash, peer_id),
+		Peer_Error.None,
+	)
+	defer Destroy_Peer_Session(&metadata_session)
+	Peer_Session_Begin(&metadata_session)
+	handshake := peer_test_remote_handshake()
+	testing.expect_value(t, Peer_Session_Feed(&metadata_session, handshake[:]), Peer_Error.None)
+
+	wire: [dynamic]byte
+	testing.expect(t, peer_test_append_wire(&wire, Wire_Message_View{
+		Kind = .Bitfield,
+		Payload = []byte{0xc0},
+	}))
+	testing.expect(t, peer_test_append_wire(&wire, Wire_Message_View{
+		Kind = .Extended,
+		Payload = []byte{0},
+	}))
+	testing.expect_value(t, Peer_Session_Feed(&metadata_session, wire[:]), Peer_Error.None)
+	delete(wire)
+}
+
+
+@(test)
 peer_piece_request_and_event_test :: proc(t: ^testing.T) {
 	session := peer_test_session()
 	defer Destroy_Peer_Session(&session)
