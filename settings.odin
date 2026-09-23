@@ -834,6 +834,9 @@ RenderSetupScreen :: proc(
                     )
 
                     RestorePersistedDownloadGames(app)
+                    if app.download_manager.worker != nil {
+                        ResumePersistedDownloadJobs(app)
+                    }
 
                     if len(app.catalog_pages) > 0 {
                         fmt.println(

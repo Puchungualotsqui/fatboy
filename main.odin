@@ -269,6 +269,9 @@ main :: proc() {
 
     if app.screen == .Loading {
         RestorePersistedDownloadGames(&app)
+        if app.download_manager.worker != nil {
+            ResumePersistedDownloadJobs(&app)
+        }
         StartLoader(&app)
     }
 

@@ -618,6 +618,41 @@ DownloadManagerHasActiveWork :: proc(manager: ^DownloadManager) -> bool {
 }
 
 
+ResumePersistedDownloadJobs :: proc(app: ^App) {
+    if app == nil || len(app.download_path) == 0 {
+        return
+    }
+    for game_index in 0..<len(app.games) {
+        phase, archive_path, _, _ := download_read_manifest_for_game(
+            &app.download_manager,
+            game_index,
+        )
+        defer delete(phase)
+        defer delete(archive_path)
+
+        resume_phase := phase == "metadata_resolving" ||
+            phase == "metadata_ready" ||
+            phase == "resolving" ||
+            phase == "remote_downloading" ||
+            phase == "local_downloading" ||
+            phase == "archive_ready" ||
+            phase == "extracting" ||
+            phase == "extracted" ||
+            phase == "installing"
+        if !resume_phase {
+            continue
+        }
+        if DownloadQueueGame(&app.download_manager, game_index) {
+            fmt.printf(
+                "[STATE] Resuming game %q from phase=%s\n",
+                app.games[game_index].title,
+                phase,
+            )
+        }
+    }
+}
+
+
 DownloadStateText :: proc(state: DownloadState) -> string {
     switch state {
     case .NotDownloaded: return "DOWNLOAD"
@@ -2827,7 +2862,10 @@ restore_persisted_download_state_file :: proc(
     magnet := download_manifest_value(text, "magnet")
     provider_name := download_manifest_value(text, "provider")
     info_hash := download_manifest_value(text, "info_hash")
-    torrent_path := download_manifest_value(text, "torrent_path")
+    torrent_path := download_manifest_value(text, "metadata_path")
+    if len(torrent_path) == 0 {
+        torrent_path = download_manifest_value(text, "torrent_path")
+    }
     delete(data)
 
     provider := download_provider_from_manifest(provider_name, app.download_provider)
@@ -2964,11 +3002,13 @@ download_write_manifest :: proc(manager: ^DownloadManager, entry_index: int, pha
     temp_path := fmt.aprintf("%s.tmp", manifest_path)
     defer delete(temp_path)
     contents := fmt.aprintf(
-        "phase=%s\nprovider=%s\ninfo_hash=%s\ntorrent_path=%s\nresolver_attempt=%d\nresolver_error=%s\ntitle=%s\nmagnet=%s\narchive_path=%s\noutput_path=%s\npart_path=%s\nprovider_job_id=%s\nmessage=%s\n",
+        "phase=%s\nprovider=%s\ninfo_hash=%s\ntorrent_path=%s\nmetadata_path=%s\ntorrent_output_path=%s\nresolver_attempt=%d\nresolver_error=%s\ntitle=%s\nmagnet=%s\narchive_path=%s\noutput_path=%s\npart_path=%s\nprovider_job_id=%s\nmessage=%s\n",
         phase,
         provider_name,
         info_hash,
         torrent_path,
+        torrent_path,
+        download_directory,
         resolver_attempt,
         resolver_error,
         game_title,
