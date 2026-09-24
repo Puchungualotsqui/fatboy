@@ -115,16 +115,31 @@ Metadata_Downloader_Handle_Event :: proc(
 	extension_id := event.Payload[0]
 	payload := event.Payload[1:]
 	if extension_id == 0 {
-		return metadata_handle_handshake_locked(downloader, session, payload)
+		handshake_error := metadata_handle_handshake_locked(downloader, session, payload)
+		if handshake_error == .None || downloader.Metadata_Size == 0 {
+			return handshake_error
+		}
+		// A few peers have been observed to send their first metadata response
+		// with extension id 0. If this is a valid piece, accept it; otherwise
+		// preserve the handshake error.
+		piece_error := metadata_handle_piece_locked(downloader, payload)
+		return .None if piece_error == .None else handshake_error
 	}
 	if extension_id != downloader.Remote_Extension_ID || downloader.Metadata_Size == 0 {
 		if downloader.Metadata_Size > 0 {
 			fmt.printf(
-				"[DURRENT-META] Ignoring extended message extension=%d expected=%d bytes=%d\n",
+				"[DURRENT-META] Probing extended message extension=%d expected=%d bytes=%d\n",
 				extension_id,
 				downloader.Remote_Extension_ID,
 				len(event.Payload),
 			)
+			// The extension mapping is advisory in practice. Accept a payload
+			// only when it is structurally a valid metadata piece, so PEX or
+			// other extension traffic is still ignored safely.
+			piece_error := metadata_handle_piece_locked(downloader, payload)
+			if piece_error == .None {
+				return .None
+			}
 		}
 		return .None
 	}
