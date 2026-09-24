@@ -97,6 +97,7 @@ Torrent_Session_Loop_Open :: proc(
 	output_directory: string,
 	peer_id: [20]byte,
 	port: u16,
+	verify_existing := true,
 ) -> Torrent_Loop_Error {
 	if loop == nil || torrent == nil {
 		return .Invalid_Loop
@@ -107,7 +108,7 @@ Torrent_Session_Loop_Open :: proc(
 	if len(torrent.Piece_Hashes) == 0 && torrent.Total_Length != 0 {
 		return .Invalid_Torrent
 	}
-	storage_error := Torrent_Storage_Open(&loop.Storage, torrent, output_directory)
+	storage_error := Torrent_Storage_Open(&loop.Storage, torrent, output_directory, verify_existing)
 	if storage_error != .None {
 		return .Storage
 	}

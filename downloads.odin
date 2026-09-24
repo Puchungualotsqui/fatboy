@@ -1398,12 +1398,18 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
         len(torrent.Files),
         torrent.Multi_File,
     )
+    // Do not synchronously hash the entire output directory here. A
+    // multi-file game can already contain tens of gigabytes, and that scan
+    // blocks the download worker before it can publish a progress state.
+    // Resume metadata still restores trusted completed pieces; missing pieces
+    // are verified as they are received by the scheduler/storage path.
     open_error := durrent.Torrent_Session_Loop_Open(
         &loop,
         &torrent,
         app.download_path,
         download_durrent_peer_id(),
         0,
+        false,
     )
     fmt.printf("[DOWNLOAD] Durrent session open entry=%d result=%v\n", entry_index, open_error)
     if open_error != .None {
