@@ -3,6 +3,7 @@ package durrent
 import "core:fmt"
 import "core:strings"
 import "core:sync"
+import "core:thread"
 import "core:time"
 
 Metadata_Resolver_Cancel_Token :: struct {
@@ -24,6 +25,9 @@ Metadata_Resolver_Options :: struct {
 	Routing_Cache_Path:   string,
 	Max_Candidates:       u32,
 	Cancel:                ^Metadata_Resolver_Cancel_Token,
+	// External_Cancel is retained when a batch uses its own cancellation token
+	// to stop sibling peer attempts after one worker obtains metadata.
+	External_Cancel:      ^Metadata_Resolver_Cancel_Token,
 }
 
 Metadata_Resolver_Error :: enum {
@@ -88,7 +92,13 @@ metadata_resolver_expired :: proc(deadline: time.Time) -> bool {
 
 
 metadata_resolver_cancelled :: proc(options: Metadata_Resolver_Options) -> bool {
-	return Metadata_Resolver_Is_Cancelled(options.Cancel)
+	if Metadata_Resolver_Is_Cancelled(options.Cancel) {
+		return true
+	}
+	if options.External_Cancel != options.Cancel {
+		return Metadata_Resolver_Is_Cancelled(options.External_Cancel)
+	}
+	return false
 }
 
 
@@ -290,6 +300,44 @@ metadata_resolver_cleanup_peer :: proc(
 }
 
 
+metadata_resolver_batch_job :: struct {
+	Candidate:  metadata_resolver_candidate,
+	Info_Hash:  Torrent_Hash,
+	Peer_ID:    [20]byte,
+	Options:    Metadata_Resolver_Options,
+	Deadline:   time.Time,
+	Metadata:   []byte,
+	Error:      Metadata_Resolver_Error,
+}
+
+
+metadata_resolver_batch_execute :: proc(job: ^metadata_resolver_batch_job) {
+	if job == nil {
+		return
+	}
+	job.Metadata, job.Error = metadata_resolver_try_peer(
+		job.Candidate,
+		job.Info_Hash,
+		job.Peer_ID,
+		job.Options,
+		job.Deadline,
+		nil,
+		0,
+	)
+	if job.Error == .None {
+		// Stop sibling workers as soon as one peer has supplied valid metadata.
+		Metadata_Resolver_Cancel(job.Options.Cancel)
+	}
+}
+
+
+metadata_resolver_batch_worker :: proc(data: rawptr) {
+	job := cast(^metadata_resolver_batch_job)data
+	metadata_resolver_batch_execute(job)
+}
+
+
+
 metadata_resolver_bootstrap_from_candidates :: proc(
 	candidates: []metadata_resolver_candidate,
 	bootstrap: ^[dynamic]DHT_Node,
@@ -384,6 +432,19 @@ metadata_resolver_try_peer :: proc(
 			event, event_ok := Peer_Session_Next_Event(&session)
 			if !event_ok {
 				break
+			}
+			if event.Kind == .Handshake {
+				fmt.printf(
+					"[DURRENT-META] Handshake received peer=%s remote_extensions=%v\n",
+					candidate.Address,
+					session.Remote_Extensions,
+				)
+			} else if event.Kind == .Extended {
+				fmt.printf(
+					"[DURRENT-META] Extended message received peer=%s bytes=%d\n",
+					candidate.Address,
+					len(event.Payload),
+				)
 			}
 			event_error := Metadata_Downloader_Handle_Event(
 				&downloader,
@@ -607,34 +668,88 @@ Resolve_Magnet_Metadata :: proc(
 
 		candidate_index := 0
 		max_candidates := candidate_limit
+		batch_limit := int(peer_limit)
 		for candidate_index < len(candidates) {
-			if candidates[candidate_index].Attempted {
-				candidate_index += 1
-				continue
-			}
-			candidates[candidate_index].Attempted = true
-			candidate := candidates[candidate_index]
-			candidate_index += 1
 			if metadata_resolver_cancelled(options) {
 				return nil, .Cancelled
 			}
 			if metadata_resolver_expired(deadline) {
 				return nil, .Timed_Out
 			}
-				metadata, peer_error := metadata_resolver_try_peer(
-				candidate,
-				magnet.Info_Hash,
-				peer_id,
-				options,
-				deadline,
-				&candidates,
-				max_candidates,
-			)
-			if peer_error == .None {
+
+			batch_cancel: Metadata_Resolver_Cancel_Token
+			jobs: [dynamic]^metadata_resolver_batch_job
+			workers: [dynamic]^thread.Thread
+			spawned := 0
+			for candidate_index < len(candidates) && spawned < batch_limit {
+				if candidates[candidate_index].Attempted {
+					candidate_index += 1
+					continue
+				}
+
+				candidates[candidate_index].Attempted = true
+				job := new(metadata_resolver_batch_job, context.allocator)
+				job.Candidate = candidates[candidate_index]
+				job.Info_Hash = magnet.Info_Hash
+				job.Peer_ID = peer_id
+				job.Options = options
+				job.Options.Cancel = &batch_cancel
+				job.Options.External_Cancel = options.Cancel
+				// PEX is optional and is intentionally excluded from concurrent
+				// metadata probes. It would require synchronizing candidate storage,
+				// while trackers and DHT already provide the initial peer set.
+				job.Options.Enable_PEX = false
+				job.Deadline = deadline
+				job.Error = .No_Peers
+				append(&jobs, job)
+				candidate_index += 1
+				spawned += 1
+
+				worker := thread.create_and_start_with_data(
+					job,
+					metadata_resolver_batch_worker,
+					nil,
+					.Normal,
+					false,
+				)
+				if worker != nil {
+					append(&workers, worker)
+				} else {
+					// Thread creation is unusual to fail, but preserve a functional
+					// fallback rather than silently discarding this candidate.
+					metadata_resolver_batch_execute(job)
+				}
+			}
+
+			fmt.printf("[DURRENT-META] Peer batch started size=%d\n", len(jobs))
+			for worker in workers {
+				if worker != nil {
+					thread.destroy(worker)
+				}
+			}
+			delete(workers)
+
+			metadata: []byte
+			for job in jobs {
+				if job != nil && job.Error == .None {
+					metadata = job.Metadata
+					job.Metadata = nil
+					break
+				}
+			}
+			batch_cancelled := Metadata_Resolver_Is_Cancelled(&batch_cancel)
+			for job in jobs {
+				if job != nil {
+					delete(job.Metadata)
+					free(job)
+				}
+			}
+			delete(jobs)
+			if metadata != nil {
 				return metadata, .None
 			}
-			if peer_error == .Cancelled {
-				return nil, peer_error
+			if Metadata_Resolver_Is_Cancelled(options.Cancel) && !batch_cancelled {
+				return nil, .Cancelled
 			}
 		}
 		metadata_resolver_prune_attempted(&candidates)
