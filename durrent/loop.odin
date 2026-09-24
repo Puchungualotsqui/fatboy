@@ -52,8 +52,12 @@ Torrent_Loop_Peer :: struct {
 	PEX_Handshake_Sent:   bool,
 	PEX_Last_Sent:        time.Time,
 	Interested_At:        time.Time,
+	Unchoked_At:          time.Time,
+	Last_Activity:        time.Time,
 	Last_Choke_Log:       time.Time,
 	Dial_Started:         time.Time,
+	Downloaded_Bytes:     u64,
+	Quality_Score:        i64,
 }
 
 Torrent_Session_Loop :: struct {
@@ -93,6 +97,7 @@ Torrent_Session_Loop :: struct {
 	DHT_Bootstrap:           [dynamic]DHT_Node,
 	DHT_Result:              DHT_Lookup_Result,
 	DHT_Result_Ready:        bool,
+	Next_DHT_Lookup:         time.Time,
 	Pending_Peers:           [dynamic]PEX_Peer,
 }
 
@@ -314,13 +319,15 @@ Torrent_Session_Loop_Tick :: proc(loop: ^Torrent_Session_Loop, now: time.Time) -
 		thread.destroy(finished_dht)
 	}
 	sync.mutex_lock(&loop.Mutex)
-	if loop.DHT_Enabled && loop.DHT_Worker == nil && !loop.Stop_Requested {
+	if loop.DHT_Enabled && loop.DHT_Worker == nil && !loop.Stop_Requested &&
+	   time.diff(loop.Next_DHT_Lookup, now) >= 0 {
 		dht_worker := thread.create(torrent_session_loop_dht_worker)
 		if dht_worker != nil {
 			dht_worker.data = loop
 			loop.DHT_Worker = dht_worker
 			loop.DHT_Worker_Started = true
 			loop.DHT_Stop_Requested = false
+			loop.Next_DHT_Lookup = time.time_add(now, loop_dht_refresh_interval_locked(loop))
 			thread.start(dht_worker)
 		}
 	}
@@ -615,6 +622,33 @@ loop_add_incoming_peer_locked :: proc(loop: ^Torrent_Session_Loop, socket: net.T
 	append(&loop.Peers, peer)
 }
 
+// DHT is useful for finding replacements, but repeatedly querying it while we
+// already have several upload-capable peers wastes network traffic and floods
+// the loop with duplicate candidates.
+loop_dht_refresh_interval_locked :: proc(loop: ^Torrent_Session_Loop) -> time.Duration {
+	if loop == nil {
+		return 30 * time.Second
+	}
+	ready: u32
+	unchoked: u32
+	for peer in loop.Peers {
+		if peer.Session.State != .Ready {
+			continue
+		}
+		ready += 1
+		if !peer.Session.Remote_Choking {
+			unchoked += 1
+		}
+	}
+	if unchoked >= 4 {
+		return 2 * time.Minute
+	}
+	if ready >= 8 {
+		return time.Minute
+	}
+	return 15 * time.Second
+}
+
 torrent_session_loop_dht_worker :: proc(thread_value: ^thread.Thread) {
 	context = runtime.default_context()
 	if thread_value == nil {
@@ -896,6 +930,8 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 				continue
 			}
 			peer.Registered = true
+			peer.Last_Activity = time.now()
+			peer.Quality_Score = 10
 			fmt.printf(
 				"[DURRENT-PEER] ready address=%s extensions=%v\n",
 				peer.Address,
@@ -951,6 +987,18 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 			)
 			peer.Last_Choke_Log = time.now()
 		}
+		if peer.Registered && peer.Session.State == .Ready && peer.Session.Remote_Choking &&
+		   time.diff(peer.Interested_At, time.now()) >= 90*time.Second {
+			fmt.printf("[DURRENT-PEER] dropping long-choked peer address=%s score=%d waited=%v\n", peer.Address, peer.Quality_Score, time.diff(peer.Interested_At, time.now()))
+			loop_remove_peer_locked(loop, index)
+			continue
+		}
+		if peer.Registered && peer.Session.State == .Ready && !peer.Session.Remote_Choking &&
+		   peer.Downloaded_Bytes == 0 && time.diff(peer.Unchoked_At, time.now()) >= 45*time.Second {
+			fmt.printf("[DURRENT-PEER] dropping idle unchoked peer address=%s score=%d waited=%v\n", peer.Address, peer.Quality_Score, time.diff(peer.Unchoked_At, time.now()))
+			loop_remove_peer_locked(loop, index)
+			continue
+		}
 		index += 1
 	}
 }
@@ -961,8 +1009,10 @@ loop_process_peer_events_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torr
 		if !found {
 			return
 		}
+		peer.Last_Activity = time.now()
 		switch event.Kind {
 		case .Handshake:
+			peer.Quality_Score += 10
 			fmt.printf(
 				"[DURRENT-PEER] handshake address=%s remote_peer_id=%q extensions=%v\n",
 				peer.Address,
@@ -973,10 +1023,12 @@ loop_process_peer_events_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torr
 			bitfield, bitfield_error := Bitfield_From_Raw(event.Payload, loop.Scheduler.Piece_Count)
 			if bitfield_error == .None {
 				_ = Piece_Scheduler_Update_Peer_Bitfield(&loop.Scheduler, peer.ID, &bitfield)
+				piece_count := Bitfield_Count(&bitfield)
+				peer.Quality_Score += i64(piece_count / 256)
 				fmt.printf(
 					"[DURRENT-PEER] bitfield address=%s pieces=%d/%d\n",
 					peer.Address,
-					Bitfield_Count(&bitfield),
+					piece_count,
 					loop.Scheduler.Piece_Count,
 				)
 			}
@@ -989,6 +1041,7 @@ loop_process_peer_events_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torr
 				peer.Address,
 				time.diff(peer.Interested_At, time.now()),
 			)
+			peer.Quality_Score -= 5
 			_ = Piece_Scheduler_Set_Peer_Choked(&loop.Scheduler, peer.ID, true)
 		case .Unchoke:
 			fmt.printf(
@@ -996,10 +1049,14 @@ loop_process_peer_events_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torr
 				peer.Address,
 				time.diff(peer.Interested_At, time.now()),
 			)
+			peer.Unchoked_At = time.now()
+			peer.Quality_Score += 20
 			_ = Piece_Scheduler_Set_Peer_Choked(&loop.Scheduler, peer.ID, false)
 		case .Piece:
 			write_error := Torrent_Storage_Write_Block(&loop.Storage, event.Index, event.Begin, event.Payload)
 			if write_error == .None {
+				peer.Downloaded_Bytes += u64(len(event.Payload))
+				peer.Quality_Score += i64(len(event.Payload) / 1024)
 				loop.Bytes_Downloaded += u64(len(event.Payload))
 				block_error := Piece_Scheduler_Complete_Block(&loop.Scheduler, event.Index, event.Begin)
 				if block_error == .None && Piece_Scheduler_Is_Piece_Ready(&loop.Scheduler, event.Index) {
