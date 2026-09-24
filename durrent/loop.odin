@@ -1,6 +1,7 @@
 package durrent
 
 
+import "core:fmt"
 import "core:net"
 import "core:sync"
 import "core:thread"
@@ -231,8 +232,22 @@ Torrent_Session_Loop_Tick :: proc(loop: ^Torrent_Session_Loop, now: time.Time) -
 			Destroy_Tracker_Response(&response)
 			return .Tracker
 		}
-		if tracker_error == .None && !loop.Stop_Requested {
-			loop_add_tracker_peers_locked(loop, &response)
+		if tracker_error == .None {
+			fmt.printf(
+				"[DURRENT-TRACKER] announce success peers=%d peers6=%d interval=%d\n",
+				len(response.Peers),
+				len(response.Peers6),
+				response.Interval,
+			)
+			if !loop.Stop_Requested {
+				loop_add_tracker_peers_locked(loop, &response)
+			}
+		} else if tracker_error != .No_Trackers {
+			fmt.printf(
+				"[DURRENT-TRACKER] announce failed error=%v failures=%d\n",
+				tracker_error,
+				Tracker_Manager_Failure_Count(&loop.Tracker),
+			)
 		}
 		Destroy_Tracker_Response(&response)
 	}
@@ -675,6 +690,7 @@ loop_consume_dht_result_locked :: proc(loop: ^Torrent_Session_Loop) {
 	if loop == nil || !loop.DHT_Result_Ready {
 		return
 	}
+	peer_count := len(loop.DHT_Result.Peers)
 	for endpoint in loop.DHT_Result.Peers {
 		peer: PEX_Peer
 		peer.IP = endpoint.IP
@@ -682,6 +698,9 @@ loop_consume_dht_result_locked :: proc(loop: ^Torrent_Session_Loop) {
 		peer.IPv6 = endpoint.IPv6
 		address := PEX_Peer_Address(peer)
 		loop_add_peer_address_locked(loop, address, peer)
+	}
+	if peer_count > 0 {
+		fmt.printf("[DURRENT-DHT] session peer candidates=%d pending=%d\n", peer_count, len(loop.Pending_Peers))
 	}
 	Destroy_DHT_Lookup_Result(&loop.DHT_Result)
 	loop.DHT_Result_Ready = false
@@ -717,11 +736,14 @@ loop_connect_pending_peers :: proc(loop: ^Torrent_Session_Loop, maximum: int) {
 	if loop == nil || maximum <= 0 {
 		return
 	}
+	attempted: u32
+	connected: u32
+	failed: u32
 	for attempt := 0; attempt < maximum; attempt += 1 {
 		sync.mutex_lock(&loop.Mutex)
 		if loop.Stop_Requested || len(loop.Pending_Peers) == 0 || len(loop.Peers) >= int(loop.Peer_Limit) {
 			sync.mutex_unlock(&loop.Mutex)
-			return
+			break
 		}
 		endpoint := loop.Pending_Peers[0]
 		copy(loop.Pending_Peers[:], loop.Pending_Peers[1:])
@@ -740,17 +762,20 @@ loop_connect_pending_peers :: proc(loop: ^Torrent_Session_Loop, maximum: int) {
 		peer.ID = peer_id
 		peer.Endpoint = endpoint
 		peer.Address = PEX_Peer_Address(endpoint)
+		attempted += 1
 		peer_error := Peer_Session_Init(&peer.Session, info_hash, local_peer_id, piece_count, piece_length, total_length)
 		if peer_error == .None {
 			peer_error = Peer_Session_Connect(&peer.Session, peer.Address, connect_timeout)
 		}
 		if peer_error != .None {
+			failed += 1
 			Destroy_Peer_Session(&peer.Session)
 			delete(peer.Address)
 			free(peer)
 			continue
 		}
 
+		connected += 1
 		sync.mutex_lock(&loop.Mutex)
 		if loop.Stop_Requested || len(loop.Peers) >= int(loop.Peer_Limit) || loop_has_peer_address(loop, peer.Address) {
 			sync.mutex_unlock(&loop.Mutex)
@@ -762,6 +787,20 @@ loop_connect_pending_peers :: proc(loop: ^Torrent_Session_Loop, maximum: int) {
 		append(&loop.Peers, peer)
 		sync.mutex_unlock(&loop.Mutex)
 	}
+	if attempted > 0 {
+		sync.mutex_lock(&loop.Mutex)
+		pending := len(loop.Pending_Peers)
+		active := len(loop.Peers)
+		sync.mutex_unlock(&loop.Mutex)
+		fmt.printf(
+			"[DURRENT-PEER] dial summary attempted=%d connected=%d failed=%d active=%d pending=%d\n",
+			attempted,
+			connected,
+			failed,
+			active,
+			pending,
+		)
+	}
 }
 
 loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
@@ -770,6 +809,13 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 		peer := loop.Peers[index]
 		poll_error := Peer_Session_Poll(&peer.Session)
 		if poll_error != .None && poll_error != .Timeout {
+			fmt.printf(
+				"[DURRENT-PEER] poll failed address=%s error=%v state=%v session_error=%v\n",
+				peer.Address,
+				poll_error,
+				peer.Session.State,
+				peer.Session.Error,
+			)
 			loop_remove_peer_locked(loop, index)
 			continue
 		}
@@ -779,6 +825,11 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 				continue
 			}
 			peer.Registered = true
+			fmt.printf(
+				"[DURRENT-PEER] ready address=%s extensions=%v\n",
+				peer.Address,
+				peer.Session.Remote_Extensions,
+			)
 			// A peer starts us choked. BitTorrent peers normally unchoke only
 			// after receiving this message; without it the scheduler can never
 			// send requests, even when the handshake and bitfield succeeded.
@@ -814,26 +865,64 @@ loop_process_peer_events_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torr
 			return
 		}
 		switch event.Kind {
+		case .Handshake:
+			fmt.printf("[DURRENT-PEER] handshake address=%s\n", peer.Address)
 		case .Bitfield:
 			bitfield, bitfield_error := Bitfield_From_Raw(event.Payload, loop.Scheduler.Piece_Count)
 			if bitfield_error == .None {
 				_ = Piece_Scheduler_Update_Peer_Bitfield(&loop.Scheduler, peer.ID, &bitfield)
+				fmt.printf(
+					"[DURRENT-PEER] bitfield address=%s pieces=%d/%d\n",
+					peer.Address,
+					Bitfield_Count(&bitfield),
+					loop.Scheduler.Piece_Count,
+				)
 			}
 			Destroy_Bitfield(&bitfield)
 		case .Have:
 			_ = Piece_Scheduler_Peer_Have(&loop.Scheduler, peer.ID, event.Index)
 		case .Choke:
+			fmt.printf("[DURRENT-PEER] choke address=%s\n", peer.Address)
 			_ = Piece_Scheduler_Set_Peer_Choked(&loop.Scheduler, peer.ID, true)
 		case .Unchoke:
+			fmt.printf("[DURRENT-PEER] unchoke address=%s\n", peer.Address)
 			_ = Piece_Scheduler_Set_Peer_Choked(&loop.Scheduler, peer.ID, false)
 		case .Piece:
-			if Torrent_Storage_Write_Block(&loop.Storage, event.Index, event.Begin, event.Payload) == .None {
+			write_error := Torrent_Storage_Write_Block(&loop.Storage, event.Index, event.Begin, event.Payload)
+			if write_error == .None {
 				loop.Bytes_Downloaded += u64(len(event.Payload))
-				_ = Piece_Scheduler_Complete_Block(&loop.Scheduler, event.Index, event.Begin)
-				valid, _ := Torrent_Storage_Verify_Piece(&loop.Storage, event.Index)
-				if valid {
-					_ = Piece_Scheduler_Complete_Piece(&loop.Scheduler, event.Index)
+				block_error := Piece_Scheduler_Complete_Block(&loop.Scheduler, event.Index, event.Begin)
+				if block_error == .None && Piece_Scheduler_Is_Piece_Ready(&loop.Scheduler, event.Index) {
+					valid, verify_error := Torrent_Storage_Verify_Piece(&loop.Storage, event.Index)
+					if valid {
+						_ = Piece_Scheduler_Complete_Piece(&loop.Scheduler, event.Index)
+					} else {
+						fmt.printf(
+							"[DURRENT-PIECE] verification failed address=%s index=%d error=%v; retrying\n",
+							peer.Address,
+							event.Index,
+							verify_error,
+						)
+						_ = Piece_Scheduler_Reset_Piece(&loop.Scheduler, event.Index)
+					}
+				} else if block_error != .None {
+					fmt.printf(
+						"[DURRENT-PIECE] scheduler rejected block address=%s index=%d begin=%d error=%v\n",
+						peer.Address,
+						event.Index,
+						event.Begin,
+						block_error,
+					)
 				}
+			} else {
+				fmt.printf(
+					"[DURRENT-PIECE] write failed address=%s index=%d begin=%d bytes=%d error=%v\n",
+					peer.Address,
+					event.Index,
+					event.Begin,
+					len(event.Payload),
+					write_error,
+				)
 			}
 		case .Request:
 			if !peer.Session.Local_Choking {
@@ -847,7 +936,7 @@ loop_process_peer_events_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torr
 			}
 		case .Extended:
 			loop_process_pex_event_locked(loop, peer, event.Payload)
-		case .Handshake, .Keep_Alive, .Interested, .Not_Interested, .Cancel, .Port:
+		case .Keep_Alive, .Interested, .Not_Interested, .Cancel, .Port:
 			{}
 		}
 		Destroy_Peer_Event(&event)
@@ -907,15 +996,20 @@ loop_queue_pex_snapshot_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torre
 }
 
 loop_queue_peer_requests_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torrent_Loop_Peer) {
+	queued: u32
 	for {
 		request, found, request_error := Piece_Scheduler_Next_Request(&loop.Scheduler, peer.ID, time.now())
 		if !found || request_error != .None {
-			return
+			break
 		}
 		if Peer_Session_Queue_Request(&peer.Session, request.Index, request.Begin, request.Length) != .None {
 			_ = Piece_Scheduler_Drop_Request(&loop.Scheduler, peer.ID, request.Index, request.Begin)
-			return
+			break
 		}
+		queued += 1
+	}
+	if queued > 0 {
+		fmt.printf("[DURRENT-PEER] requests queued address=%s count=%d\n", peer.Address, queued)
 	}
 }
 

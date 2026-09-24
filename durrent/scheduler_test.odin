@@ -60,6 +60,9 @@ piece_scheduler_rarest_first_and_pipeline_test :: proc(t: ^testing.T) {
 	testing.expect_value(t, request.Begin, u32(0))
 
 	testing.expect_value(t, Piece_Scheduler_Complete_Block(&scheduler, 0, 0), Piece_Scheduler_Error.None)
+	testing.expect(t, Piece_Scheduler_Is_Piece_Ready(&scheduler, 0))
+	testing.expect_value(t, Piece_Scheduler_Reset_Piece(&scheduler, 0), Piece_Scheduler_Error.None)
+	testing.expect(t, !Piece_Scheduler_Is_Piece_Ready(&scheduler, 0))
 	request_count, request_count_ok := Piece_Scheduler_Peer_Request_Count(&scheduler, 10)
 	testing.expect(t, request_count_ok)
 	testing.expect_value(t, request_count, u32(0))

@@ -379,6 +379,37 @@ Piece_Scheduler_Complete_Block :: proc(scheduler: ^Piece_Scheduler, index, begin
 	return .None
 }
 
+Piece_Scheduler_Is_Piece_Ready :: proc(scheduler: ^Piece_Scheduler, index: u32) -> bool {
+	if scheduler == nil {
+		return false
+	}
+	sync.mutex_lock(&scheduler.Mutex)
+	defer sync.mutex_unlock(&scheduler.Mutex)
+	return piece_scheduler_all_blocks_received_locked(scheduler, index)
+}
+
+Piece_Scheduler_Reset_Piece :: proc(scheduler: ^Piece_Scheduler, index: u32) -> Piece_Scheduler_Error {
+	if scheduler == nil {
+		return .Invalid_Scheduler
+	}
+	sync.mutex_lock(&scheduler.Mutex)
+	defer sync.mutex_unlock(&scheduler.Mutex)
+	if index >= scheduler.Piece_Count {
+		return .Invalid_Piece
+	}
+	Bitfield_Clear_Piece(&scheduler.Completed, index)
+	if index < u32(len(scheduler.Block_Received)) {
+		for &value in scheduler.Block_Received[index] {
+			value = 0
+		}
+	}
+	for &peer in scheduler.Peers {
+		piece_scheduler_remove_piece_requests_locked(&peer, index)
+	}
+	scheduler.Seeding = false
+	return .None
+}
+
 Piece_Scheduler_Complete_Piece :: proc(scheduler: ^Piece_Scheduler, index: u32) -> Piece_Scheduler_Error {
 	if scheduler == nil {
 		return .Invalid_Scheduler
@@ -489,6 +520,23 @@ piece_scheduler_block_received :: proc(scheduler: ^Piece_Scheduler, index, begin
 		return false
 	}
 	return piece_bitmap_has(scheduler.Block_Received[index], begin/Block_Size)
+}
+
+piece_scheduler_all_blocks_received_locked :: proc(scheduler: ^Piece_Scheduler, index: u32) -> bool {
+	if scheduler == nil || index >= scheduler.Piece_Count || index >= u32(len(scheduler.Block_Received)) {
+		return false
+	}
+	length := Piece_Length(index, scheduler.Piece_Length, scheduler.Total_Length)
+	if length == 0 {
+		return false
+	}
+	block_count := u32((u64(length)+u64(Block_Size)-1)/u64(Block_Size))
+	for block: u32 = 0; block < block_count; block += 1 {
+		if !piece_bitmap_has(scheduler.Block_Received[index], block) {
+			return false
+		}
+	}
+	return true
 }
 
 piece_scheduler_mark_block_received_locked :: proc(scheduler: ^Piece_Scheduler, index, begin: u32) {
