@@ -218,24 +218,49 @@ Torrent_Session_Loop_Tick :: proc(loop: ^Torrent_Session_Loop, now: time.Time) -
 		loop.State = .Failed
 		return .Scheduler
 	}
-	if Tracker_Manager_Announce_Due(&loop.Tracker, now) {
+	announce_due := Tracker_Manager_Announce_Due(&loop.Tracker, now)
+	if announce_due {
+		// Tracker HTTP/UDP operations can block for several seconds. Release
+		// the loop mutex so UI snapshots and lifecycle controls remain usable.
+		sync.mutex_unlock(&loop.Mutex)
 		response, tracker_error := Tracker_Manager_Announce(&loop.Tracker, now)
+		sync.mutex_lock(&loop.Mutex)
 		if tracker_error == .Out_Of_Memory {
 			loop.Error = .Tracker
 			loop.State = .Failed
 			Destroy_Tracker_Response(&response)
 			return .Tracker
 		}
-		if tracker_error == .None {
+		if tracker_error == .None && !loop.Stop_Requested {
 			loop_add_tracker_peers_locked(loop, &response)
 		}
 		Destroy_Tracker_Response(&response)
 	}
 	loop_accept_peers_locked(loop)
 	loop_consume_dht_result_locked(loop)
-	// Peer TCP dials can wait for seconds. Do not hold the loop mutex while
-	// contacting DHT/tracker candidates, otherwise UI snapshots and pause/
-	// cancel operations appear frozen.
+	finished_dht: ^thread.Thread
+	if loop.DHT_Worker != nil && !loop.DHT_Worker_Started && thread.is_done(loop.DHT_Worker) {
+		finished_dht = loop.DHT_Worker
+		loop.DHT_Worker = nil
+	}
+	// Peer TCP dials and thread joining can wait for seconds. Do not hold the
+	// loop mutex while contacting candidates or restarting the DHT worker,
+	// otherwise UI snapshots and pause/cancel operations appear frozen.
+	sync.mutex_unlock(&loop.Mutex)
+	if finished_dht != nil {
+		thread.destroy(finished_dht)
+	}
+	sync.mutex_lock(&loop.Mutex)
+	if loop.DHT_Enabled && loop.DHT_Worker == nil && !loop.Stop_Requested {
+		dht_worker := thread.create(torrent_session_loop_dht_worker)
+		if dht_worker != nil {
+			dht_worker.data = loop
+			loop.DHT_Worker = dht_worker
+			loop.DHT_Worker_Started = true
+			loop.DHT_Stop_Requested = false
+			thread.start(dht_worker)
+		}
+	}
 	sync.mutex_unlock(&loop.Mutex)
 	loop_connect_pending_peers(loop, 4)
 	sync.mutex_lock(&loop.Mutex)
@@ -545,6 +570,9 @@ torrent_session_loop_dht_worker :: proc(thread_value: ^thread.Thread) {
 	sync.mutex_unlock(&loop.Mutex)
 	if stop {
 		delete(bootstrap)
+		sync.mutex_lock(&loop.Mutex)
+		loop.DHT_Worker_Started = false
+		sync.mutex_unlock(&loop.Mutex)
 		return
 	}
 	options := DHT_Default_Network_Options()
@@ -557,6 +585,7 @@ torrent_session_loop_dht_worker :: proc(thread_value: ^thread.Thread) {
 	}
 	sync.mutex_lock(&loop.Mutex)
 	if loop.DHT_Stop_Requested {
+		loop.DHT_Worker_Started = false
 		sync.mutex_unlock(&loop.Mutex)
 		Destroy_DHT_Lookup_Result(&result)
 		return
@@ -564,6 +593,7 @@ torrent_session_loop_dht_worker :: proc(thread_value: ^thread.Thread) {
 	Destroy_DHT_Lookup_Result(&loop.DHT_Result)
 	loop.DHT_Result = result
 	loop.DHT_Result_Ready = lookup_error == .None
+	loop.DHT_Worker_Started = false
 	sync.mutex_unlock(&loop.Mutex)
 }
 

@@ -1069,19 +1069,40 @@ download_attach_magnet_trackers :: proc(torrent: ^durrent.Torrent, magnet_uri: s
         return
     }
     defer durrent.Destroy_Magnet_Link(&magnet)
-    if len(magnet.Trackers) == 0 {
-        return
+
+    tracker_urls := magnet.Trackers
+    fallback_trackers: [4]string
+    if len(tracker_urls) == 0 {
+        fallback_trackers = [4]string{
+            "udp://tracker.opentrackr.org:1337/announce",
+            "udp://open.stealth.si:80/announce",
+            "udp://tracker.torrent.eu.org:451/announce",
+            "http://tracker.openbittorrent.com:80/announce",
+        }
     }
 
-    for tracker_url in magnet.Trackers {
-        copied_url := strings.clone(string(tracker_url), context.allocator)
-        tier: durrent.Torrent_Tracker_Tier
-        append(&tier.URLs, transmute([]byte)copied_url)
-        append(&torrent.Announce_List, tier)
-        copied_url = ""
-    }
-    if len(torrent.Announce) == 0 {
-        copied_announce := strings.clone(string(magnet.Trackers[0]), context.allocator)
+    if len(tracker_urls) > 0 {
+        for tracker_url in tracker_urls {
+            copied_url := strings.clone(string(tracker_url), context.allocator)
+            tier: durrent.Torrent_Tracker_Tier
+            append(&tier.URLs, transmute([]byte)copied_url)
+            append(&torrent.Announce_List, tier)
+            copied_url = ""
+        }
+        if len(torrent.Announce) == 0 {
+            copied_announce := strings.clone(string(tracker_urls[0]), context.allocator)
+            torrent.Announce = transmute([]byte)copied_announce
+            copied_announce = ""
+        }
+    } else {
+        for tracker_url in fallback_trackers {
+            copied_url := strings.clone(tracker_url, context.allocator)
+            tier: durrent.Torrent_Tracker_Tier
+            append(&tier.URLs, transmute([]byte)copied_url)
+            append(&torrent.Announce_List, tier)
+            copied_url = ""
+        }
+        copied_announce := strings.clone(fallback_trackers[0], context.allocator)
         torrent.Announce = transmute([]byte)copied_announce
         copied_announce = ""
     }
