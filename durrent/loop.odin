@@ -855,13 +855,18 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 				continue
 			}
 		}
+		// BEP 10 requires the extension handshake to be the first extended
+		// message. Send it as soon as both wire handshakes are complete, rather
+		// than waiting for the peer to unchoke us.
+		pex_handshake_queued := false
 		if loop.PEX_Enabled && peer.Session.State == .Ready &&
-		   !peer.Session.Remote_Choking && !peer.PEX_Handshake_Sent {
+		   peer.Session.Remote_Extensions && !peer.PEX_Handshake_Sent {
 			payload := PEX_Encode_Extension_Handshake()
 			pex_error := Peer_Session_Queue_Extended(&peer.Session, 0, payload)
 			fmt.printf("[DURRENT-PEER] pex handshake address=%s result=%v\n", peer.Address, pex_error)
 			if pex_error == .None {
 				peer.PEX_Handshake_Sent = true
+				pex_handshake_queued = true
 			}
 			delete(payload)
 		}
@@ -871,7 +876,10 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 			loop_remove_peer_locked(loop, index)
 			continue
 		}
-		if peer.Registered {
+		// Flush extension negotiation before queuing piece requests. Besides
+		// satisfying BEP 10 ordering, this makes the first request batch easier
+		// to diagnose when a remote peer disconnects.
+		if peer.Registered && peer.Session.State == .Ready && !pex_handshake_queued {
 			loop_queue_peer_requests_locked(loop, peer)
 		}
 		index += 1
