@@ -143,9 +143,12 @@ Torrent_Session_Loop_Open :: proc(
 	loop.Info_Hash = torrent.Info_Hash
 	loop.Peer_ID = peer_id
 	loop.Port = listen_port
-	loop.Peer_Limit = 50
-	loop.Tick_Interval = 50 * time.Millisecond
-	loop.Peer_Connect_Timeout = 5 * time.Second
+	// Keep the foreground download worker responsive while dead DHT peers
+	// time out. Metadata resolution has its own larger peer budget; the
+	// steady-state torrent loop should maintain a small active set.
+	loop.Peer_Limit = 8
+	loop.Tick_Interval = 100 * time.Millisecond
+	loop.Peer_Connect_Timeout = time.Second
 	loop.Next_Peer_ID = 1
 	loop.Port = listen_port
 	loop.PEX_Enabled = Torrent_Allows_Peer_Exchange(torrent)

@@ -1430,6 +1430,7 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
     download_write_manifest(manager, entry_index, "local_downloading", "Downloading through Durrent.")
 
     completed := false
+    stats_log_at := time.time_add(time.now(), 2*time.Second)
     for {
         if download_should_cancel(manager, entry_index) {
             _ = durrent.Torrent_Session_Loop_Shutdown(&loop)
@@ -1470,6 +1471,26 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
             entry_index,
             stats.Download_Bytes_Per_Second,
         )
+        if time.diff(stats_log_at, time.now()) >= 0 {
+            fmt.printf(
+                "[DOWNLOAD] Durrent stats state=%v peers=%d connected=%d progress=%.1f%% bytes=%d/%d speed=%.1f KiB/s\n",
+                stats.State,
+                stats.Peer_Count,
+                stats.Connected_Peers,
+                fraction * 100,
+                completed_bytes,
+                total_bytes,
+                stats.Download_Bytes_Per_Second / 1024,
+            )
+            status := fmt.aprintf(
+                "Downloading through Durrent... peers=%d connected=%d",
+                stats.Peer_Count,
+                stats.Connected_Peers,
+            )
+            download_set_message(manager, entry_index, status)
+            delete(status)
+            stats_log_at = time.time_add(time.now(), 2*time.Second)
+        }
 
         if stats.State == .Failed {
             _ = durrent.Torrent_Session_Loop_Shutdown(&loop)
