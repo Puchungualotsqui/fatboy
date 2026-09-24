@@ -468,8 +468,7 @@ metadata_resolver_try_peer :: proc(
 					max_candidates,
 				)
 			}
-			Destroy_Peer_Event(&event)
-			if event.Kind == .Extended && downloader.Metadata_Size > 0 {
+			if event.Kind == .Extended && downloader.Metadata_Size > 0 && len(event.Payload) > 0 {
 				fmt.printf(
 					"[DURRENT-META] Metadata piece state peer=%s extension=%d remote_extension=%d received=%d/%d size=%d\n",
 					candidate.Address,
@@ -480,6 +479,7 @@ metadata_resolver_try_peer :: proc(
 					downloader.Metadata_Size,
 				)
 			}
+			Destroy_Peer_Event(&event)
 			if event_error != .None {
 				fmt.printf("[DURRENT-META] Metadata event failed address=%s error=%v\n", candidate.Address, event_error)
 				break

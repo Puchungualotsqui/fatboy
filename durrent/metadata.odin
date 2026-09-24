@@ -1,6 +1,7 @@
 package durrent
 
 import "core:crypto/hash"
+import "core:fmt"
 import "core:sync"
 
 Metadata_Piece_Size :: u32(16 * 1024)
@@ -117,6 +118,14 @@ Metadata_Downloader_Handle_Event :: proc(
 		return metadata_handle_handshake_locked(downloader, session, payload)
 	}
 	if extension_id != downloader.Remote_Extension_ID || downloader.Metadata_Size == 0 {
+		if downloader.Metadata_Size > 0 {
+			fmt.printf(
+				"[DURRENT-META] Ignoring extended message extension=%d expected=%d bytes=%d\n",
+				extension_id,
+				downloader.Remote_Extension_ID,
+				len(event.Payload),
+			)
+		}
 		return .None
 	}
 	return metadata_handle_piece_locked(downloader, payload)
