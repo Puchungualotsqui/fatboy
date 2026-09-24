@@ -97,9 +97,9 @@ Piece_Scheduler_Init :: proc(
 	scheduler.Block_Received = block_received
 	scheduler.Availability = availability
 	scheduler.Request_Timeout = request_timeout
-	// Keep up to 512 KiB in flight per peer (32 × 16 KiB blocks). A five
-	// block window stalls badly on ordinary public-internet round-trip times.
-	scheduler.Max_Requests_Per_Peer = 32
+	// The loop chooses a bounded per-peer target from measured throughput.
+	// This is the hard cap for unusually fast peers (96 × 16 KiB = 1.5 MiB).
+	scheduler.Max_Requests_Per_Peer = 96
 	scheduler.Endgame_Piece_Threshold = 2
 	scheduler.Seeding = piece_count == 0
 	return .None
@@ -290,6 +290,17 @@ Piece_Scheduler_Next_Request :: proc(
 	peer_id: u64,
 	now: time.Time,
 ) -> (Piece_Request, bool, Piece_Scheduler_Error) {
+	return Piece_Scheduler_Next_Request_With_Limit(scheduler, peer_id, now, 0)
+}
+
+// limit is a per-peer in-flight target selected by the session loop. A zero
+// limit uses the scheduler's global maximum.
+Piece_Scheduler_Next_Request_With_Limit :: proc(
+	scheduler: ^Piece_Scheduler,
+	peer_id: u64,
+	now: time.Time,
+	limit: u32,
+) -> (Piece_Request, bool, Piece_Scheduler_Error) {
 	if scheduler == nil {
 		return Piece_Request{}, false, .Invalid_Scheduler
 	}
@@ -302,7 +313,11 @@ Piece_Scheduler_Next_Request :: proc(
 	if peer.Choked {
 		return Piece_Request{}, false, .Choked
 	}
-	if u32(len(peer.In_Flight)) >= scheduler.Max_Requests_Per_Peer {
+	request_limit := scheduler.Max_Requests_Per_Peer
+	if limit > 0 && limit < request_limit {
+		request_limit = limit
+	}
+	if u32(len(peer.In_Flight)) >= request_limit {
 		return Piece_Request{}, false, .No_Request
 	}
 	endgame := piece_scheduler_endgame_locked(scheduler)

@@ -57,6 +57,10 @@ Torrent_Loop_Peer :: struct {
 	Last_Choke_Log:       time.Time,
 	Dial_Started:         time.Time,
 	Downloaded_Bytes:     u64,
+	Rate_Window_Bytes:    u64,
+	Rate_Window_Started:  time.Time,
+	Recent_Rate:          f64,
+	Last_Block_At:        time.Time,
 	Quality_Score:        i64,
 }
 
@@ -1185,14 +1189,15 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 			peer.Last_Choke_Log = time.now()
 		}
 		if peer.Registered && peer.Session.State == .Ready && peer.Session.Remote_Choking &&
-		   time.diff(peer.Interested_At, time.now()) >= 90*time.Second {
+		   time.diff(peer.Interested_At, time.now()) >= 45*time.Second {
 			fmt.printf("[DURRENT-PEER] dropping long-choked peer address=%s score=%d waited=%v\n", peer.Address, peer.Quality_Score, time.diff(peer.Interested_At, time.now()))
 			loop_remove_peer_locked(loop, index)
 			continue
 		}
 		if peer.Registered && peer.Session.State == .Ready && !peer.Session.Remote_Choking &&
-		   peer.Downloaded_Bytes == 0 && time.diff(peer.Unchoked_At, time.now()) >= 45*time.Second {
-			fmt.printf("[DURRENT-PEER] dropping idle unchoked peer address=%s score=%d waited=%v\n", peer.Address, peer.Quality_Score, time.diff(peer.Unchoked_At, time.now()))
+		   time.diff(peer.Unchoked_At, time.now()) >= 30*time.Second &&
+		   (peer.Downloaded_Bytes == 0 || time.diff(peer.Last_Block_At, time.now()) >= 30*time.Second) {
+			fmt.printf("[DURRENT-PEER] dropping idle unchoked peer address=%s rate=%.1f KiB/s waited=%v\n", peer.Address, peer.Recent_Rate/1024, time.diff(peer.Unchoked_At, time.now()))
 			loop_remove_peer_locked(loop, index)
 			continue
 		}
@@ -1252,7 +1257,19 @@ loop_process_peer_events_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torr
 		case .Piece:
 			write_error := Torrent_Storage_Write_Block(&loop.Storage, event.Index, event.Begin, event.Payload)
 			if write_error == .None {
+				now := time.now()
 				peer.Downloaded_Bytes += u64(len(event.Payload))
+				if peer.Rate_Window_Bytes == 0 {
+					peer.Rate_Window_Started = now
+				}
+				peer.Rate_Window_Bytes += u64(len(event.Payload))
+				elapsed := time.diff(peer.Rate_Window_Started, now)
+				if elapsed >= time.Second {
+					peer.Recent_Rate = f64(peer.Rate_Window_Bytes) / time.duration_seconds(elapsed)
+					peer.Rate_Window_Bytes = 0
+					peer.Rate_Window_Started = now
+				}
+				peer.Last_Block_At = now
 				peer.Quality_Score += i64(len(event.Payload) / 1024)
 				loop.Bytes_Downloaded += u64(len(event.Payload))
 				block_error := Piece_Scheduler_Complete_Block(&loop.Scheduler, event.Index, event.Begin)
@@ -1387,10 +1404,29 @@ loop_queue_pex_snapshot_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torre
 	delete(added)
 }
 
+// Fast peers get enough in-flight data to cover their bandwidth-delay product;
+// new and slow peers stay cheap until they prove useful.
+loop_peer_request_target :: proc(peer: ^Torrent_Loop_Peer) -> u32 {
+	if peer == nil || peer.Downloaded_Bytes == 0 {
+		return 16
+	}
+	if peer.Recent_Rate >= 2*1024*1024 {
+		return 96
+	}
+	if peer.Recent_Rate >= 512*1024 {
+		return 64
+	}
+	if peer.Recent_Rate >= 128*1024 {
+		return 32
+	}
+	return 8
+}
+
 loop_queue_peer_requests_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torrent_Loop_Peer) {
 	queued: u32
+	target := loop_peer_request_target(peer)
 	for {
-		request, found, request_error := Piece_Scheduler_Next_Request(&loop.Scheduler, peer.ID, time.now())
+		request, found, request_error := Piece_Scheduler_Next_Request_With_Limit(&loop.Scheduler, peer.ID, time.now(), target)
 		if !found || request_error != .None {
 			break
 		}
@@ -1402,8 +1438,9 @@ loop_queue_peer_requests_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torr
 	}
 	// Log only substantial pipeline fills. Small replenishments are normal
 	// steady-state behavior and can occur many times per second.
-	if queued >= 16 {
-		fmt.printf("[DURRENT-PEER] requests queued address=%s count=%d\n", peer.Address, queued)
+	if queued >= 8 {
+		in_flight, _ := Piece_Scheduler_Peer_Request_Count(&loop.Scheduler, peer.ID)
+		fmt.printf("[DURRENT-PEER] requests queued address=%s count=%d target=%d in_flight=%d rate=%.1f KiB/s\n", peer.Address, queued, target, in_flight, peer.Recent_Rate/1024)
 	}
 }
 
