@@ -78,6 +78,13 @@ Peer_Session :: struct {
 	Receive_Buffer:    [dynamic]byte,
 	Outgoing:          [dynamic]byte,
 	Events:            [dynamic]Peer_Event,
+	// Disabled by default. MSE is configured by the session owner before a
+	// connection is started; this preserves established plaintext behavior.
+	MSE_Policy:        MSE_Policy,
+	MSE:               MSE_Handshake_Engine,
+	MSE_Negotiating:   bool,
+	MSE_Active:        bool,
+	MSE_Inbound:       bool,
 }
 
 Peer_Session_Init :: proc(
@@ -149,6 +156,7 @@ Destroy_Peer_Session :: proc(session: ^Peer_Session) {
 	Destroy_Bitfield(&session.Remote_Pieces)
 	delete(session.Receive_Buffer)
 	delete(session.Outgoing)
+	MSE_Handshake_Destroy(&session.MSE)
 	for &event in session.Events {
 		Destroy_Peer_Event(&event)
 	}
@@ -165,6 +173,21 @@ Destroy_Peer_Event :: proc(event: ^Peer_Event) {
 	event^ = Peer_Event{}
 }
 
+// Peer_Session_Set_MSE_Policy must be called before connecting or accepting.
+// It is intentionally opt-in while the MSE transport bridge is introduced.
+Peer_Session_Set_MSE_Policy :: proc(session: ^Peer_Session, policy: MSE_Policy) -> Peer_Error {
+	if session == nil {
+		return .Invalid_Peer
+	}
+	sync.mutex_lock(&session.Mutex)
+	defer sync.mutex_unlock(&session.Mutex)
+	if session.State != .New {
+		return .Invalid_State
+	}
+	session.MSE_Policy = policy
+	return .None
+}
+
 Peer_Session_Connect :: proc(session: ^Peer_Session, address: string, timeout: time.Duration) -> Peer_Error {
 	if session == nil {
 		return .Invalid_Peer
@@ -178,7 +201,7 @@ Peer_Session_Connect :: proc(session: ^Peer_Session, address: string, timeout: t
 	if transport_error != .None {
 		return peer_session_fail_locked(session, peer_transport_error(transport_error))
 	}
-	return peer_session_begin_locked(session)
+	return peer_session_begin_outbound_locked(session)
 }
 
 // Starts an outbound dial without waiting for DNS/TCP completion. Pair with
@@ -217,7 +240,7 @@ Peer_Session_Poll_Connect :: proc(session: ^Peer_Session, timeout: time.Duration
 	if transport_error != .None {
 		return true, peer_session_fail_locked(session, peer_transport_error(transport_error))
 	}
-	return true, peer_session_begin_locked(session)
+	return true, peer_session_begin_outbound_locked(session)
 }
 
 Peer_Session_Accept :: proc(session: ^Peer_Session, socket: net.TCP_Socket, timeout: time.Duration) -> Peer_Error {
@@ -233,7 +256,7 @@ Peer_Session_Accept :: proc(session: ^Peer_Session, socket: net.TCP_Socket, time
 	if transport_error != .None {
 		return peer_session_fail_locked(session, peer_transport_error(transport_error))
 	}
-	return peer_session_begin_locked(session)
+	return peer_session_begin_inbound_locked(session)
 }
 
 Peer_Session_Begin :: proc(session: ^Peer_Session) -> Peer_Error {
@@ -254,8 +277,7 @@ Peer_Session_Feed :: proc(session: ^Peer_Session, data: []byte) -> Peer_Error {
 	if session.State != .Handshaking && session.State != .Ready {
 		return .Invalid_State
 	}
-	append(&session.Receive_Buffer, ..data)
-	return peer_session_process_locked(session)
+	return peer_session_feed_locked(session, data)
 }
 
 Peer_Session_Poll :: proc(session: ^Peer_Session) -> Peer_Error {
@@ -473,19 +495,48 @@ peer_session_begin_locked :: proc(session: ^Peer_Session) -> Peer_Error {
 	if session.State != .New {
 		return .Invalid_State
 	}
-	handshake := Wire_Handshake{
-		Info_Hash = session.Expected_Info_Hash,
-		Peer_ID = session.Local_Peer_ID,
-	}
-	handshake.Reserved[5] = 0x10
-	encoded := Wire_Handshake_Serialize(handshake)
-	append(&session.Outgoing, ..encoded[:])
-	session.State = .Handshaking
-	return .None
+	return peer_session_begin_plain_locked(session)
 }
 
 peer_session_feed_locked :: proc(session: ^Peer_Session, data: []byte) -> Peer_Error {
-	append(&session.Receive_Buffer, ..data)
+	feed_data := data
+	if session.MSE_Inbound && !session.MSE_Negotiating && session.MSE_Policy == .Preferred {
+		append(&session.Receive_Buffer, ..data)
+		if len(session.Receive_Buffer) < 20 {
+			return .None
+		}
+		protocol := BitTorrent_Protocol_String
+		if session.Receive_Buffer[0] == byte(19) && bytes_equal(session.Receive_Buffer[1:20], transmute([]byte)protocol) {
+			// A preferred inbound session accepts an ordinary PWP peer unchanged.
+			session.MSE_Inbound = false
+			return peer_session_process_locked(session)
+		}
+		raw := session.Receive_Buffer
+		session.Receive_Buffer = nil
+		defer delete(raw)
+		if peer_session_mse_start_responder_locked(session) != .None {
+			return .Protocol
+		}
+		feed_data = raw[:]
+	}
+	if session.MSE_Negotiating {
+		mse_error := MSE_Handshake_Feed(&session.MSE, feed_data)
+		peer_session_mse_drain_outgoing_locked(session)
+		if mse_error != .None {
+			return peer_session_fail_locked(session, .Protocol)
+		}
+		return peer_session_mse_finish_locked(session)
+	}
+	if session.MSE_Active {
+		if MSE_Handshake_Feed(&session.MSE, feed_data) != .None {
+			return peer_session_fail_locked(session, .Protocol)
+		}
+		payload := MSE_Handshake_Take_Payload(&session.MSE)
+		defer delete(payload)
+		append(&session.Receive_Buffer, ..payload[:])
+		return peer_session_process_locked(session)
+	}
+	append(&session.Receive_Buffer, ..feed_data)
 	return peer_session_process_locked(session)
 }
 
@@ -589,6 +640,15 @@ peer_session_queue_locked :: proc(session: ^Peer_Session, message: Wire_Message_
 	encoded, encode_error := Wire_Message_Encode(message)
 	if encode_error != .None {
 		return .Protocol
+	}
+	if session.MSE_Active {
+		mse_error := MSE_Handshake_Queue_Payload(&session.MSE, encoded)
+		delete(encoded)
+		if mse_error != .None {
+			return .Protocol
+		}
+		peer_session_mse_drain_outgoing_locked(session)
+		return .None
 	}
 	append(&session.Outgoing, ..encoded)
 	delete(encoded)

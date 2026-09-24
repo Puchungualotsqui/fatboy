@@ -70,6 +70,8 @@ Torrent_Session_Loop :: struct {
 	Peer_Limit:            u32,
 	Tick_Interval:         time.Duration,
 	Peer_Connect_Timeout:  time.Duration,
+	// Disabled unless the caller explicitly opts into a fully validated MSE mode.
+	MSE_Policy:             MSE_Policy,
 	Scheduler:             Piece_Scheduler,
 	Storage:               Torrent_Storage,
 	Tracker:               Tracker_Manager,
@@ -766,6 +768,9 @@ loop_add_incoming_peer_locked :: proc(loop: ^Torrent_Session_Loop, socket: net.T
 	peer.Endpoint = endpoint
 	peer_error := Peer_Session_Init(&peer.Session, loop.Info_Hash, loop.Peer_ID, loop.Scheduler.Piece_Count, loop.Scheduler.Piece_Length, loop.Scheduler.Total_Length)
 	if peer_error == .None {
+		peer_error = Peer_Session_Set_MSE_Policy(&peer.Session, loop.MSE_Policy)
+	}
+	if peer_error == .None {
 		peer_error = Peer_Session_Accept(&peer.Session, socket, loop.Peer_Connect_Timeout)
 	}
 	if peer_error != .None {
@@ -1006,7 +1011,11 @@ loop_connect_pending_peers :: proc(loop: ^Torrent_Session_Loop, maximum: int) {
 		peer.Endpoint = endpoint
 		peer.Address = PEX_Peer_Address(endpoint)
 		peer.Dial_Started = time.now()
+		mse_policy := loop.MSE_Policy
 		peer_error := Peer_Session_Init(&peer.Session, info_hash, local_peer_id, piece_count, piece_length, total_length)
+		if peer_error == .None {
+			peer_error = Peer_Session_Set_MSE_Policy(&peer.Session, mse_policy)
+		}
 		if peer_error == .None {
 			peer_error = Peer_Session_Begin_Connect(&peer.Session, peer.Address)
 		}

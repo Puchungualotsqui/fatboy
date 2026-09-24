@@ -1,5 +1,6 @@
 package durrent
 
+import "core:crypto"
 import "core:crypto/hash"
 
 // MSE/PE is negotiated before the ordinary BitTorrent handshake. Keep the
@@ -14,6 +15,21 @@ MSE_Policy :: enum {
 MSE_Encryption_Plaintext :: u32(1)
 MSE_Encryption_RC4 :: u32(2)
 MSE_Verification_Constant :: [8]byte{}
+
+// Generates a CSPRNG-backed MSE private exponent for live peer sessions.
+MSE_DH_Private_Generate :: proc() -> ([MSE_DH_Private_Length]byte, bool) {
+	private: [MSE_DH_Private_Length]byte
+	if !crypto.HAS_RAND_BYTES {
+		return private, false
+	}
+	crypto.rand_bytes(private[:])
+	for value in private {
+		if value != 0 {
+			return private, true
+		}
+	}
+	return private, false
+}
 
 MSE_RC4 :: struct {
 	S: [256]byte,

@@ -21,6 +21,9 @@ Metadata_Resolver_Options :: struct {
 	Max_Metadata_Size:     u32,
 	Enable_DHT:            bool,
 	Enable_PEX:            bool,
+	// Disabled by default; callers can opt metadata peers into the same policy
+	// used by normal torrent sessions.
+	MSE_Policy:             MSE_Policy,
 	Bootstrap:             []DHT_Node,
 	Routing_Cache_Path:   string,
 	Max_Candidates:       u32,
@@ -377,6 +380,10 @@ metadata_resolver_try_peer :: proc(
 
 	session: Peer_Session
 	if Peer_Session_Init_Metadata(&session, info_hash, peer_id) != .None {
+		return nil, .Metadata
+	}
+	if Peer_Session_Set_MSE_Policy(&session, options.MSE_Policy) != .None {
+		Destroy_Peer_Session(&session)
 		return nil, .Metadata
 	}
 	downloader: Metadata_Downloader
