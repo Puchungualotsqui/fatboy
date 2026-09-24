@@ -848,7 +848,8 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 				continue
 			}
 		}
-		if loop.PEX_Enabled && peer.Session.State == .Ready && !peer.PEX_Handshake_Sent {
+		if loop.PEX_Enabled && peer.Session.State == .Ready &&
+		   !peer.Session.Remote_Choking && !peer.PEX_Handshake_Sent {
 			payload := PEX_Encode_Extension_Handshake()
 			pex_error := Peer_Session_Queue_Extended(&peer.Session, 0, payload)
 			fmt.printf("[DURRENT-PEER] pex handshake address=%s result=%v\n", peer.Address, pex_error)
