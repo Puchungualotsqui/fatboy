@@ -7,6 +7,11 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 
+Peer_Transport_Kind :: enum {
+	TCP,
+	UTP,
+}
+
 Peer_Transport_Error :: enum {
 	None,
 	Invalid_Transport,
@@ -31,7 +36,9 @@ Peer_Dial_Job :: struct {
 }
 
 Peer_Transport :: struct {
+	Kind:          Peer_Transport_Kind,
 	Socket:        net.TCP_Socket,
+	UTP:           UTP_Connection,
 	Connected:     bool,
 	Read_Timeout:  time.Duration,
 	Write_Timeout: time.Duration,
@@ -45,6 +52,9 @@ Peer_Transport_Begin_Connect :: proc(transport: ^Peer_Transport, address: string
 	}
 	if transport.Connected || transport.Pending_Dial != nil || len(address) == 0 {
 		return .Already_Connected if transport.Connected else .Connect
+	}
+	if transport.Kind != .TCP {
+		return .Connect
 	}
 	job := new(Peer_Dial_Job, context.allocator)
 	job.Address = strings.clone(address, context.allocator)
@@ -66,6 +76,22 @@ Peer_Transport_Poll_Connect :: proc(transport: ^Peer_Transport, timeout: time.Du
 		return false, .Invalid_Transport
 	}
 	if transport.Connected {
+		return true, .None
+	}
+	if transport.Kind == .UTP {
+		utp_error := UTP_Connection_Poll(&transport.UTP)
+		if utp_error != .None && utp_error != .Timeout {
+			return true, .Connect
+		}
+		if transport.UTP.State == .Failed || transport.UTP.State == .Closed {
+			return true, .Connect
+		}
+		if transport.UTP.State != .Connected {
+			return false, .None
+		}
+		transport.Connected = true
+		transport.Read_Timeout = 100 * time.Millisecond if timeout > 0 else time.Duration(0)
+		transport.Write_Timeout = timeout
 		return true, .None
 	}
 	job := transport.Pending_Dial
@@ -147,6 +173,21 @@ Peer_Transport_Connect :: proc(transport: ^Peer_Transport, address: string, time
 	}
 }
 
+// Peer_Transport_Begin_UTP_Connect opens an outbound BEP 29 stream. uTP is
+// UDP based, so DNS is intentionally resolved by the caller before this point.
+Peer_Transport_Begin_UTP_Connect :: proc(transport: ^Peer_Transport, remote: net.Endpoint) -> Peer_Transport_Error {
+	if transport == nil || transport.Connected || transport.Pending_Dial != nil || transport.UTP.State != .Closed {
+		return .Already_Connected if transport != nil && transport.Connected else .Connect
+	}
+	transport.Kind = .UTP
+	utp_error := UTP_Connection_Begin(&transport.UTP, remote)
+	if utp_error != .None {
+		transport.Kind = .TCP
+		return .Connect
+	}
+	return .None
+}
+
 Peer_Transport_Close :: proc(transport: ^Peer_Transport) {
 	if transport == nil {
 		return
@@ -168,12 +209,15 @@ Peer_Transport_Close :: proc(transport: ^Peer_Transport) {
 		sync.mutex_unlock(&job.Mutex)
 		transport.Pending_Dial = nil
 	}
-	if transport.Connected {
+	if transport.Kind == .UTP {
+		UTP_Connection_Close(&transport.UTP)
+	} else if transport.Connected {
 		net.close(transport.Socket)
 	}
 	delete(transport.Write_Buffer)
 	transport.Write_Buffer = nil
 	transport.Socket = net.TCP_Socket(0)
+	transport.Kind = .TCP
 	transport.Connected = false
 }
 
@@ -225,6 +269,10 @@ Peer_Transport_Queue :: proc(transport: ^Peer_Transport, data: []byte) -> Peer_T
 	if !transport.Connected {
 		return .Disconnected
 	}
+	if transport.Kind == .UTP {
+		utp_error := UTP_Connection_Queue(&transport.UTP, data)
+		return .None if utp_error == .None else .Write
+	}
 	append(&transport.Write_Buffer, ..data)
 	return .None
 }
@@ -235,6 +283,13 @@ Peer_Transport_Flush :: proc(transport: ^Peer_Transport) -> Peer_Transport_Error
 	}
 	if !transport.Connected {
 		return .Disconnected
+	}
+	if transport.Kind == .UTP {
+		utp_error := UTP_Connection_Poll(&transport.UTP)
+		if utp_error == .None {
+			return .None
+		}
+		return .Timeout if utp_error == .Timeout else .Write
 	}
 	if len(transport.Write_Buffer) == 0 {
 		return .None
@@ -272,6 +327,18 @@ Peer_Transport_Receive :: proc(transport: ^Peer_Transport, buffer: []byte) -> (i
 	}
 	if !transport.Connected {
 		return 0, .Disconnected
+	}
+	if transport.Kind == .UTP {
+		utp_error := UTP_Connection_Poll(&transport.UTP)
+		if utp_error != .None && utp_error != .Timeout {
+			transport.Connected = false
+			return 0, .Read
+		}
+		count := UTP_Connection_Take_Received(&transport.UTP, buffer)
+		if count == 0 {
+			return 0, .Timeout
+		}
+		return count, .None
 	}
 	count, recv_error := net.recv_tcp(transport.Socket, buffer)
 	if recv_error == net.TCP_Recv_Error.Timeout || recv_error == net.TCP_Recv_Error.Would_Block {

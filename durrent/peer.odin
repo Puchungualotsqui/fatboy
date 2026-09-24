@@ -144,18 +144,9 @@ Destroy_Peer_Session :: proc(session: ^Peer_Session) {
 	if session == nil {
 		return
 	}
-	// peer_session_fail_locked already closes the transport before marking
-	// the session Failed. Avoid running transport shutdown twice on terminal
-	// sessions; the remaining buffers still need to be released below.
-	if session.State != .Failed && session.State != .Closed {
-		Peer_Transport_Close(&session.Transport)
-	} else {
-		session.Transport.Pending_Dial = nil
-		delete(session.Transport.Write_Buffer)
-		session.Transport.Write_Buffer = nil
-		session.Transport.Socket = net.TCP_Socket(0)
-		session.Transport.Connected = false
-	}
+	// Closing is idempotent and also releases an owned uTP UDP socket. A failed
+	// session may already have closed it, which is safe.
+	Peer_Transport_Close(&session.Transport)
 	Destroy_Bitfield(&session.Remote_Pieces)
 	delete(session.Receive_Buffer)
 	delete(session.Outgoing)
@@ -209,6 +200,22 @@ Peer_Session_Connect :: proc(session: ^Peer_Session, address: string, timeout: t
 
 // Starts an outbound dial without waiting for DNS/TCP completion. Pair with
 // Peer_Session_Poll_Connect from an event loop.
+Peer_Session_Begin_UTP_Connect :: proc(session: ^Peer_Session, remote: net.Endpoint) -> Peer_Error {
+	if session == nil {
+		return .Invalid_Peer
+	}
+	sync.mutex_lock(&session.Mutex)
+	defer sync.mutex_unlock(&session.Mutex)
+	if session.State != .New {
+		return .Invalid_State
+	}
+	transport_error := Peer_Transport_Begin_UTP_Connect(&session.Transport, remote)
+	if transport_error != .None {
+		return peer_session_fail_locked(session, peer_transport_error(transport_error))
+	}
+	return .None
+}
+
 Peer_Session_Begin_Connect :: proc(session: ^Peer_Session, address: string) -> Peer_Error {
 	if session == nil {
 		return .Invalid_Peer

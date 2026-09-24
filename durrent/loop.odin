@@ -62,6 +62,8 @@ Torrent_Loop_Peer :: struct {
 	Recent_Rate:          f64,
 	Last_Block_At:        time.Time,
 	Quality_Score:        i64,
+	Using_UTP:           bool,
+	UTP_Fallback_Used:   bool,
 }
 
 Torrent_Session_Loop :: struct {
@@ -76,6 +78,10 @@ Torrent_Session_Loop :: struct {
 	Peer_Connect_Timeout:  time.Duration,
 	// Disabled unless the caller explicitly opts into a fully validated MSE mode.
 	MSE_Policy:             MSE_Policy,
+	// uTP is attempted for outbound peers and falls back to TCP when a peer
+	// does not answer the BEP 29 SYN. Call Set_UTP_Enabled before Open to opt out.
+	UTP_Enabled:            bool,
+	UTP_Configured:         bool,
 	Scheduler:             Piece_Scheduler,
 	Storage:               Torrent_Storage,
 	Tracker:               Tracker_Manager,
@@ -190,12 +196,29 @@ Torrent_Session_Loop_Open :: proc(
 	// validated: several public peers reset shortly after receiving our PEX
 	// traffic, preventing them from reaching the normal unchoke stage.
 	loop.PEX_Enabled = false
+	if !loop.UTP_Configured {
+		loop.UTP_Enabled = true
+	}
 	if Torrent_Allows_DHT(torrent) {
 		loop.DHT_Enabled = DHT_Client_Init(&loop.DHT, torrent, DHT_Node_ID_Generate(u64(time.to_unix_seconds(time.now()))), listen_port) == .None
 	}
 	loop.Stats_Time = time.now()
 	loop.Stats_Downloaded = 0
 	loop.Stats_Uploaded = 0
+	return .None
+}
+
+// Torrent_Session_Loop_Set_UTP_Enabled must be called before Open. TCP remains
+// available as the automatic fallback for peers that do not implement BEP 29.
+Torrent_Session_Loop_Set_UTP_Enabled :: proc(loop: ^Torrent_Session_Loop, enabled: bool) -> Torrent_Loop_Error {
+	if loop == nil {
+		return .Invalid_Loop
+	}
+	if loop.State != .Closed {
+		return .Invalid_State
+	}
+	loop.UTP_Enabled = enabled
+	loop.UTP_Configured = true
 	return .None
 }
 
@@ -1016,11 +1039,17 @@ loop_connect_pending_peers :: proc(loop: ^Torrent_Session_Loop, maximum: int) {
 		peer.Address = PEX_Peer_Address(endpoint)
 		peer.Dial_Started = time.now()
 		mse_policy := loop.MSE_Policy
+		use_utp := loop.UTP_Enabled
 		peer_error := Peer_Session_Init(&peer.Session, info_hash, local_peer_id, piece_count, piece_length, total_length)
 		if peer_error == .None {
 			peer_error = Peer_Session_Set_MSE_Policy(&peer.Session, mse_policy)
 		}
-		if peer_error == .None {
+		if peer_error == .None && use_utp {
+			remote := loop_pex_endpoint(endpoint)
+			peer_error = Peer_Session_Begin_UTP_Connect(&peer.Session, remote)
+			peer.Using_UTP = peer_error == .None
+		}
+		if peer_error == .None && !peer.Using_UTP {
 			peer_error = Peer_Session_Begin_Connect(&peer.Session, peer.Address)
 		}
 		if peer_error != .None {
@@ -1058,18 +1087,58 @@ loop_connect_pending_peers :: proc(loop: ^Torrent_Session_Loop, maximum: int) {
 	}
 }
 
+loop_pex_endpoint :: proc(peer: PEX_Peer) -> net.Endpoint {
+	if peer.IPv6 {
+		address: net.IP6_Address
+		for index := 0; index < 8; index += 1 {
+			address[index] = u16be(u16(peer.IP[index*2])<<8 | u16(peer.IP[index*2+1]))
+		}
+		return net.Endpoint{address = address, port = int(peer.Port)}
+	}
+	return net.Endpoint{
+		address = net.IP4_Address{peer.IP[0], peer.IP[1], peer.IP[2], peer.IP[3]},
+		port = int(peer.Port),
+	}
+}
+
+// uTP capability is not advertised by tracker/DHT candidates. Once a SYN
+// fails, retry the same endpoint over TCP exactly once instead of discarding a
+// potentially useful conventional BitTorrent peer.
+loop_fallback_to_tcp_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torrent_Loop_Peer) -> bool {
+	if loop == nil || peer == nil || !peer.Using_UTP || peer.UTP_Fallback_Used {
+		return false
+	}
+	if Peer_Session_Reset_For_Transport_Fallback(&peer.Session) != .None {
+		return false
+	}
+	peer.Using_UTP = false
+	peer.UTP_Fallback_Used = true
+	peer.Dial_Started = time.now()
+	return Peer_Session_Begin_Connect(&peer.Session, peer.Address) == .None
+}
+
 loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 	index := 0
 	for index < len(loop.Peers) {
 		peer := loop.Peers[index]
 		if peer.Session.State == .New {
 			if time.diff(peer.Dial_Started, time.now()) >= loop.Peer_Connect_Timeout {
+				if loop_fallback_to_tcp_locked(loop, peer) {
+					fmt.printf("[DURRENT-uTP] SYN timed out; retrying TCP address=%s\n", peer.Address)
+					index += 1
+					continue
+				}
 				fmt.printf("[DURRENT-PEER] dial timed out address=%s\n", peer.Address)
 				loop_remove_peer_locked(loop, index)
 				continue
 			}
 			dial_done, dial_error := Peer_Session_Poll_Connect(&peer.Session, loop.Peer_Connect_Timeout)
 			if dial_error != .None {
+				if loop_fallback_to_tcp_locked(loop, peer) {
+					fmt.printf("[DURRENT-uTP] connect failed; retrying TCP address=%s\n", peer.Address)
+					index += 1
+					continue
+				}
 				fmt.printf("[DURRENT-PEER] dial failed address=%s error=%v\n", peer.Address, dial_error)
 				loop_remove_peer_locked(loop, index)
 				continue
@@ -1078,7 +1147,8 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 				index += 1
 				continue
 			}
-			fmt.printf("[DURRENT-PEER] dial connected address=%s\n", peer.Address)
+			transport_name := "uTP" if peer.Using_UTP else "TCP"
+			fmt.printf("[DURRENT-PEER] dial connected transport=%s address=%s\n", transport_name, peer.Address)
 			if peer.Session.MSE_Policy != .Disabled {
 				fmt.printf("[DURRENT-MSE] initiator started peer=%s policy=%v\n", peer.Address, peer.Session.MSE_Policy)
 			}

@@ -33,6 +33,38 @@ Peer_Session_MSE_Early_Timed_Out :: proc(session: ^Peer_Session, timeout: time.D
 		time.diff(session.MSE_Started_At, time.now()) >= timeout
 }
 
+// Peer_Session_Reset_For_Transport_Fallback discards an unestablished stream
+// so the caller can retry the same peer over TCP after uTP times out. It keeps
+// the configured MSE policy; the fallback is transport selection, not a crypto
+// downgrade.
+Peer_Session_Reset_For_Transport_Fallback :: proc(session: ^Peer_Session) -> Peer_Error {
+	if session == nil {
+		return .Invalid_Peer
+	}
+	sync.mutex_lock(&session.Mutex)
+	defer sync.mutex_unlock(&session.Mutex)
+	if session.State != .New && session.State != .Handshaking && session.State != .Failed {
+		return .Invalid_State
+	}
+	policy := session.MSE_Policy
+	Peer_Transport_Close(&session.Transport)
+	delete(session.Receive_Buffer)
+	session.Receive_Buffer = nil
+	delete(session.Outgoing)
+	session.Outgoing = nil
+	MSE_Handshake_Destroy(&session.MSE)
+	session.MSE_Negotiating = false
+	session.MSE_Active = false
+	session.MSE_Negotiated = false
+	session.MSE_Inbound = false
+	session.MSE_Plaintext_Retry_Used = false
+	session.MSE_Started_At = time.Time{}
+	session.MSE_Policy = policy
+	session.State = .New
+	session.Error = .None
+	return .None
+}
+
 Peer_Session_Reset_For_Plaintext_Retry :: proc(session: ^Peer_Session) -> Peer_Error {
 	if session == nil {
 		return .Invalid_Peer

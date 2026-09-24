@@ -111,6 +111,12 @@ BitTorrent v1 client while keeping each layer testable:
 10. **Add optional interoperability features**
     - Add IPv6 support throughout peer, tracker, and DHT handling *(implemented in `tracker_udp.odin`, `dht_client.odin`, and `loop.odin`)*.
     - Add PEX *(implemented in `pex.odin` and `loop.odin`)*.
+    - Add outbound BEP 29/uTP with UDP reliability, ACK/retransmit handling,
+      extension skipping, congestion-window bounds, and TCP fallback *(implemented
+      in `utp.odin`, `transport.odin`, and `loop.odin`)*. It uses an ephemeral
+      UDP source socket per outbound peer; inbound uTP remains a follow-up because
+      DHT currently owns the advertised UDP listener and needs a shared UDP
+      demultiplexer.
     - Add fast-extension messages, web seeds, and BitTorrent v2/hybrid metadata
       as separate future capabilities.
 
