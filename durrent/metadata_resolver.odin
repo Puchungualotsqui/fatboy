@@ -231,6 +231,20 @@ metadata_resolver_process_pex_event :: proc(
 }
 
 
+metadata_resolver_cleanup_peer :: proc(
+	session: ^Peer_Session,
+	downloader: ^Metadata_Downloader,
+	address: string,
+) {
+	fmt.printf("[DURRENT-META] Cleanup downloader begin peer=%s\\n", address)
+	Metadata_Downloader_Destroy(downloader)
+	fmt.printf("[DURRENT-META] Cleanup downloader done peer=%s\\n", address)
+	fmt.printf("[DURRENT-META] Cleanup session begin peer=%s\\n", address)
+	Destroy_Peer_Session(session)
+	fmt.printf("[DURRENT-META] Cleanup session done peer=%s\\n", address)
+}
+
+
 metadata_resolver_bootstrap_from_candidates :: proc(
 	candidates: []metadata_resolver_candidate,
 	bootstrap: ^[dynamic]DHT_Node,
@@ -272,7 +286,8 @@ metadata_resolver_try_peer :: proc(
 	if Peer_Session_Init_Metadata(&session, info_hash, peer_id) != .None {
 		return nil, .Metadata
 	}
-	defer Destroy_Peer_Session(&session)
+	downloader: Metadata_Downloader
+	defer metadata_resolver_cleanup_peer(&session, &downloader, candidate.Address)
 
 	connect_timeout := options.Peer_Connect_Timeout
 	if connect_timeout <= 0 {
@@ -285,7 +300,6 @@ metadata_resolver_try_peer :: proc(
 	}
 	fmt.printf("[DURRENT-META] Peer connected address=%s\n", candidate.Address)
 
-	downloader: Metadata_Downloader
 	metadata_error := Metadata_Downloader_Init(
 		&downloader,
 		info_hash,
@@ -294,15 +308,8 @@ metadata_resolver_try_peer :: proc(
 	if metadata_error != .None {
 		return nil, .Metadata
 	}
-	defer Metadata_Downloader_Destroy(&downloader)
-
 	remote_pex_id: byte
-	if options.Enable_PEX {
-		payload := PEX_Encode_Extension_Handshake()
-		pex_error := Peer_Session_Queue_Extended(&session, 0, payload)
-		delete(payload)
-		fmt.printf("[DURRENT-META] PEX handshake queued peer=%s result=%v\\n", candidate.Address, pex_error)
-	}
+	pex_handshake_sent := false
 
 	peer_deadline := time.time_add(time.now(), options.Peer_Metadata_Timeout)
 	if options.Peer_Metadata_Timeout <= 0 {
@@ -330,6 +337,13 @@ metadata_resolver_try_peer :: proc(
 				&session,
 				&event,
 			)
+			if options.Enable_PEX && event.Kind == .Handshake && !pex_handshake_sent {
+				payload := PEX_Encode_Extension_Handshake()
+				pex_error := Peer_Session_Queue_Extended(&session, 0, payload)
+				delete(payload)
+				pex_handshake_sent = pex_error == .None
+				fmt.printf("[DURRENT-META] PEX handshake queued peer=%s result=%v\\n", candidate.Address, pex_error)
+			}
 			if options.Enable_PEX && event.Kind == .Extended &&
 			   candidates != nil && u32(len(candidates)) < max_candidates {
 				metadata_resolver_process_pex_event(

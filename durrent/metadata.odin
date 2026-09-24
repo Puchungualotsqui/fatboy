@@ -56,9 +56,18 @@ Metadata_Downloader_Destroy :: proc(downloader: ^Metadata_Downloader) {
 	delete(downloader.Data)
 	delete(downloader.Received)
 	sync.mutex_unlock(&downloader.Mutex)
-	// The mutex is part of the struct. Resetting the struct while holding
-	// the mutex corrupts it before the unlock and can abort during cleanup.
-	downloader^ = Metadata_Downloader{}
+	// Keep the mutex object intact. Reset only the non-synchronization state
+	// so later cleanup cannot operate on a zeroed synchronization object.
+	downloader.Info_Hash = Torrent_Hash{}
+	downloader.Max_Size = 0
+	downloader.Metadata_Size = 0
+	downloader.Piece_Count = 0
+	downloader.Received_Count = 0
+	downloader.Remote_Extension_ID = 0
+	downloader.Started = false
+	downloader.Complete = false
+	downloader.Data = nil
+	downloader.Received = nil
 }
 
 Metadata_Downloader_Begin :: proc(downloader: ^Metadata_Downloader, session: ^Peer_Session) -> Metadata_Error {
