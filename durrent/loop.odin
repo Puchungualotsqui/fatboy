@@ -157,7 +157,11 @@ Torrent_Session_Loop_Open :: proc(
 	loop.Peer_Connect_Timeout = time.Second
 	loop.Next_Peer_ID = 1
 	loop.Port = listen_port
-	loop.PEX_Enabled = Torrent_Allows_Peer_Exchange(torrent)
+	// Peer exchange is optional and not needed while tracker and DHT discovery
+	// are active. Keep it disabled until its outbound interoperability is
+	// validated: several public peers reset shortly after receiving our PEX
+	// traffic, preventing them from reaching the normal unchoke stage.
+	loop.PEX_Enabled = false
 	if Torrent_Allows_DHT(torrent) {
 		loop.DHT_Enabled = DHT_Client_Init(&loop.DHT, torrent, DHT_Node_ID_Generate(u64(time.to_unix_seconds(time.now()))), listen_port) == .None
 	}
