@@ -133,7 +133,18 @@ Destroy_Peer_Session :: proc(session: ^Peer_Session) {
 	if session == nil {
 		return
 	}
-	Peer_Transport_Close(&session.Transport)
+	// peer_session_fail_locked already closes the transport before marking
+	// the session Failed. Avoid running transport shutdown twice on terminal
+	// sessions; the remaining buffers still need to be released below.
+	if session.State != .Failed && session.State != .Closed {
+		Peer_Transport_Close(&session.Transport)
+	} else {
+		session.Transport.Pending_Dial = nil
+		delete(session.Transport.Write_Buffer)
+		session.Transport.Write_Buffer = nil
+		session.Transport.Socket = net.TCP_Socket(0)
+		session.Transport.Connected = false
+	}
 	Destroy_Bitfield(&session.Remote_Pieces)
 	delete(session.Receive_Buffer)
 	delete(session.Outgoing)

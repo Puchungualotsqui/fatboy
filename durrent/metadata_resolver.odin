@@ -489,7 +489,7 @@ Resolve_Magnet_Metadata :: proc(
 			copy := strings.clone(tracker_url, context.allocator)
 			append(&tracker_magnet.Trackers, transmute([]byte)copy)
 		}
-		fmt.printf("[DURRENT-META] No magnet trackers; using fallback trackers=%d\\n", len(tracker_magnet.Trackers))
+		fmt.printf("[DURRENT-META] No magnet trackers; using fallback trackers=%d\n", len(tracker_magnet.Trackers))
 	}
 	defer Destroy_Magnet_Link(&tracker_magnet)
 	tracker: Tracker_Manager

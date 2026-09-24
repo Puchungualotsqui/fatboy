@@ -116,6 +116,7 @@ Peer_Transport_Close :: proc(transport: ^Peer_Transport) {
 		net.close(transport.Socket)
 	}
 	delete(transport.Write_Buffer)
+	transport.Write_Buffer = nil
 	transport.Socket = net.TCP_Socket(0)
 	transport.Connected = false
 }
