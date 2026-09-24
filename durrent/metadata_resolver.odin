@@ -403,6 +403,7 @@ metadata_resolver_try_peer :: proc(
 	}
 	remote_pex_id: byte
 	pex_handshake_sent := false
+	metadata_retry_at := time.time_add(time.now(), time.Second)
 
 	peer_deadline := time.time_add(time.now(), options.Peer_Metadata_Timeout)
 	if options.Peer_Metadata_Timeout <= 0 {
@@ -468,6 +469,17 @@ metadata_resolver_try_peer :: proc(
 				)
 			}
 			Destroy_Peer_Event(&event)
+			if event.Kind == .Extended && downloader.Metadata_Size > 0 {
+				fmt.printf(
+					"[DURRENT-META] Metadata piece state peer=%s extension=%d remote_extension=%d received=%d/%d size=%d\n",
+					candidate.Address,
+					event.Payload[0],
+					downloader.Remote_Extension_ID,
+					downloader.Received_Count,
+					downloader.Piece_Count,
+					downloader.Metadata_Size,
+				)
+			}
 			if event_error != .None {
 				fmt.printf("[DURRENT-META] Metadata event failed address=%s error=%v\n", candidate.Address, event_error)
 				break
@@ -483,6 +495,19 @@ metadata_resolver_try_peer :: proc(
 		fmt.printf("[DURRENT-META] Metadata verification failed address=%s error=%v\n", candidate.Address, finish_error)
 		return nil, .Metadata
 	}
+		if downloader.Metadata_Size > 0 &&
+		   !Metadata_Downloader_Is_Complete(&downloader) &&
+		   metadata_resolver_expired(metadata_retry_at) {
+			retry_error := Metadata_Downloader_Retry_Missing(&downloader, &session)
+			fmt.printf(
+				"[DURRENT-META] Metadata missing-piece retry peer=%s result=%v received=%d/%d\n",
+				candidate.Address,
+				retry_error,
+				downloader.Received_Count,
+				downloader.Piece_Count,
+			)
+			metadata_retry_at = time.time_add(time.now(), time.Second)
+		}
 		time.sleep(10 * time.Millisecond)
 	}
 

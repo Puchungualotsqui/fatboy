@@ -131,6 +131,26 @@ Metadata_Downloader_Is_Complete :: proc(downloader: ^Metadata_Downloader) -> boo
 	return downloader.Complete
 }
 
+
+Metadata_Downloader_Retry_Missing :: proc(
+	downloader: ^Metadata_Downloader,
+	session: ^Peer_Session,
+) -> Metadata_Error {
+	if downloader == nil || session == nil {
+		return .Invalid_Downloader
+	}
+	sync.mutex_lock(&downloader.Mutex)
+	defer sync.mutex_unlock(&downloader.Mutex)
+	if !downloader.Started || downloader.Metadata_Size == 0 {
+		return .Invalid_State
+	}
+	if downloader.Complete {
+		return .None
+	}
+	return metadata_queue_requests_locked(downloader, session, true)
+}
+
+
 Metadata_Downloader_Finish_Bencoded :: proc(downloader: ^Metadata_Downloader) -> ([]byte, Metadata_Error) {
 	if downloader == nil {
 		return nil, .Invalid_Downloader
@@ -259,8 +279,15 @@ metadata_handle_piece_locked :: proc(downloader: ^Metadata_Downloader, payload: 
 	return .None
 }
 
-metadata_queue_requests_locked :: proc(downloader: ^Metadata_Downloader, session: ^Peer_Session) -> Metadata_Error {
+metadata_queue_requests_locked :: proc(
+	downloader: ^Metadata_Downloader,
+	session: ^Peer_Session,
+	missing_only := false,
+) -> Metadata_Error {
 	for piece: u32 = 0; piece < downloader.Piece_Count; piece += 1 {
+		if missing_only && downloader.Received[piece] {
+			continue
+		}
 		payload := metadata_request_payload(piece)
 		error := Peer_Session_Queue_Extended(session, downloader.Remote_Extension_ID, payload)
 		delete(payload)
