@@ -99,6 +99,10 @@ Torrent_Session_Loop :: struct {
 	DHT_Result_Ready:        bool,
 	Next_DHT_Lookup:         time.Time,
 	Pending_Peers:           [dynamic]PEX_Peer,
+	UPnP_IGD:                UPnP_IGD,
+	UPnP_TCP_Mapped:         bool,
+	UPnP_UDP_Mapped:         bool,
+	UPnP_Port:               u16,
 }
 
 Torrent_Session_Loop_Open :: proc(
@@ -141,32 +145,7 @@ Torrent_Session_Loop_Open :: proc(
 		loop.Listener_Open,
 		loop.Listener6_Open,
 	)
-	if listen_port > 0 && loop.Listener_Open {
-		mapping, mapping_error := NAT_PMP_Map_TCP(listen_port, listen_port, 2*60*60, time.Second)
-		if mapping_error == .None {
-			fmt.printf(
-				"[DURRENT-NAT] NAT-PMP TCP mapped gateway=%v internal=%d external=%d lifetime=%ds\n",
-				mapping.Gateway,
-				mapping.Internal_Port,
-				mapping.External_Port,
-				mapping.Lifetime,
-			)
-		} else {
-			fmt.printf("[DURRENT-NAT] NAT-PMP TCP mapping unavailable error=%v\n", mapping_error)
-		}
-		udp_mapping, udp_mapping_error := NAT_PMP_Map_UDP(listen_port, listen_port, 2*60*60, time.Second)
-		if udp_mapping_error == .None {
-			fmt.printf(
-				"[DURRENT-NAT] NAT-PMP UDP mapped gateway=%v internal=%d external=%d lifetime=%ds\n",
-				udp_mapping.Gateway,
-				udp_mapping.Internal_Port,
-				udp_mapping.External_Port,
-				udp_mapping.Lifetime,
-			)
-		} else if mapping_error != .None {
-			fmt.printf("[DURRENT-NAT] NAT-PMP unavailable; forward TCP/UDP %d on your router/firewall for inbound peers\n", listen_port)
-		}
-	}
+	loop_configure_nat_mappings(loop, listen_port)
 	request := Tracker_Announce_Request{
 		Info_Hash = torrent.Info_Hash,
 		Peer_ID = peer_id,
@@ -176,6 +155,8 @@ Torrent_Session_Loop_Open :: proc(
 	}
 	tracker_error := Tracker_Manager_Init(&loop.Tracker, torrent, request)
 	if tracker_error != .None && tracker_error != .No_Trackers {
+		loop_release_upnp_mappings(loop)
+		loop_close_listeners(loop)
 		Piece_Scheduler_Destroy(&loop.Scheduler)
 		Torrent_Storage_Close(&loop.Storage)
 		return .Tracker
@@ -216,6 +197,9 @@ Torrent_Session_Loop_Start :: proc(loop: ^Torrent_Session_Loop) -> Torrent_Loop_
 	if loop == nil {
 		return .Invalid_Loop
 	}
+	// Pause closes the listeners and removes temporary UPnP mappings. Restore
+	// them before starting workers again so a resumed session remains reachable.
+	loop_restore_listener_and_nat(loop)
 	sync.mutex_lock(&loop.Mutex)
 	defer sync.mutex_unlock(&loop.Mutex)
 	if loop.State != .Paused && loop.State != .Completed && loop.State != .Seeding {
@@ -403,6 +387,7 @@ Torrent_Session_Loop_Pause :: proc(loop: ^Torrent_Session_Loop) -> Torrent_Loop_
 		thread.destroy(worker)
 	}
 	loop_close_listeners(loop)
+	loop_release_upnp_mappings(loop)
 	if loop.DHT_Worker != nil {
 		sync.mutex_lock(&loop.Mutex)
 		loop.DHT_Stop_Requested = true
@@ -462,6 +447,7 @@ Torrent_Session_Loop_Shutdown :: proc(loop: ^Torrent_Session_Loop) -> Torrent_Lo
 		thread.destroy(worker)
 	}
 	loop_close_listeners(loop)
+	loop_release_upnp_mappings(loop)
 	if loop.DHT_Worker != nil {
 		sync.mutex_lock(&loop.Mutex)
 		loop.DHT_Stop_Requested = true
@@ -531,6 +517,175 @@ loop_open_listeners :: proc(loop: ^Torrent_Session_Loop, port: u16) -> u16 {
 		net.close(listener6)
 	}
 	return actual_port
+}
+
+// NAT-PMP is preferred because it is inexpensive. UPnP IGD is a best-effort
+// fallback for routers that expose only the SOAP gateway protocol.
+loop_configure_nat_mappings :: proc(loop: ^Torrent_Session_Loop, listen_port: u16) {
+	if loop == nil || listen_port == 0 || !loop.Listener_Open {
+		return
+	}
+
+	tcp_mapping, tcp_error := NAT_PMP_Map_TCP(listen_port, listen_port, 2*60*60, time.Second)
+	nat_tcp_mapped := tcp_error == .None
+	if nat_tcp_mapped {
+		fmt.printf(
+			"[DURRENT-NAT] NAT-PMP TCP mapped gateway=%v internal=%d external=%d lifetime=%ds\n",
+			tcp_mapping.Gateway,
+			tcp_mapping.Internal_Port,
+			tcp_mapping.External_Port,
+			tcp_mapping.Lifetime,
+		)
+	} else {
+		fmt.printf("[DURRENT-NAT] NAT-PMP TCP mapping unavailable error=%v\n", tcp_error)
+	}
+
+	udp_mapping, udp_error := NAT_PMP_Map_UDP(listen_port, listen_port, 2*60*60, time.Second)
+	nat_udp_mapped := udp_error == .None
+	if nat_udp_mapped {
+		fmt.printf(
+			"[DURRENT-NAT] NAT-PMP UDP mapped gateway=%v internal=%d external=%d lifetime=%ds\n",
+			udp_mapping.Gateway,
+			udp_mapping.Internal_Port,
+			udp_mapping.External_Port,
+			udp_mapping.Lifetime,
+		)
+	} else {
+		fmt.printf("[DURRENT-NAT] NAT-PMP UDP mapping unavailable error=%v\n", udp_error)
+	}
+	if nat_tcp_mapped && nat_udp_mapped {
+		return
+	}
+
+	internal_ip := UPnP_IGD_Local_IPv4()
+	if len(internal_ip) == 0 {
+		fmt.printf("[DURRENT-NAT] UPnP IGD skipped: no usable LAN IPv4 address; forward TCP/UDP %d on your router/firewall for inbound peers\n", listen_port)
+		return
+	}
+	defer delete(internal_ip)
+	options := UPnP_IGD_Options{
+		Discovery_Timeout = 2 * time.Second,
+		Discovery_Attempts = 1,
+		HTTP_Connect_Timeout = 3,
+		HTTP_Total_Timeout = 5,
+		Max_Response_Bytes = 1024 * 1024,
+	}
+	igd, discover_error := UPnP_IGD_Discover(options)
+	if discover_error != .None {
+		fmt.printf("[DURRENT-NAT] UPnP IGD mapping unavailable error=%v; forward TCP/UDP %d on your router/firewall for inbound peers\n", discover_error, listen_port)
+		return
+	}
+	fmt.printf("[DURRENT-NAT] UPnP IGD discovered control_url=%s service=%s\n", igd.Control_URL, igd.Service_Type)
+
+	upnp_tcp_mapped := false
+	upnp_udp_mapped := false
+	if !nat_tcp_mapped {
+		tcp_error := UPnP_IGD_Add_Port_Mapping(&igd, UPnP_IGD_Mapping{
+			Protocol = .TCP,
+			Internal_Client = internal_ip,
+			Internal_Port = listen_port,
+			External_Port = listen_port,
+			Description = "Fatboy Durrent TCP",
+			Enabled = true,
+			Lease_Duration = 0,
+		}, options)
+		upnp_tcp_mapped = tcp_error == .None
+		if upnp_tcp_mapped {
+			fmt.printf("[DURRENT-NAT] UPnP TCP mapped internal=%s:%d external=%d\n", internal_ip, listen_port, listen_port)
+		} else {
+			fmt.printf("[DURRENT-NAT] UPnP TCP mapping unavailable error=%v\n", tcp_error)
+		}
+	}
+	if !nat_udp_mapped {
+		udp_error := UPnP_IGD_Add_Port_Mapping(&igd, UPnP_IGD_Mapping{
+			Protocol = .UDP,
+			Internal_Client = internal_ip,
+			Internal_Port = listen_port,
+			External_Port = listen_port,
+			Description = "Fatboy Durrent UDP",
+			Enabled = true,
+			Lease_Duration = 0,
+		}, options)
+		upnp_udp_mapped = udp_error == .None
+		if upnp_udp_mapped {
+			fmt.printf("[DURRENT-NAT] UPnP UDP mapped internal=%s:%d external=%d\n", internal_ip, listen_port, listen_port)
+		} else {
+			fmt.printf("[DURRENT-NAT] UPnP UDP mapping unavailable error=%v\n", udp_error)
+		}
+	}
+	if upnp_tcp_mapped || upnp_udp_mapped {
+		loop.UPnP_IGD = igd
+		loop.UPnP_TCP_Mapped = upnp_tcp_mapped
+		loop.UPnP_UDP_Mapped = upnp_udp_mapped
+		loop.UPnP_Port = listen_port
+		return
+	}
+	UPnP_IGD_Destroy(&igd)
+	fmt.printf("[DURRENT-NAT] automatic mapping unavailable; forward TCP/UDP %d on your router/firewall for inbound peers\n", listen_port)
+}
+
+// UPnP mappings are owned by the loop. Extract the ownership under the mutex,
+// then issue SOAP cleanup without blocking the worker or UI.
+loop_release_upnp_mappings :: proc(loop: ^Torrent_Session_Loop) {
+	if loop == nil {
+		return
+	}
+	igd: UPnP_IGD
+	tcp_mapped := false
+	udp_mapped := false
+	port: u16
+	sync.mutex_lock(&loop.Mutex)
+	if loop.UPnP_TCP_Mapped || loop.UPnP_UDP_Mapped {
+		igd = loop.UPnP_IGD
+		tcp_mapped = loop.UPnP_TCP_Mapped
+		udp_mapped = loop.UPnP_UDP_Mapped
+		port = loop.UPnP_Port
+		loop.UPnP_IGD = UPnP_IGD{}
+		loop.UPnP_TCP_Mapped = false
+		loop.UPnP_UDP_Mapped = false
+		loop.UPnP_Port = 0
+	}
+	sync.mutex_unlock(&loop.Mutex)
+	if !tcp_mapped && !udp_mapped {
+		return
+	}
+	options := UPnP_IGD_Options{
+		HTTP_Connect_Timeout = 3,
+		HTTP_Total_Timeout = 5,
+		Max_Response_Bytes = 1024 * 1024,
+	}
+	if tcp_mapped {
+		delete_error := UPnP_IGD_Delete_Port_Mapping(&igd, port, .TCP, "", options)
+		fmt.printf("[DURRENT-NAT] UPnP TCP mapping release port=%d result=%v\n", port, delete_error)
+	}
+	if udp_mapped {
+		delete_error := UPnP_IGD_Delete_Port_Mapping(&igd, port, .UDP, "", options)
+		fmt.printf("[DURRENT-NAT] UPnP UDP mapping release port=%d result=%v\n", port, delete_error)
+	}
+	UPnP_IGD_Destroy(&igd)
+}
+
+loop_restore_listener_and_nat :: proc(loop: ^Torrent_Session_Loop) {
+	if loop == nil {
+		return
+	}
+	restore := false
+	port: u16
+	sync.mutex_lock(&loop.Mutex)
+	if loop.State == .Paused && !loop.Listener_Open && !loop.Listener6_Open {
+		restore = true
+		port = loop.Port
+	}
+	sync.mutex_unlock(&loop.Mutex)
+	if !restore {
+		return
+	}
+	listen_port := loop_open_listeners(loop, port)
+	if loop.Listener_Open {
+		loop.Port = listen_port
+		fmt.printf("[DURRENT-NAT] listener resumed requested=%d bound=%d tcp4=%v tcp6=%v\n", port, listen_port, loop.Listener_Open, loop.Listener6_Open)
+		loop_configure_nat_mappings(loop, listen_port)
+	}
 }
 
 loop_close_listeners :: proc(loop: ^Torrent_Session_Loop) {
