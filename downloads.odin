@@ -1450,7 +1450,7 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
         &torrent,
         app.download_path,
         download_durrent_peer_id(),
-        0,
+        DURRENT_LISTEN_PORT,
         false,
     )
     fmt.printf("[DOWNLOAD] Durrent session open entry=%d result=%v\n", entry_index, open_error)

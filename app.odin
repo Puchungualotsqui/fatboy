@@ -47,9 +47,13 @@ AppScreen :: enum {
 
 
 DownloadProvider :: enum {
-    RealDebrid,
-    Durrent,
+	RealDebrid,
+	Durrent,
 }
+
+// Keep one predictable BitTorrent port so users can forward it on their
+// router/firewall and trackers/DHT can advertise a reachable endpoint.
+DURRENT_LISTEN_PORT :: u16(51413)
 
 
 GameRelease :: struct {

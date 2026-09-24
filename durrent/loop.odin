@@ -129,6 +129,39 @@ Torrent_Session_Loop_Open :: proc(
 		return .Scheduler
 	}
 	listen_port := loop_open_listeners(loop, port)
+	fmt.printf(
+		"[DURRENT-NAT] listener requested=%d bound=%d tcp4=%v tcp6=%v\n",
+		port,
+		listen_port,
+		loop.Listener_Open,
+		loop.Listener6_Open,
+	)
+	if listen_port > 0 && loop.Listener_Open {
+		mapping, mapping_error := NAT_PMP_Map_TCP(listen_port, listen_port, 2*60*60, time.Second)
+		if mapping_error == .None {
+			fmt.printf(
+				"[DURRENT-NAT] NAT-PMP TCP mapped gateway=%v internal=%d external=%d lifetime=%ds\n",
+				mapping.Gateway,
+				mapping.Internal_Port,
+				mapping.External_Port,
+				mapping.Lifetime,
+			)
+		} else {
+			fmt.printf("[DURRENT-NAT] NAT-PMP TCP mapping unavailable error=%v\n", mapping_error)
+		}
+		udp_mapping, udp_mapping_error := NAT_PMP_Map_UDP(listen_port, listen_port, 2*60*60, time.Second)
+		if udp_mapping_error == .None {
+			fmt.printf(
+				"[DURRENT-NAT] NAT-PMP UDP mapped gateway=%v internal=%d external=%d lifetime=%ds\n",
+				udp_mapping.Gateway,
+				udp_mapping.Internal_Port,
+				udp_mapping.External_Port,
+				udp_mapping.Lifetime,
+			)
+		} else if mapping_error != .None {
+			fmt.printf("[DURRENT-NAT] NAT-PMP unavailable; forward TCP/UDP %d on your router/firewall for inbound peers\n", listen_port)
+		}
+	}
 	request := Tracker_Announce_Request{
 		Info_Hash = torrent.Info_Hash,
 		Peer_ID = peer_id,
@@ -155,7 +188,9 @@ Torrent_Session_Loop_Open :: proc(
 	// few interested clients.
 	loop.Peer_Limit = 16
 	loop.Tick_Interval = 100 * time.Millisecond
-	loop.Peer_Connect_Timeout = time.Second
+	// Dials are asynchronous, so allow ordinary high-latency/NAT peers enough
+	// time to complete TCP without delaying established peer traffic.
+	loop.Peer_Connect_Timeout = 5 * time.Second
 	loop.Next_Peer_ID = 1
 	loop.Port = listen_port
 	// Peer exchange is optional and not needed while tracker and DHT discovery
