@@ -53,6 +53,7 @@ Torrent_Loop_Peer :: struct {
 	PEX_Last_Sent:        time.Time,
 	Interested_At:        time.Time,
 	Last_Choke_Log:       time.Time,
+	Dial_Started:         time.Time,
 }
 
 Torrent_Session_Loop :: struct {
@@ -263,14 +264,9 @@ Torrent_Session_Loop_Tick :: proc(loop: ^Torrent_Session_Loop, now: time.Time) -
 	loop_accept_peers_locked(loop)
 	loop_consume_dht_result_locked(loop)
 	finished_dht: ^thread.Thread
+	// Outbound peer dialing is asynchronous, so start several candidates per
+	// tick without delaying active peers' handshake, unchoke, or piece traffic.
 	connect_budget := 4
-	if len(loop.Peers) > 0 {
-		// A public swarm commonly keeps many interested peers choked. Continue
-		// rotating one candidate at a time until the peer limit is populated;
-		// otherwise one non-uploading connection can stall the torrent forever.
-		// Keeping this to one bounds each tick's synchronous dial delay.
-		connect_budget = 1
-	}
 	if loop.DHT_Worker != nil && !loop.DHT_Worker_Started && thread.is_done(loop.DHT_Worker) {
 		finished_dht = loop.DHT_Worker
 		loop.DHT_Worker = nil
@@ -761,8 +757,7 @@ loop_connect_pending_peers :: proc(loop: ^Torrent_Session_Loop, maximum: int) {
 	if loop == nil || maximum <= 0 {
 		return
 	}
-	attempted: u32
-	connected: u32
+	started: u32
 	failed: u32
 	for attempt := 0; attempt < maximum; attempt += 1 {
 		sync.mutex_lock(&loop.Mutex)
@@ -780,17 +775,16 @@ loop_connect_pending_peers :: proc(loop: ^Torrent_Session_Loop, maximum: int) {
 		piece_count := loop.Scheduler.Piece_Count
 		piece_length := loop.Scheduler.Piece_Length
 		total_length := loop.Scheduler.Total_Length
-		connect_timeout := loop.Peer_Connect_Timeout
 		sync.mutex_unlock(&loop.Mutex)
 
 		peer := new(Torrent_Loop_Peer, context.allocator)
 		peer.ID = peer_id
 		peer.Endpoint = endpoint
 		peer.Address = PEX_Peer_Address(endpoint)
-		attempted += 1
+		peer.Dial_Started = time.now()
 		peer_error := Peer_Session_Init(&peer.Session, info_hash, local_peer_id, piece_count, piece_length, total_length)
 		if peer_error == .None {
-			peer_error = Peer_Session_Connect(&peer.Session, peer.Address, connect_timeout)
+			peer_error = Peer_Session_Begin_Connect(&peer.Session, peer.Address)
 		}
 		if peer_error != .None {
 			failed += 1
@@ -800,7 +794,6 @@ loop_connect_pending_peers :: proc(loop: ^Torrent_Session_Loop, maximum: int) {
 			continue
 		}
 
-		connected += 1
 		sync.mutex_lock(&loop.Mutex)
 		if loop.Stop_Requested || len(loop.Peers) >= int(loop.Peer_Limit) || loop_has_peer_address(loop, peer.Address) {
 			sync.mutex_unlock(&loop.Mutex)
@@ -810,17 +803,17 @@ loop_connect_pending_peers :: proc(loop: ^Torrent_Session_Loop, maximum: int) {
 			continue
 		}
 		append(&loop.Peers, peer)
+		started += 1
 		sync.mutex_unlock(&loop.Mutex)
 	}
-	if attempted > 0 {
+	if started > 0 || failed > 0 {
 		sync.mutex_lock(&loop.Mutex)
 		pending := len(loop.Pending_Peers)
 		active := len(loop.Peers)
 		sync.mutex_unlock(&loop.Mutex)
 		fmt.printf(
-			"[DURRENT-PEER] dial summary attempted=%d connected=%d failed=%d active=%d pending=%d\n",
-			attempted,
-			connected,
+			"[DURRENT-PEER] dial starts=%d failed=%d active=%d pending=%d\n",
+			started,
 			failed,
 			active,
 			pending,
@@ -832,6 +825,24 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 	index := 0
 	for index < len(loop.Peers) {
 		peer := loop.Peers[index]
+		if peer.Session.State == .New {
+			if time.diff(peer.Dial_Started, time.now()) >= loop.Peer_Connect_Timeout {
+				fmt.printf("[DURRENT-PEER] dial timed out address=%s\n", peer.Address)
+				loop_remove_peer_locked(loop, index)
+				continue
+			}
+			dial_done, dial_error := Peer_Session_Poll_Connect(&peer.Session, loop.Peer_Connect_Timeout)
+			if dial_error != .None {
+				fmt.printf("[DURRENT-PEER] dial failed address=%s error=%v\n", peer.Address, dial_error)
+				loop_remove_peer_locked(loop, index)
+				continue
+			}
+			if !dial_done {
+				index += 1
+				continue
+			}
+			fmt.printf("[DURRENT-PEER] dial connected address=%s\n", peer.Address)
+		}
 		poll_error := Peer_Session_Poll(&peer.Session)
 		if poll_error != .None && poll_error != .Timeout {
 			fmt.printf(

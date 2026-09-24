@@ -39,7 +39,7 @@ Peer_Transport :: struct {
 	Pending_Dial:  ^Peer_Dial_Job,
 }
 
-Peer_Transport_Connect :: proc(transport: ^Peer_Transport, address: string, timeout: time.Duration) -> Peer_Transport_Error {
+Peer_Transport_Begin_Connect :: proc(transport: ^Peer_Transport, address: string) -> Peer_Transport_Error {
 	if transport == nil {
 		return .Invalid_Transport
 	}
@@ -56,6 +56,60 @@ Peer_Transport_Connect :: proc(transport: ^Peer_Transport, address: string, time
 		transport.Pending_Dial = nil
 		return .Connect
 	}
+	return .None
+}
+
+// Polls a dial started by Peer_Transport_Begin_Connect. It never blocks: done
+// is false while the resolver/TCP worker is still running.
+Peer_Transport_Poll_Connect :: proc(transport: ^Peer_Transport, timeout: time.Duration) -> (done: bool, err: Peer_Transport_Error) {
+	if transport == nil {
+		return false, .Invalid_Transport
+	}
+	if transport.Connected {
+		return true, .None
+	}
+	job := transport.Pending_Dial
+	if job == nil {
+		return true, .Connect
+	}
+	sync.mutex_lock(&job.Mutex)
+	if !job.Done {
+		sync.mutex_unlock(&job.Mutex)
+		return false, .None
+	}
+	socket := job.Socket
+	dial_failed := job.Error
+	sync.mutex_unlock(&job.Mutex)
+	transport.Pending_Dial = nil
+	delete(job.Address)
+	free(job)
+	if dial_failed {
+		return true, .Resolve
+	}
+	read_timeout := 100 * time.Millisecond if timeout > 0 else time.Duration(0)
+	if timeout > 0 && (net.set_option(socket, .Receive_Timeout, read_timeout) != nil || net.set_option(socket, .Send_Timeout, timeout) != nil) {
+		net.close(socket)
+		return true, .Timeout
+	}
+	transport.Socket = socket
+	transport.Connected = true
+	transport.Read_Timeout = read_timeout
+	transport.Write_Timeout = timeout
+	return true, .None
+}
+
+Peer_Transport_Connect :: proc(transport: ^Peer_Transport, address: string, timeout: time.Duration) -> Peer_Transport_Error {
+	if transport == nil {
+		return .Invalid_Transport
+	}
+	if transport.Connected || transport.Pending_Dial != nil || len(address) == 0 {
+		return .Already_Connected if transport.Connected else .Connect
+	}
+	begin_error := Peer_Transport_Begin_Connect(transport, address)
+	if begin_error != .None {
+		return begin_error
+	}
+	job := transport.Pending_Dial
 	started := time.now()
 	for {
 		sync.mutex_lock(&job.Mutex)

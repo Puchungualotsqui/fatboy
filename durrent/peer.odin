@@ -181,6 +181,45 @@ Peer_Session_Connect :: proc(session: ^Peer_Session, address: string, timeout: t
 	return peer_session_begin_locked(session)
 }
 
+// Starts an outbound dial without waiting for DNS/TCP completion. Pair with
+// Peer_Session_Poll_Connect from an event loop.
+Peer_Session_Begin_Connect :: proc(session: ^Peer_Session, address: string) -> Peer_Error {
+	if session == nil {
+		return .Invalid_Peer
+	}
+	sync.mutex_lock(&session.Mutex)
+	defer sync.mutex_unlock(&session.Mutex)
+	if session.State != .New {
+		return .Invalid_State
+	}
+	transport_error := Peer_Transport_Begin_Connect(&session.Transport, address)
+	if transport_error != .None {
+		return peer_session_fail_locked(session, peer_transport_error(transport_error))
+	}
+	return .None
+}
+
+// Completes a previously started outbound dial when its worker finishes.
+// done=false is not an error and means the dial is still pending.
+Peer_Session_Poll_Connect :: proc(session: ^Peer_Session, timeout: time.Duration) -> (done: bool, err: Peer_Error) {
+	if session == nil {
+		return true, .Invalid_Peer
+	}
+	sync.mutex_lock(&session.Mutex)
+	defer sync.mutex_unlock(&session.Mutex)
+	if session.State != .New {
+		return true, .Invalid_State
+	}
+	dial_done, transport_error := Peer_Transport_Poll_Connect(&session.Transport, timeout)
+	if !dial_done {
+		return false, .None
+	}
+	if transport_error != .None {
+		return true, peer_session_fail_locked(session, peer_transport_error(transport_error))
+	}
+	return true, peer_session_begin_locked(session)
+}
+
 Peer_Session_Accept :: proc(session: ^Peer_Session, socket: net.TCP_Socket, timeout: time.Duration) -> Peer_Error {
 	if session == nil {
 		return .Invalid_Peer
