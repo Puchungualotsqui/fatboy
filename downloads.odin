@@ -1010,12 +1010,33 @@ download_remove_durrent_artifacts :: proc(
 }
 
 
+durrent_peer_id: [20]byte
+durrent_peer_id_initialized: bool
+
+
 download_durrent_peer_id :: proc() -> (peer_id: [20]byte) {
-    value := "-FB0100-DURRENT-0001"
-    for index := 0; index < len(value) && index < len(peer_id); index += 1 {
-        peer_id[index] = value[index]
+    // Reuse one ID for this process so tracker, metadata, and download
+    // connections identify the same client, but never reuse the old fixed
+    // ID across launches.
+    if !durrent_peer_id_initialized {
+        prefix := "-FB0100-"
+        for index := 0; index < len(prefix); index += 1 {
+            durrent_peer_id[index] = prefix[index]
+        }
+
+        // A timestamp-seeded nonce prevents reuse across Fatboy processes.
+        value := u64(time.to_unix_nanoseconds(time.now()))
+        alphabet := "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        for index := 8; index < len(durrent_peer_id); index += 1 {
+            value = value ~ (value << 13)
+            value = value ~ (value >> 7)
+            value = value ~ (value << 17)
+            durrent_peer_id[index] = alphabet[int(value % u64(len(alphabet)))]
+        }
+        durrent_peer_id_initialized = true
+        fmt.printf("[DURRENT-PEER] local peer_id=%q\n", string(durrent_peer_id[:]))
     }
-    return peer_id
+    return durrent_peer_id
 }
 
 

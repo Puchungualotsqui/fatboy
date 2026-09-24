@@ -51,6 +51,8 @@ Torrent_Loop_Peer :: struct {
 	Remote_PEX_ID:        byte,
 	PEX_Handshake_Sent:   bool,
 	PEX_Last_Sent:        time.Time,
+	Interested_At:        time.Time,
+	Last_Choke_Log:       time.Time,
 }
 
 Torrent_Session_Loop :: struct {
@@ -853,6 +855,9 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 			// after receiving this message; without it the scheduler can never
 			// send requests, even when the handshake and bitfield succeeded.
 			interest_error := Peer_Session_Queue_Interested(&peer.Session, true)
+			if interest_error == .None {
+				peer.Interested_At = time.now()
+			}
 			fmt.printf("[DURRENT-PEER] interested address=%s result=%v\n", peer.Address, interest_error)
 			if interest_error != .None {
 				loop_remove_peer_locked(loop, index)
@@ -886,6 +891,16 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 		if peer.Registered && peer.Session.State == .Ready && !pex_handshake_queued {
 			loop_queue_peer_requests_locked(loop, peer)
 		}
+		if peer.Registered && peer.Session.State == .Ready && peer.Session.Remote_Choking &&
+		   time.diff(peer.Last_Choke_Log, time.now()) >= 10*time.Second {
+			fmt.printf(
+				"[DURRENT-PEER] still choked address=%s for=%v local_interested=%v\n",
+				peer.Address,
+				time.diff(peer.Interested_At, time.now()),
+				peer.Session.Local_Interested,
+			)
+			peer.Last_Choke_Log = time.now()
+		}
 		index += 1
 	}
 }
@@ -898,7 +913,12 @@ loop_process_peer_events_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torr
 		}
 		switch event.Kind {
 		case .Handshake:
-			fmt.printf("[DURRENT-PEER] handshake address=%s\n", peer.Address)
+			fmt.printf(
+				"[DURRENT-PEER] handshake address=%s remote_peer_id=%q extensions=%v\n",
+				peer.Address,
+				string(peer.Session.Remote_Peer_ID[:]),
+				peer.Session.Remote_Extensions,
+			)
 		case .Bitfield:
 			bitfield, bitfield_error := Bitfield_From_Raw(event.Payload, loop.Scheduler.Piece_Count)
 			if bitfield_error == .None {
@@ -914,10 +934,18 @@ loop_process_peer_events_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torr
 		case .Have:
 			_ = Piece_Scheduler_Peer_Have(&loop.Scheduler, peer.ID, event.Index)
 		case .Choke:
-			fmt.printf("[DURRENT-PEER] choke address=%s\n", peer.Address)
+			fmt.printf(
+				"[DURRENT-PEER] choke address=%s after_interest=%v\n",
+				peer.Address,
+				time.diff(peer.Interested_At, time.now()),
+			)
 			_ = Piece_Scheduler_Set_Peer_Choked(&loop.Scheduler, peer.ID, true)
 		case .Unchoke:
-			fmt.printf("[DURRENT-PEER] unchoke address=%s\n", peer.Address)
+			fmt.printf(
+				"[DURRENT-PEER] unchoke address=%s after_interest=%v\n",
+				peer.Address,
+				time.diff(peer.Interested_At, time.now()),
+			)
 			_ = Piece_Scheduler_Set_Peer_Choked(&loop.Scheduler, peer.ID, false)
 		case .Piece:
 			write_error := Torrent_Storage_Write_Block(&loop.Storage, event.Index, event.Begin, event.Payload)
@@ -967,11 +995,39 @@ loop_process_peer_events_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torr
 				}
 			}
 		case .Extended:
+			loop_log_extended_handshake(peer, event.Payload)
 			loop_process_pex_event_locked(loop, peer, event.Payload)
-		case .Keep_Alive, .Interested, .Not_Interested, .Cancel, .Port:
+		case .Keep_Alive:
+			fmt.printf("[DURRENT-PEER] keep-alive address=%s\n", peer.Address)
+		case .Interested, .Not_Interested, .Cancel, .Port:
 			{}
 		}
 		Destroy_Peer_Event(&event)
+	}
+}
+
+loop_log_extended_handshake :: proc(peer: ^Torrent_Loop_Peer, payload: []byte) {
+	if peer == nil || len(payload) < 2 || payload[0] != 0 {
+		return
+	}
+	root, decode_error := Bencode_Decode_Default(payload[1:])
+	if decode_error != .None || root.Kind != .Dictionary {
+		fmt.printf("[DURRENT-PEER] extension handshake invalid address=%s error=%v\n", peer.Address, decode_error)
+		Destroy_Bencode_Value(&root)
+		return
+	}
+	defer Destroy_Bencode_Value(&root)
+
+	mapping := Bencode_Dictionary_Get(&root, "m")
+	if mapping == nil || mapping.Kind != .Dictionary {
+		fmt.printf("[DURRENT-PEER] extension handshake address=%s mappings=0\n", peer.Address)
+		return
+	}
+	fmt.printf("[DURRENT-PEER] extension handshake address=%s mappings=%d\n", peer.Address, len(mapping.Dictionary))
+	for entry in mapping.Dictionary {
+		if entry.Value.Kind == .Integer {
+			fmt.printf("[DURRENT-PEER] extension address=%s name=%q id=%d\n", peer.Address, string(entry.Key), entry.Value.Integer)
+		}
 	}
 }
 
