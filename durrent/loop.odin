@@ -89,6 +89,7 @@ Torrent_Session_Loop :: struct {
 	DHT_Bootstrap:           [dynamic]DHT_Node,
 	DHT_Result:              DHT_Lookup_Result,
 	DHT_Result_Ready:        bool,
+	Pending_Peers:           [dynamic]PEX_Peer,
 }
 
 Torrent_Session_Loop_Open :: proc(
@@ -229,6 +230,12 @@ Torrent_Session_Loop_Tick :: proc(loop: ^Torrent_Session_Loop, now: time.Time) -
 	}
 	loop_accept_peers_locked(loop)
 	loop_consume_dht_result_locked(loop)
+	// Peer TCP dials can wait for seconds. Do not hold the loop mutex while
+	// contacting DHT/tracker candidates, otherwise UI snapshots and pause/
+	// cancel operations appear frozen.
+	sync.mutex_unlock(&loop.Mutex)
+	loop_connect_pending_peers(loop, 4)
+	sync.mutex_lock(&loop.Mutex)
 	loop_poll_peers_locked(loop)
 	loop_update_rates_locked(loop, now)
 	if Piece_Scheduler_Is_Seeding(&loop.Scheduler) {
@@ -324,6 +331,7 @@ Torrent_Session_Loop_Pause :: proc(loop: ^Torrent_Session_Loop) -> Torrent_Loop_
 	}
 	delete(loop.Peers)
 	loop.Peers = nil
+	delete(loop.Pending_Peers)
 	_ = Torrent_Storage_Flush(&loop.Storage)
 	sync.mutex_unlock(&loop.Mutex)
 	return .None
@@ -385,6 +393,7 @@ Torrent_Session_Loop_Shutdown :: proc(loop: ^Torrent_Session_Loop) -> Torrent_Lo
 	}
 	delete(loop.Peers)
 	loop.Peers = nil
+	delete(loop.Pending_Peers)
 	Tracker_Manager_Destroy(&loop.Tracker)
 	Piece_Scheduler_Destroy(&loop.Scheduler)
 	Torrent_Storage_Close(&loop.Storage)
@@ -646,26 +655,80 @@ loop_consume_dht_result_locked :: proc(loop: ^Torrent_Session_Loop) {
 }
 
 loop_add_peer_address_locked :: proc(loop: ^Torrent_Session_Loop, address: string, endpoint: PEX_Peer) {
-	if loop == nil || len(loop.Peers) >= int(loop.Peer_Limit) || loop_has_peer_address(loop, address) {
+	if loop == nil || endpoint.Port == 0 ||
+	   len(loop.Peers)+len(loop.Pending_Peers) >= int(loop.Peer_Limit) ||
+	   loop_has_peer_address(loop, address) ||
+	   loop_has_pending_peer_address(loop, endpoint) {
 		delete(address)
 		return
 	}
-	peer := new(Torrent_Loop_Peer, context.allocator)
-	peer.ID = loop.Next_Peer_ID
-	loop.Next_Peer_ID += 1
-	peer.Address = address
-	peer.Endpoint = endpoint
-	peer_error := Peer_Session_Init(&peer.Session, loop.Info_Hash, loop.Peer_ID, loop.Scheduler.Piece_Count, loop.Scheduler.Piece_Length, loop.Scheduler.Total_Length)
-	if peer_error == .None {
-		peer_error = Peer_Session_Connect(&peer.Session, address, loop.Peer_Connect_Timeout)
+	append(&loop.Pending_Peers, endpoint)
+	delete(address)
+}
+
+
+loop_has_pending_peer_address :: proc(loop: ^Torrent_Session_Loop, endpoint: PEX_Peer) -> bool {
+	if loop == nil {
+		return false
 	}
-	if peer_error != .None {
-		Destroy_Peer_Session(&peer.Session)
-		delete(peer.Address)
-		free(peer)
+	for pending in loop.Pending_Peers {
+		if pending.IP == endpoint.IP && pending.Port == endpoint.Port && pending.IPv6 == endpoint.IPv6 {
+			return true
+		}
+	}
+	return false
+}
+
+
+loop_connect_pending_peers :: proc(loop: ^Torrent_Session_Loop, maximum: int) {
+	if loop == nil || maximum <= 0 {
 		return
 	}
-	append(&loop.Peers, peer)
+	for attempt := 0; attempt < maximum; attempt += 1 {
+		sync.mutex_lock(&loop.Mutex)
+		if loop.Stop_Requested || len(loop.Pending_Peers) == 0 || len(loop.Peers) >= int(loop.Peer_Limit) {
+			sync.mutex_unlock(&loop.Mutex)
+			return
+		}
+		endpoint := loop.Pending_Peers[0]
+		copy(loop.Pending_Peers[:], loop.Pending_Peers[1:])
+		resize(&loop.Pending_Peers, len(loop.Pending_Peers)-1)
+		peer_id := loop.Next_Peer_ID
+		loop.Next_Peer_ID += 1
+		info_hash := loop.Info_Hash
+		local_peer_id := loop.Peer_ID
+		piece_count := loop.Scheduler.Piece_Count
+		piece_length := loop.Scheduler.Piece_Length
+		total_length := loop.Scheduler.Total_Length
+		connect_timeout := loop.Peer_Connect_Timeout
+		sync.mutex_unlock(&loop.Mutex)
+
+		peer := new(Torrent_Loop_Peer, context.allocator)
+		peer.ID = peer_id
+		peer.Endpoint = endpoint
+		peer.Address = PEX_Peer_Address(endpoint)
+		peer_error := Peer_Session_Init(&peer.Session, info_hash, local_peer_id, piece_count, piece_length, total_length)
+		if peer_error == .None {
+			peer_error = Peer_Session_Connect(&peer.Session, peer.Address, connect_timeout)
+		}
+		if peer_error != .None {
+			Destroy_Peer_Session(&peer.Session)
+			delete(peer.Address)
+			free(peer)
+			continue
+		}
+
+		sync.mutex_lock(&loop.Mutex)
+		if loop.Stop_Requested || len(loop.Peers) >= int(loop.Peer_Limit) || loop_has_peer_address(loop, peer.Address) {
+			sync.mutex_unlock(&loop.Mutex)
+			Destroy_Peer_Session(&peer.Session)
+			delete(peer.Address)
+			free(peer)
+			continue
+		}
+		append(&loop.Peers, peer)
+		sync.mutex_unlock(&loop.Mutex)
+	}
 }
 
 loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
