@@ -101,6 +101,10 @@ Torrent_Session_Loop :: struct {
 	Listener6:               net.TCP_Socket,
 	Listener_Open:           bool,
 	Listener6_Open:          bool,
+	UDP_Listener:            net.UDP_Socket,
+	UDP_Listener6:           net.UDP_Socket,
+	UDP_Listener_Open:       bool,
+	UDP_Listener6_Open:      bool,
 	DHT:                     DHT_Client,
 	DHT_Enabled:             bool,
 	DHT_Worker:              ^thread.Thread,
@@ -199,8 +203,15 @@ Torrent_Session_Loop_Open :: proc(
 	if !loop.UTP_Configured {
 		loop.UTP_Enabled = true
 	}
-	if Torrent_Allows_DHT(torrent) {
-		loop.DHT_Enabled = DHT_Client_Init(&loop.DHT, torrent, DHT_Node_ID_Generate(u64(time.to_unix_seconds(time.now()))), listen_port) == .None
+	if Torrent_Allows_DHT(torrent) && loop.UDP_Listener_Open {
+		loop.DHT_Enabled = DHT_Client_Init_External(
+			&loop.DHT,
+			torrent,
+			DHT_Node_ID_Generate(u64(time.to_unix_seconds(time.now()))),
+			loop.UDP_Listener,
+			loop.UDP_Listener6,
+			loop.UDP_Listener6_Open,
+		) == .None
 	}
 	loop.Stats_Time = time.now()
 	loop.Stats_Downloaded = 0
@@ -282,6 +293,8 @@ Torrent_Session_Loop_Tick :: proc(loop: ^Torrent_Session_Loop, now: time.Time) -
 		loop.State = .Failed
 		return .Scheduler
 	}
+	// Flush queued DHT requests before a potentially blocking tracker announce.
+	loop_pump_udp_locked(loop)
 	announce_due := Tracker_Manager_Announce_Due(&loop.Tracker, now)
 	if announce_due {
 		// Tracker HTTP/UDP operations can block for several seconds. Release
@@ -314,6 +327,7 @@ Torrent_Session_Loop_Tick :: proc(loop: ^Torrent_Session_Loop, now: time.Time) -
 		}
 		Destroy_Tracker_Response(&response)
 	}
+	loop_pump_udp_locked(loop)
 	loop_accept_peers_locked(loop)
 	loop_consume_dht_result_locked(loop)
 	finished_dht: ^thread.Thread
@@ -545,6 +559,20 @@ loop_open_listeners :: proc(loop: ^Torrent_Session_Loop, port: u16) -> u16 {
 	} else if listener6_error == nil {
 		net.close(listener6)
 	}
+	udp, udp_error := net.make_bound_udp_socket(net.IP4_Any, int(actual_port))
+	if udp_error == nil && net.set_blocking(udp, false) == nil {
+		loop.UDP_Listener = udp
+		loop.UDP_Listener_Open = true
+	} else if udp_error == nil {
+		net.close(udp)
+	}
+	udp6, udp6_error := net.make_bound_udp_socket(net.IP6_Any, int(actual_port))
+	if udp6_error == nil && net.set_blocking(udp6, false) == nil {
+		loop.UDP_Listener6 = udp6
+		loop.UDP_Listener6_Open = true
+	} else if udp6_error == nil {
+		net.close(udp6)
+	}
 	return actual_port
 }
 
@@ -729,6 +757,67 @@ loop_close_listeners :: proc(loop: ^Torrent_Session_Loop) {
 		net.close(loop.Listener6)
 		loop.Listener6_Open = false
 	}
+	if loop.UDP_Listener_Open {
+		net.close(loop.UDP_Listener)
+		loop.UDP_Listener_Open = false
+	}
+	if loop.UDP_Listener6_Open {
+		net.close(loop.UDP_Listener6)
+		loop.UDP_Listener6_Open = false
+	}
+}
+
+// The loop is the only receiver for its advertised UDP ports. KRPC and uTP
+// are discriminated before dispatch; malformed datagrams are dropped silently.
+loop_pump_udp_locked :: proc(loop: ^Torrent_Session_Loop) {
+	if loop == nil { return }
+	if loop.UDP_Listener_Open { loop_pump_udp_socket_locked(loop, loop.UDP_Listener, false) }
+	if loop.UDP_Listener6_Open { loop_pump_udp_socket_locked(loop, loop.UDP_Listener6, true) }
+	loop_flush_dht_outbound_locked(loop)
+}
+
+loop_pump_udp_socket_locked :: proc(loop: ^Torrent_Session_Loop, socket: net.UDP_Socket, ipv6: bool) {
+	buffer: [UTP_Max_Packet_Size]byte
+	for _ in 0..<32 {
+		count, source, receive_error := net.recv_udp(socket, buffer[:])
+		if receive_error == .Would_Block || receive_error == .Timeout { break }
+		if receive_error != .None || count <= 0 { break }
+		endpoint := loop_endpoint_to_pex(source)
+		if count > 0 && buffer[0] == 'd' {
+			if loop.DHT_Enabled {
+				dht_source: DHT_Endpoint
+				dht_source.IP = endpoint.IP
+				dht_source.Port = endpoint.Port
+				dht_source.IPv6 = endpoint.IPv6
+				_ = DHT_Client_Handle_Datagram(&loop.DHT, buffer[:count], dht_source)
+			}
+			continue
+		}
+		header, header_error := UTP_Header_Parse(buffer[:count])
+		if header_error != .None { continue }
+		if loop_dispatch_utp_locked(loop, socket, source, endpoint, header, buffer[:count]) {
+			continue
+		}
+	}
+}
+
+loop_flush_dht_outbound_locked :: proc(loop: ^Torrent_Session_Loop) {
+	if loop == nil || !loop.DHT_Enabled { return }
+	for _ in 0..<16 {
+		packet, found := DHT_Client_Dequeue_Outbound(&loop.DHT)
+		if !found { break }
+		socket := loop.UDP_Listener6 if packet.Endpoint.IPv6 else loop.UDP_Listener
+		valid_socket := loop.UDP_Listener6_Open if packet.Endpoint.IPv6 else loop.UDP_Listener_Open
+		if !valid_socket {
+			_ = DHT_Client_Mark_Send_Error(&loop.DHT, packet)
+			delete(packet.Data)
+			continue
+		}
+		remote := loop_dht_endpoint(packet.Endpoint)
+		_, send_error := net.send_udp(socket, packet.Data, remote)
+		if send_error != .None { _ = DHT_Client_Mark_Send_Error(&loop.DHT, packet) }
+		delete(packet.Data)
+	}
 }
 
 loop_accept_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
@@ -765,14 +854,12 @@ loop_accept_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 	}
 }
 
-loop_add_incoming_peer_locked :: proc(loop: ^Torrent_Session_Loop, socket: net.TCP_Socket, source: net.Endpoint) {
+loop_endpoint_to_pex :: proc(source: net.Endpoint) -> PEX_Peer {
 	endpoint: PEX_Peer
 	switch address in source.address {
 	case net.IP4_Address:
-		endpoint.IP[0] = address[0]
-		endpoint.IP[1] = address[1]
-		endpoint.IP[2] = address[2]
-		endpoint.IP[3] = address[3]
+		endpoint.IP[0] = address[0]; endpoint.IP[1] = address[1]
+		endpoint.IP[2] = address[2]; endpoint.IP[3] = address[3]
 	case net.IP6_Address:
 		endpoint.IPv6 = true
 		for index := 0; index < 8; index += 1 {
@@ -782,6 +869,72 @@ loop_add_incoming_peer_locked :: proc(loop: ^Torrent_Session_Loop, socket: net.T
 		}
 	}
 	endpoint.Port = u16(source.port)
+	return endpoint
+}
+
+loop_dht_endpoint :: proc(endpoint: DHT_Endpoint) -> net.Endpoint {
+	peer := PEX_Peer{IP = endpoint.IP, Port = endpoint.Port, IPv6 = endpoint.IPv6}
+	return loop_pex_endpoint(peer)
+}
+
+loop_dispatch_utp_locked :: proc(loop: ^Torrent_Session_Loop, socket: net.UDP_Socket, source: net.Endpoint, endpoint: PEX_Peer, header: UTP_Header, packet: []byte) -> bool {
+	for peer in loop.Peers {
+		transport := &peer.Session.Transport
+		if transport.Kind != .UTP || transport.UTP.Socket != socket { continue }
+		if header.Type == .Syn && transport.UTP.Send_Connection_ID == header.Connection_ID &&
+			utp_endpoint_equal(source, transport.UTP.Remote) {
+			// A lost STATE must not allocate a second peer/session for a retransmitted SYN.
+			_ = utp_connection_send_control(&transport.UTP, .State, transport.UTP.Next_Sequence)
+			return true
+		}
+		if transport.UTP.Receive_Connection_ID == header.Connection_ID {
+			_ = UTP_Connection_Handle_Datagram(&transport.UTP, packet, source)
+			return true
+		}
+	}
+	address := PEX_Peer_Address(endpoint)
+	defer delete(address)
+	if header.Type != .Syn || len(loop.Peers) >= int(loop.Peer_Limit) || loop_has_peer_address(loop, address) {
+		return false
+	}
+	payload_offset, payload_error := utp_packet_payload_offset(packet, header.Extension)
+	if payload_error != .None || payload_offset != len(packet) || loop_utp_connection_id_in_use(loop, header.Connection_ID) {
+		return false
+	}
+	connection: UTP_Connection
+	if UTP_Connection_Accept_Shared(&connection, socket, source, header) != .None { return false }
+	peer := new(Torrent_Loop_Peer, context.allocator)
+	peer.ID = loop.Next_Peer_ID
+	loop.Next_Peer_ID += 1
+	peer.Endpoint = endpoint
+	peer.Address = PEX_Peer_Address(endpoint)
+	peer.Using_UTP = true
+	peer.Dial_Started = time.now()
+	peer_error := Peer_Session_Init(&peer.Session, loop.Info_Hash, loop.Peer_ID, loop.Scheduler.Piece_Count, loop.Scheduler.Piece_Length, loop.Scheduler.Total_Length)
+	if peer_error == .None { peer_error = Peer_Session_Set_MSE_Policy(&peer.Session, loop.MSE_Policy) }
+	if peer_error == .None { peer_error = Peer_Session_Accept_UTP(&peer.Session, &connection) }
+	if peer_error != .None {
+		UTP_Connection_Close(&connection)
+		Destroy_Peer_Session(&peer.Session)
+		delete(peer.Address)
+		free(peer)
+		return false
+	}
+	append(&loop.Peers, peer)
+	fmt.printf("[DURRENT-uTP] accepted inbound peer=%s\n", peer.Address)
+	return true
+}
+
+loop_utp_connection_id_in_use :: proc(loop: ^Torrent_Session_Loop, connection_id: u16) -> bool {
+	for peer in loop.Peers {
+		transport := &peer.Session.Transport
+		if transport.Kind == .UTP && (transport.UTP.Send_Connection_ID == connection_id || transport.UTP.Receive_Connection_ID == connection_id) { return true }
+	}
+	return false
+}
+
+loop_add_incoming_peer_locked :: proc(loop: ^Torrent_Session_Loop, socket: net.TCP_Socket, source: net.Endpoint) {
+	endpoint := loop_endpoint_to_pex(source)
 	address := PEX_Peer_Address(endpoint)
 	if loop_has_peer_address(loop, address) {
 		delete(address)
@@ -793,6 +946,7 @@ loop_add_incoming_peer_locked :: proc(loop: ^Torrent_Session_Loop, socket: net.T
 	loop.Next_Peer_ID += 1
 	peer.Address = address
 	peer.Endpoint = endpoint
+	peer.Dial_Started = time.now()
 	peer_error := Peer_Session_Init(&peer.Session, loop.Info_Hash, loop.Peer_ID, loop.Scheduler.Piece_Count, loop.Scheduler.Piece_Length, loop.Scheduler.Total_Length)
 	if peer_error == .None {
 		peer_error = Peer_Session_Set_MSE_Policy(&peer.Session, loop.MSE_Policy)
@@ -894,6 +1048,9 @@ torrent_session_loop_worker :: proc(thread_value: ^thread.Thread) {
 		sync.mutex_lock(&loop.Mutex)
 		stop := loop.Stop_Requested
 		interval := loop.Tick_Interval
+		if loop_has_active_utp_locked(loop) && interval > 5*time.Millisecond {
+			interval = 5 * time.Millisecond
+		}
 		sync.mutex_unlock(&loop.Mutex)
 		if stop {
 			return
@@ -901,6 +1058,16 @@ torrent_session_loop_worker :: proc(thread_value: ^thread.Thread) {
 		_ = Torrent_Session_Loop_Tick(loop, time.now())
 		time.sleep(interval)
 	}
+}
+
+loop_has_active_utp_locked :: proc(loop: ^Torrent_Session_Loop) -> bool {
+	if loop == nil { return false }
+	for peer in loop.Peers {
+		if peer.Session.Transport.Kind == .UTP && peer.Session.Transport.UTP.State != .Closed && peer.Session.Transport.UTP.State != .Failed {
+			return true
+		}
+	}
+	return false
 }
 
 loop_add_tracker_peers_locked :: proc(loop: ^Torrent_Session_Loop, response: ^Tracker_Announce_Response) {
@@ -1031,6 +1198,8 @@ loop_connect_pending_peers :: proc(loop: ^Torrent_Session_Loop, maximum: int) {
 		piece_count := loop.Scheduler.Piece_Count
 		piece_length := loop.Scheduler.Piece_Length
 		total_length := loop.Scheduler.Total_Length
+		utp_socket := loop.UDP_Listener6 if endpoint.IPv6 else loop.UDP_Listener
+		utp_socket_open := loop.UDP_Listener6_Open if endpoint.IPv6 else loop.UDP_Listener_Open
 		sync.mutex_unlock(&loop.Mutex)
 
 		peer := new(Torrent_Loop_Peer, context.allocator)
@@ -1046,7 +1215,11 @@ loop_connect_pending_peers :: proc(loop: ^Torrent_Session_Loop, maximum: int) {
 		}
 		if peer_error == .None && use_utp {
 			remote := loop_pex_endpoint(endpoint)
-			peer_error = Peer_Session_Begin_UTP_Connect(&peer.Session, remote)
+			if utp_socket_open {
+				peer_error = Peer_Session_Begin_Shared_UTP_Connect(&peer.Session, utp_socket, remote)
+			} else {
+				peer_error = Peer_Session_Begin_UTP_Connect(&peer.Session, remote)
+			}
 			peer.Using_UTP = peer_error == .None
 		}
 		if peer_error == .None && !peer.Using_UTP {
@@ -1121,6 +1294,12 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 	index := 0
 	for index < len(loop.Peers) {
 		peer := loop.Peers[index]
+		if peer.Session.State == .Handshaking &&
+			time.diff(peer.Dial_Started, time.now()) >= loop.Peer_Connect_Timeout {
+			fmt.printf("[DURRENT-PEER] handshake timed out address=%s\n", peer.Address)
+			loop_remove_peer_locked(loop, index)
+			continue
+		}
 		if peer.Session.State == .New {
 			if time.diff(peer.Dial_Started, time.now()) >= loop.Peer_Connect_Timeout {
 				if loop_fallback_to_tcp_locked(loop, peer) {

@@ -43,6 +43,75 @@ utp_sequence_wraparound_test :: proc(t: ^testing.T) {
 }
 
 @(test)
+utp_inbound_shared_socket_reorder_and_sack_test :: proc(t: ^testing.T) {
+	listener, listener_error := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	testing.expect_value(t, listener_error, nil)
+	defer net.close(listener)
+	testing.expect_value(t, net.set_option(listener, .Receive_Timeout, time.Second), nil)
+	listener_endpoint, endpoint_error := net.bound_endpoint(listener)
+	testing.expect_value(t, endpoint_error, nil)
+	client, client_error := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	testing.expect_value(t, client_error, nil)
+	defer net.close(client)
+	testing.expect_value(t, net.set_option(client, .Receive_Timeout, time.Second), nil)
+
+	syn := UTP_Header_Encode(UTP_Header{Type = .Syn, Connection_ID = 77, Sequence = 1, Window_Size = UTP_Initial_Window})
+	_, send_error := net.send_udp(client, syn[:], listener_endpoint)
+	testing.expect_value(t, send_error, net.UDP_Send_Error.None)
+	wire: [UTP_Max_Packet_Size]byte
+	count, source, receive_error := net.recv_udp(listener, wire[:])
+	testing.expect_value(t, receive_error, net.UDP_Recv_Error.None)
+	parsed_syn, syn_error := UTP_Header_Parse(wire[:count])
+	testing.expect_value(t, syn_error, UTP_Error.None)
+	connection: UTP_Connection
+	defer UTP_Connection_Close(&connection)
+	testing.expect_value(t, UTP_Connection_Accept_Shared(&connection, listener, source, parsed_syn), UTP_Error.None)
+
+	// The server returns STATE on the listener socket and uses the SYN ID as its
+	// send ID. Client DATA subsequently uses SYN ID + 1.
+	count, _, receive_error = net.recv_udp(client, wire[:])
+	testing.expect_value(t, receive_error, net.UDP_Recv_Error.None)
+	state, state_error := UTP_Header_Parse(wire[:count])
+	testing.expect_value(t, state_error, UTP_Error.None)
+	testing.expect_value(t, state.Type, UTP_Packet_Type.State)
+	testing.expect_value(t, state.Connection_ID, u16(77))
+
+	utp_test_send_data(t, client, listener_endpoint, 78, 4, state.Sequence, []byte{'d'})
+	count, source, receive_error = net.recv_udp(listener, wire[:])
+	testing.expect_value(t, receive_error, net.UDP_Recv_Error.None)
+	testing.expect_value(t, UTP_Connection_Handle_Datagram(&connection, wire[:count], source), UTP_Error.None)
+	// The acknowledgement includes a SACK bit for sequence 4 while sequence 2
+	// is still missing.
+	count, _, receive_error = net.recv_udp(client, wire[:])
+	testing.expect_value(t, receive_error, net.UDP_Recv_Error.None)
+	ack, ack_error := UTP_Header_Parse(wire[:count])
+	testing.expect_value(t, ack_error, UTP_Error.None)
+	testing.expect_value(t, ack.Extension, byte(1))
+
+	utp_test_send_data(t, client, listener_endpoint, 78, 2, state.Sequence, []byte{'b'})
+	count, source, receive_error = net.recv_udp(listener, wire[:])
+	testing.expect_value(t, receive_error, net.UDP_Recv_Error.None)
+	testing.expect_value(t, UTP_Connection_Handle_Datagram(&connection, wire[:count], source), UTP_Error.None)
+	utp_test_send_data(t, client, listener_endpoint, 78, 3, state.Sequence, []byte{'c'})
+	count, source, receive_error = net.recv_udp(listener, wire[:])
+	testing.expect_value(t, receive_error, net.UDP_Recv_Error.None)
+	testing.expect_value(t, UTP_Connection_Handle_Datagram(&connection, wire[:count], source), UTP_Error.None)
+	result: [8]byte
+	result_count := UTP_Connection_Take_Received(&connection, result[:])
+	testing.expect(t, bytes_equal(result[:result_count], []byte{'b', 'c', 'd'}))
+}
+
+utp_test_send_data :: proc(t: ^testing.T, socket: net.UDP_Socket, remote: net.Endpoint, connection_id, sequence, acknowledgement: u16, payload: []byte) {
+	header := UTP_Header_Encode(UTP_Header{Type = .Data, Connection_ID = connection_id, Sequence = sequence, Acknowledgement = acknowledgement, Window_Size = UTP_Initial_Window})
+	wire: [dynamic]byte
+	defer delete(wire)
+	append(&wire, ..header[:])
+	append(&wire, ..payload)
+	_, send_error := net.send_udp(socket, wire[:], remote)
+	testing.expect_value(t, send_error, net.UDP_Send_Error.None)
+}
+
+@(test)
 utp_outbound_handshake_and_data_test :: proc(t: ^testing.T) {
 	server, server_error := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 	testing.expect_value(t, server_error, nil)

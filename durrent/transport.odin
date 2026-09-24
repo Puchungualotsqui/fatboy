@@ -181,10 +181,28 @@ Peer_Transport_Begin_UTP_Connect :: proc(transport: ^Peer_Transport, remote: net
 	}
 	transport.Kind = .UTP
 	utp_error := UTP_Connection_Begin(&transport.UTP, remote)
-	if utp_error != .None {
-		transport.Kind = .TCP
-		return .Connect
+	if utp_error != .None { transport.Kind = .TCP; return .Connect }
+	return .None
+}
+
+Peer_Transport_Begin_Shared_UTP_Connect :: proc(transport: ^Peer_Transport, socket: net.UDP_Socket, remote: net.Endpoint) -> Peer_Transport_Error {
+	if transport == nil || transport.Connected || transport.Pending_Dial != nil || transport.UTP.State != .Closed {
+		return .Already_Connected if transport != nil && transport.Connected else .Connect
 	}
+	transport.Kind = .UTP
+	utp_error := UTP_Connection_Begin_Shared(&transport.UTP, socket, remote)
+	if utp_error != .None { transport.Kind = .TCP; return .Connect }
+	return .None
+}
+
+Peer_Transport_Adopt_UTP :: proc(transport: ^Peer_Transport, connection: ^UTP_Connection) -> Peer_Transport_Error {
+	if transport == nil || connection == nil || transport.Connected || connection.State != .Connected || !connection.Socket_Open {
+		return .Invalid_Transport
+	}
+	transport.Kind = .UTP
+	transport.UTP = connection^
+	connection^ = UTP_Connection{}
+	transport.Connected = true
 	return .None
 }
 
@@ -286,9 +304,7 @@ Peer_Transport_Flush :: proc(transport: ^Peer_Transport) -> Peer_Transport_Error
 	}
 	if transport.Kind == .UTP {
 		utp_error := UTP_Connection_Poll(&transport.UTP)
-		if utp_error == .None {
-			return .None
-		}
+		if utp_error == .None { return .None }
 		return .Timeout if utp_error == .Timeout else .Write
 	}
 	if len(transport.Write_Buffer) == 0 {

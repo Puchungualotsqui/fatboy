@@ -200,6 +200,26 @@ Peer_Session_Connect :: proc(session: ^Peer_Session, address: string, timeout: t
 
 // Starts an outbound dial without waiting for DNS/TCP completion. Pair with
 // Peer_Session_Poll_Connect from an event loop.
+Peer_Session_Begin_Shared_UTP_Connect :: proc(session: ^Peer_Session, socket: net.UDP_Socket, remote: net.Endpoint) -> Peer_Error {
+	if session == nil { return .Invalid_Peer }
+	sync.mutex_lock(&session.Mutex)
+	defer sync.mutex_unlock(&session.Mutex)
+	if session.State != .New { return .Invalid_State }
+	transport_error := Peer_Transport_Begin_Shared_UTP_Connect(&session.Transport, socket, remote)
+	if transport_error != .None { return peer_session_fail_locked(session, peer_transport_error(transport_error)) }
+	return .None
+}
+
+Peer_Session_Accept_UTP :: proc(session: ^Peer_Session, connection: ^UTP_Connection) -> Peer_Error {
+	if session == nil { return .Invalid_Peer }
+	sync.mutex_lock(&session.Mutex)
+	defer sync.mutex_unlock(&session.Mutex)
+	if session.State != .New { return .Invalid_State }
+	transport_error := Peer_Transport_Adopt_UTP(&session.Transport, connection)
+	if transport_error != .None { return peer_session_fail_locked(session, peer_transport_error(transport_error)) }
+	return peer_session_begin_inbound_locked(session)
+}
+
 Peer_Session_Begin_UTP_Connect :: proc(session: ^Peer_Session, remote: net.Endpoint) -> Peer_Error {
 	if session == nil {
 		return .Invalid_Peer

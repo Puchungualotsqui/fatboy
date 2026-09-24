@@ -82,11 +82,20 @@ Destroy_DHT_Lookup_Result :: proc(result: ^DHT_Lookup_Result) {
 	result^ = DHT_Lookup_Result{}
 }
 
+DHT_Client_Outbound_Packet :: struct {
+	// Data ownership transfers to the caller of DHT_Client_Dequeue_Outbound.
+	Data:        []byte,
+	Endpoint:    DHT_Endpoint,
+	Transaction: [2]byte,
+}
+
 DHT_Client :: struct {
 	Mutex:       sync.Mutex,
+	Exchange_Cond: sync.Cond,
 	Socket:      net.UDP_Socket,
 	Socket6:     net.UDP_Socket,
 	Has_Socket6: bool,
+	Owns_Sockets: bool,
 	Node_ID:     DHT_Node_ID,
 	Routing:     DHT_Routing_Table,
 	Token_Secret: [20]byte,
@@ -94,6 +103,18 @@ DHT_Client :: struct {
 	Secret_Time: time.Time,
 	Transaction: u16,
 	Open:         bool,
+
+	// Exactly one exchange is active at a time. In external-socket mode the
+	// dispatcher owns socket I/O and these fields bridge its datagrams back to
+	// the synchronous lookup worker.
+	External_Sockets: bool,
+	Exchange_Active:  bool,
+	Pending_Endpoint: DHT_Endpoint,
+	Pending_Transaction: [2]byte,
+	Pending_Response: DHT_Message,
+	Pending_Error:    DHT_Error,
+	Pending_Ready:    bool,
+	Outbound:         [dynamic]DHT_Client_Outbound_Packet,
 }
 
 DHT_Client_Init :: proc(
@@ -138,14 +159,53 @@ DHT_Client_Init :: proc(
 		}
 		return .Out_Of_Memory
 	}
+	sync.mutex_lock(&client.Mutex)
 	client.Socket = socket4
 	client.Socket6 = socket6
 	client.Has_Socket6 = socket6_ready
+	client.Owns_Sockets = true
 	client.Node_ID = node_id
 	client.Token_Secret = node_id
 	client.Secret_Time = time.now()
 	client.Transaction = 1
 	client.Open = true
+	sync.mutex_unlock(&client.Mutex)
+	return .None
+}
+
+// DHT_Client_Init_External initializes a client whose UDP sockets are owned
+// and polled by the caller. The caller must relay packets through the public
+// dequeue, send-error, and datagram handler APIs below.
+DHT_Client_Init_External :: proc(
+	client: ^DHT_Client,
+	torrent: ^Torrent,
+	node_id: DHT_Node_ID,
+	socket4: net.UDP_Socket,
+	socket6: net.UDP_Socket,
+	has_socket6: bool,
+) -> DHT_Error {
+	if client == nil {
+		return .Invalid_DHT
+	}
+	if torrent != nil && !Torrent_Allows_DHT(torrent) {
+		return .Private_Torrent
+	}
+	DHT_Client_Destroy(client)
+	if DHT_Routing_Init(&client.Routing, node_id) != .None {
+		return .Out_Of_Memory
+	}
+	sync.mutex_lock(&client.Mutex)
+	client.Socket = socket4
+	client.Socket6 = socket6
+	client.Has_Socket6 = has_socket6
+	client.Owns_Sockets = false
+	client.External_Sockets = true
+	client.Node_ID = node_id
+	client.Token_Secret = node_id
+	client.Secret_Time = time.now()
+	client.Transaction = 1
+	client.Open = true
+	sync.mutex_unlock(&client.Mutex)
 	return .None
 }
 
@@ -154,16 +214,28 @@ DHT_Client_Destroy :: proc(client: ^DHT_Client) {
 		return
 	}
 	sync.mutex_lock(&client.Mutex)
-	if client.Open {
-		net.close(client.Socket)
-		if client.Has_Socket6 {
-			net.close(client.Socket6)
+	close_sockets := client.Open && client.Owns_Sockets
+	socket4 := client.Socket
+	socket6 := client.Socket6
+	has_socket6 := client.Has_Socket6
+	client.Open = false
+	client.Owns_Sockets = false
+	client.External_Sockets = false
+	if client.Exchange_Active {
+		dht_client_remove_pending_outbound_locked(client)
+		Destroy_DHT_Message(&client.Pending_Response)
+		client.Pending_Error = .Invalid_DHT
+		client.Pending_Ready = true
+		sync.cond_broadcast(&client.Exchange_Cond)
+	}
+	sync.mutex_unlock(&client.Mutex)
+	if close_sockets {
+		net.close(socket4)
+		if has_socket6 {
+			net.close(socket6)
 		}
 	}
-	client.Open = false
-	sync.mutex_unlock(&client.Mutex)
 	DHT_Routing_Destroy(&client.Routing)
-	client^ = DHT_Client{}
 }
 
 DHT_Client_Get_Peers :: proc(
@@ -177,8 +249,10 @@ DHT_Client_Get_Peers :: proc(
 		return result, .Invalid_DHT
 	}
 	sync.mutex_lock(&client.Mutex)
-	defer sync.mutex_unlock(&client.Mutex)
-	if !client.Open {
+	open := client.Open
+	node_id := client.Node_ID
+	sync.mutex_unlock(&client.Mutex)
+	if !open {
 		return result, .Invalid_DHT
 	}
 	queue: [dynamic]DHT_Node
@@ -234,7 +308,7 @@ DHT_Client_Get_Peers :: proc(
 			node.Endpoint.Port,
 		)
 		transaction := dht_client_next_transaction(client)
-		packet := DHT_Encode_Get_Peers(transaction[:], client.Node_ID, info_hash)
+		packet := DHT_Encode_Get_Peers(transaction[:], node_id, info_hash)
 		message, query_error := dht_client_exchange_locked(client, node.Endpoint, packet, transaction[:], options)
 		delete(packet)
 		if query_error != .None {
@@ -289,8 +363,10 @@ DHT_Client_Announce_Peer :: proc(
 		return 0, .Invalid_DHT
 	}
 	sync.mutex_lock(&client.Mutex)
-	defer sync.mutex_unlock(&client.Mutex)
-	if !client.Open {
+	open := client.Open
+	node_id := client.Node_ID
+	sync.mutex_unlock(&client.Mutex)
+	if !open {
 		return 0, .Invalid_DHT
 	}
 	sent: u32
@@ -299,7 +375,7 @@ DHT_Client_Announce_Peer :: proc(
 			continue
 		}
 		transaction := dht_client_next_transaction(client)
-		packet := DHT_Encode_Announce_Peer(transaction[:], client.Node_ID, info_hash, targets[index].Token, port)
+		packet := DHT_Encode_Announce_Peer(transaction[:], node_id, info_hash, targets[index].Token, port)
 		message, query_error := dht_client_exchange_locked(client, targets[index].Node.Endpoint, packet, transaction[:], options)
 		delete(packet)
 		if query_error == .None {
@@ -344,6 +420,94 @@ DHT_Token_Validate :: proc(
 	return dht_constant_time_equal(token, current[:]) || dht_constant_time_equal(token, previous[:])
 }
 
+// DHT_Client_Dequeue_Outbound transfers ownership of the packet data to the
+// caller. It is used only by clients initialized with DHT_Client_Init_External.
+DHT_Client_Dequeue_Outbound :: proc(client: ^DHT_Client) -> (DHT_Client_Outbound_Packet, bool) {
+	if client == nil {
+		return DHT_Client_Outbound_Packet{}, false
+	}
+	sync.mutex_lock(&client.Mutex)
+	defer sync.mutex_unlock(&client.Mutex)
+	if !client.Open || !client.External_Sockets || len(client.Outbound) == 0 {
+		return DHT_Client_Outbound_Packet{}, false
+	}
+	packet := client.Outbound[0]
+	copy(client.Outbound[:], client.Outbound[1:])
+	resize(&client.Outbound, len(client.Outbound)-1)
+	return packet, true
+}
+
+// DHT_Client_Mark_Send_Error wakes the matching external exchange after its
+// dequeued packet could not be sent. The caller retains ownership of packet.Data.
+DHT_Client_Mark_Send_Error :: proc(client: ^DHT_Client, packet: DHT_Client_Outbound_Packet) -> bool {
+	if client == nil {
+		return false
+	}
+	sync.mutex_lock(&client.Mutex)
+	defer sync.mutex_unlock(&client.Mutex)
+	if !client.Open || !client.External_Sockets || !client.Exchange_Active ||
+	   client.Pending_Ready || !dht_client_same_endpoint(client.Pending_Endpoint, packet.Endpoint) ||
+	   client.Pending_Transaction != packet.Transaction {
+		return false
+	}
+	client.Pending_Error = .Send
+	client.Pending_Ready = true
+	sync.cond_signal(&client.Exchange_Cond)
+	return true
+}
+
+// DHT_Client_Handle_Datagram parses a dispatcher-received datagram. A message
+// is consumed only when both its sender endpoint and transaction match the
+// current exchange; on success its allocation ownership moves to the client.
+DHT_Client_Handle_Datagram :: proc(client: ^DHT_Client, data: []byte, source: DHT_Endpoint) -> bool {
+	if client == nil {
+		return false
+	}
+	message, parse_error := DHT_Parse_Message(data)
+	if parse_error != .None {
+		return false
+	}
+	sync.mutex_lock(&client.Mutex)
+	if !client.Open || !client.External_Sockets || !client.Exchange_Active ||
+	   client.Pending_Ready || !dht_client_same_endpoint(client.Pending_Endpoint, source) ||
+	   !dht_client_transaction_matches(client.Pending_Transaction, message.Transaction) {
+		sync.mutex_unlock(&client.Mutex)
+		Destroy_DHT_Message(&message)
+		return false
+	}
+	client.Pending_Response = message
+	message = DHT_Message{}
+	client.Pending_Error = .None
+	client.Pending_Ready = true
+	sync.cond_signal(&client.Exchange_Cond)
+	sync.mutex_unlock(&client.Mutex)
+	return true
+}
+
+// DHT_Client_Handle is a concise alias for DHT_Client_Handle_Datagram.
+DHT_Client_Handle :: proc(client: ^DHT_Client, data: []byte, source: DHT_Endpoint) -> bool {
+	return DHT_Client_Handle_Datagram(client, data, source)
+}
+
+// DHT_Client_Cancel_Pending_Exchange cancels the outstanding external request.
+// Its synchronous caller receives DHT_Error.Timeout, the closest existing DHT
+// error for a request that deliberately received no response.
+DHT_Client_Cancel_Pending_Exchange :: proc(client: ^DHT_Client) -> bool {
+	if client == nil {
+		return false
+	}
+	sync.mutex_lock(&client.Mutex)
+	defer sync.mutex_unlock(&client.Mutex)
+	if !client.Open || !client.External_Sockets || !client.Exchange_Active || client.Pending_Ready {
+		return false
+	}
+	dht_client_remove_pending_outbound_locked(client)
+	client.Pending_Error = .Timeout
+	client.Pending_Ready = true
+	sync.cond_signal(&client.Exchange_Cond)
+	return true
+}
+
 dht_client_exchange_locked :: proc(
 	client: ^DHT_Client,
 	endpoint: DHT_Endpoint,
@@ -351,12 +515,75 @@ dht_client_exchange_locked :: proc(
 	transaction: []byte,
 	options: DHT_Network_Options,
 ) -> (DHT_Message, DHT_Error) {
+	if client == nil || len(transaction) != 2 {
+		return DHT_Message{}, .Invalid_DHT
+	}
+	timeout := options.Timeout if options.Timeout > 0 else DHT_Default_Network_Options().Timeout
+	deadline := time.time_add(time.now(), timeout)
+
+	sync.mutex_lock(&client.Mutex)
+	for client.Open && client.Exchange_Active {
+		remaining := time.diff(time.now(), deadline)
+		if remaining <= 0 || !sync.cond_wait_with_timeout(&client.Exchange_Cond, &client.Mutex, remaining) {
+			sync.mutex_unlock(&client.Mutex)
+			return DHT_Message{}, .Timeout
+		}
+	}
+	if !client.Open {
+		sync.mutex_unlock(&client.Mutex)
+		return DHT_Message{}, .Invalid_DHT
+	}
+	if endpoint.IPv6 && !client.Has_Socket6 {
+		sync.mutex_unlock(&client.Mutex)
+		return DHT_Message{}, .Resolve
+	}
+
+	client.Exchange_Active = true
+	if client.External_Sockets {
+		outbound_data, clone_ok := torrent_clone(packet)
+		if !clone_ok {
+			client.Exchange_Active = false
+			sync.cond_broadcast(&client.Exchange_Cond)
+			sync.mutex_unlock(&client.Mutex)
+			return DHT_Message{}, .Out_Of_Memory
+		}
+		outbound := DHT_Client_Outbound_Packet{Data = outbound_data, Endpoint = endpoint}
+		copy(outbound.Transaction[:], transaction)
+		client.Pending_Endpoint = endpoint
+		client.Pending_Transaction = outbound.Transaction
+		client.Pending_Response = DHT_Message{}
+		client.Pending_Error = .None
+		client.Pending_Ready = false
+		append(&client.Outbound, outbound)
+		sync.cond_signal(&client.Exchange_Cond)
+
+		for !client.Pending_Ready {
+			remaining := time.diff(time.now(), deadline)
+			if remaining <= 0 || !sync.cond_wait_with_timeout(&client.Exchange_Cond, &client.Mutex, remaining) {
+				if !client.Pending_Ready {
+					dht_client_remove_pending_outbound_locked(client)
+					client.Pending_Error = .Timeout
+					client.Pending_Ready = true
+				}
+			}
+		}
+		message := client.Pending_Response
+		client.Pending_Response = DHT_Message{}
+		exchange_error := client.Pending_Error
+		dht_client_remove_pending_outbound_locked(client)
+		client.Pending_Endpoint = DHT_Endpoint{}
+		client.Pending_Transaction = [2]byte{}
+		client.Pending_Error = .None
+		client.Pending_Ready = false
+		client.Exchange_Active = false
+		sync.cond_broadcast(&client.Exchange_Cond)
+		sync.mutex_unlock(&client.Mutex)
+		return message, exchange_error
+	}
+
 	socket: net.UDP_Socket
 	net_endpoint: net.Endpoint
 	if endpoint.IPv6 {
-		if !client.Has_Socket6 {
-			return DHT_Message{}, .Resolve
-		}
 		ip6: net.IP6_Address
 		for index := 0; index < 8; index += 1 {
 			ip6[index] = u16be(u16(endpoint.IP[index*2])<<8 | u16(endpoint.IP[index*2+1]))
@@ -368,11 +595,13 @@ dht_client_exchange_locked :: proc(
 		socket = client.Socket
 		net_endpoint = net.Endpoint{address = ip4, port = int(endpoint.Port)}
 	}
+	sync.mutex_unlock(&client.Mutex)
+	defer dht_client_finish_direct_exchange(client)
+
 	if _, send_error := net.send_udp(socket, packet, net_endpoint); send_error != .None {
 		fmt.printf("[DURRENT-DHT] UDP send failed endpoint=%v error=%v\\n", net_endpoint, send_error)
 		return DHT_Message{}, .Send
 	}
-	timeout := options.Timeout if options.Timeout > 0 else DHT_Default_Network_Options().Timeout
 	_ = net.set_option(socket, .Receive_Timeout, timeout)
 	buffer, buffer_error := make([]byte, 64*1024, context.allocator)
 	if buffer_error != nil {
@@ -403,10 +632,43 @@ dht_client_exchange_locked :: proc(
 	return message, .None
 }
 
+dht_client_finish_direct_exchange :: proc(client: ^DHT_Client) {
+	sync.mutex_lock(&client.Mutex)
+	client.Exchange_Active = false
+	sync.cond_broadcast(&client.Exchange_Cond)
+	sync.mutex_unlock(&client.Mutex)
+}
+
+dht_client_remove_pending_outbound_locked :: proc(client: ^DHT_Client) {
+	index := 0
+	for index < len(client.Outbound) {
+		outbound := client.Outbound[index]
+		if dht_client_same_endpoint(outbound.Endpoint, client.Pending_Endpoint) &&
+		   outbound.Transaction == client.Pending_Transaction {
+			delete(outbound.Data)
+			copy(client.Outbound[index:], client.Outbound[index+1:])
+			resize(&client.Outbound, len(client.Outbound)-1)
+			continue
+		}
+		index += 1
+	}
+}
+
+dht_client_same_endpoint :: proc(left: DHT_Endpoint, right: DHT_Endpoint) -> bool {
+	return left.IP == right.IP && left.Port == right.Port && left.IPv6 == right.IPv6
+}
+
+dht_client_transaction_matches :: proc(transaction: [2]byte, received: []byte) -> bool {
+	value := transaction
+	return len(received) == len(value) && bytes_equal(value[:], received)
+}
+
 dht_client_next_transaction :: proc(client: ^DHT_Client) -> [2]byte {
+	sync.mutex_lock(&client.Mutex)
 	client.Transaction += 1
 	result: [2]byte
 	endian.put_u16(result[:], .Big, client.Transaction)
+	sync.mutex_unlock(&client.Mutex)
 	return result
 }
 
