@@ -51,7 +51,6 @@ Torrent_Loop_Peer :: struct {
 	Remote_PEX_ID:        byte,
 	PEX_Handshake_Sent:   bool,
 	PEX_Last_Sent:        time.Time,
-	Ready_Since:          time.Time,
 }
 
 Torrent_Session_Loop :: struct {
@@ -148,7 +147,10 @@ Torrent_Session_Loop_Open :: proc(
 	// Keep the foreground download worker responsive while dead DHT peers
 	// time out. Metadata resolution has its own larger peer budget; the
 	// steady-state torrent loop should maintain a small active set.
-	loop.Peer_Limit = 8
+	// A larger connection set is important for public swarms, where most
+	// tracker/DHT endpoints are stale and peers selectively unchoke only a
+	// few interested clients.
+	loop.Peer_Limit = 16
 	loop.Tick_Interval = 100 * time.Millisecond
 	loop.Peer_Connect_Timeout = time.Second
 	loop.Next_Peer_ID = 1
@@ -257,19 +259,11 @@ Torrent_Session_Loop_Tick :: proc(loop: ^Torrent_Session_Loop, now: time.Time) -
 	finished_dht: ^thread.Thread
 	connect_budget := 4
 	if len(loop.Peers) > 0 {
-		// Peer_Transport_Connect can consume its entire dial timeout. Do not
-		// delay an established peer's wire polling behind another synchronous
-		// dial: it delays flushing Interested and receiving Unchoke/Piece.
-		// If every ready peer remains choked for a while, admit one additional
-		// candidate to find an uploader without starving existing connections.
-		connect_budget = 0
-		for peer in loop.Peers {
-			if peer.Session.State == .Ready && peer.Session.Remote_Choking &&
-			   time.diff(peer.Ready_Since, now) >= 15*time.Second {
-				connect_budget = 1
-				break
-			}
-		}
+		// A public swarm commonly keeps many interested peers choked. Continue
+		// rotating one candidate at a time until the peer limit is populated;
+		// otherwise one non-uploading connection can stall the torrent forever.
+		// Keeping this to one bounds each tick's synchronous dial delay.
+		connect_budget = 1
 	}
 	if loop.DHT_Worker != nil && !loop.DHT_Worker_Started && thread.is_done(loop.DHT_Worker) {
 		finished_dht = loop.DHT_Worker
@@ -850,7 +844,6 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 				continue
 			}
 			peer.Registered = true
-			peer.Ready_Since = time.now()
 			fmt.printf(
 				"[DURRENT-PEER] ready address=%s extensions=%v\n",
 				peer.Address,
