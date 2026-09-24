@@ -422,8 +422,26 @@ metadata_resolver_try_peer :: proc(
 		}
 
 		poll_error := Peer_Session_Poll(&session)
+		if poll_error == .Timeout && Peer_Session_MSE_Early_Timed_Out(&session, connect_timeout) &&
+		   Peer_Session_Reset_For_Plaintext_Retry(&session) == .None {
+			if Peer_Session_Connect(&session, candidate.Address, connect_timeout) == .None {
+				fmt.printf("[DURRENT-META] MSE Yb timeout; retrying plaintext on fresh TCP peer=%s\n", candidate.Address)
+				continue
+			}
+		}
 		if poll_error != .None &&
 			poll_error != .Timeout {
+			if Peer_Session_Can_Retry_Plaintext(&session) &&
+			   Peer_Session_Reset_For_Plaintext_Retry(&session) == .None {
+				retry_error := Peer_Session_Connect(&session, candidate.Address, connect_timeout)
+				if retry_error == .None {
+					fmt.printf("[DURRENT-META] MSE early failure; retrying plaintext on fresh TCP peer=%s\n", candidate.Address)
+					continue
+				}
+			}
+			if session.MSE_Policy != .Disabled && !session.MSE_Negotiated {
+				fmt.printf("[DURRENT-MSE] terminal metadata negotiation failure peer=%s error=%v\n", candidate.Address, poll_error)
+			}
 			fmt.printf(
 				"[DURRENT-META] Peer poll failed address=%s error=%v state=%v session_error=%v remote_extensions=%v events=%d\n",
 				candidate.Address,
@@ -442,6 +460,14 @@ metadata_resolver_try_peer :: proc(
 				break
 			}
 			if event.Kind == .Handshake {
+				if session.MSE_Negotiated {
+					mode := "plaintext"
+					if session.MSE_Active {
+						mode = "RC4"
+					}
+					fmt.printf("[DURRENT-MSE] negotiated metadata peer=%s mode=%s\n", candidate.Address, mode)
+					session.MSE_Negotiated = false
+				}
 				fmt.printf(
 					"[DURRENT-META] Handshake received peer=%s remote_extensions=%v\n",
 					candidate.Address,

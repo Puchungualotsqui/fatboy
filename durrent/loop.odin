@@ -1075,9 +1075,34 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 				continue
 			}
 			fmt.printf("[DURRENT-PEER] dial connected address=%s\n", peer.Address)
+			if peer.Session.MSE_Policy != .Disabled {
+				fmt.printf("[DURRENT-MSE] initiator started peer=%s policy=%v\n", peer.Address, peer.Session.MSE_Policy)
+			}
 		}
 		poll_error := Peer_Session_Poll(&peer.Session)
+		if poll_error == .Timeout && Peer_Session_MSE_Early_Timed_Out(&peer.Session, loop.Peer_Connect_Timeout) &&
+		   Peer_Session_Reset_For_Plaintext_Retry(&peer.Session) == .None {
+			peer.Dial_Started = time.now()
+			if Peer_Session_Begin_Connect(&peer.Session, peer.Address) == .None {
+				fmt.printf("[DURRENT-PEER] MSE Yb timeout; retrying plaintext on fresh TCP address=%s\n", peer.Address)
+				index += 1
+				continue
+			}
+		}
 		if poll_error != .None && poll_error != .Timeout {
+			if Peer_Session_Can_Retry_Plaintext(&peer.Session) &&
+			   Peer_Session_Reset_For_Plaintext_Retry(&peer.Session) == .None {
+				peer.Dial_Started = time.now()
+				retry_error := Peer_Session_Begin_Connect(&peer.Session, peer.Address)
+				if retry_error == .None {
+					fmt.printf("[DURRENT-PEER] MSE early failure; retrying plaintext on fresh TCP address=%s\n", peer.Address)
+					index += 1
+					continue
+				}
+			}
+			if peer.Session.MSE_Policy != .Disabled && !peer.Session.MSE_Negotiated {
+				fmt.printf("[DURRENT-MSE] terminal negotiation failure peer=%s error=%v\n", peer.Address, poll_error)
+			}
 			fmt.printf(
 				"[DURRENT-PEER] poll failed address=%s error=%v state=%v session_error=%v\n",
 				peer.Address,
@@ -1088,7 +1113,15 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 			loop_remove_peer_locked(loop, index)
 			continue
 		}
-		if peer.Session.State == .Ready && !peer.Registered {
+		if peer.Session.State == .Ready && peer.Session.MSE_Negotiated {
+			mode := "plaintext"
+			if peer.Session.MSE_Active {
+				mode = "RC4"
+			}
+			fmt.printf("[DURRENT-MSE] negotiated peer=%s mode=%s\n", peer.Address, mode)
+			peer.Session.MSE_Negotiated = false
+		}
+	if peer.Session.State == .Ready && !peer.Registered {
 			if Piece_Scheduler_Add_Peer(&loop.Scheduler, peer.ID, &peer.Session.Remote_Pieces, &peer.Session) != .None {
 				loop_remove_peer_locked(loop, index)
 				continue

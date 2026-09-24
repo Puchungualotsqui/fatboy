@@ -51,6 +51,12 @@ DownloadProvider :: enum {
 	Durrent,
 }
 
+MSE_Mode :: enum {
+	Disabled,
+	Preferred,
+	Required,
+}
+
 // Keep one predictable BitTorrent port so users can forward it on their
 // router/firewall and trackers/DHT can advertise a reachable endpoint.
 DURRENT_LISTEN_PORT :: u16(51413)
@@ -112,6 +118,7 @@ App :: struct {
     rd_token_expires_at:  i64,
     download_path:        string,
     use_ram_limit:        bool,
+    mse_mode:             MSE_Mode,
 
     load_status: string,
     games:       [dynamic]GameRelease,

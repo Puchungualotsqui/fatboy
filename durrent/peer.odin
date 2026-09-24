@@ -84,7 +84,10 @@ Peer_Session :: struct {
 	MSE:               MSE_Handshake_Engine,
 	MSE_Negotiating:   bool,
 	MSE_Active:        bool,
+	MSE_Negotiated:    bool,
 	MSE_Inbound:       bool,
+	MSE_Plaintext_Retry_Used: bool,
+	MSE_Started_At:    time.Time,
 }
 
 Peer_Session_Init :: proc(

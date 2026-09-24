@@ -15,6 +15,15 @@ import curl "vendor:curl"
 import durrent "./durrent"
 
 
+download_mse_policy :: proc(mode: MSE_Mode) -> durrent.MSE_Policy {
+    switch mode {
+    case .Preferred: return .Preferred
+    case .Required: return .Required
+    case .Disabled: return .Disabled
+    }
+    return .Disabled
+}
+
 DownloadState :: enum {
     NotDownloaded,
     Queued,
@@ -1277,6 +1286,7 @@ download_resolve_durrent_torrent :: proc(
     cancel_token: durrent.Metadata_Resolver_Cancel_Token
     download_set_metadata_cancel(manager, &cancel_token)
     options := durrent.Metadata_Resolver_Default_Options()
+    options.MSE_Policy = download_mse_policy(app.mse_mode)
     options.Cancel = &cancel_token
     state_directory := download_state_directory(app.download_path)
     defer delete(state_directory)
@@ -1445,6 +1455,7 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
     // blocks the download worker before it can publish a progress state.
     // Resume metadata still restores trusted completed pieces; missing pieces
     // are verified as they are received by the scheduler/storage path.
+    loop.MSE_Policy = download_mse_policy(app.mse_mode)
     open_error := durrent.Torrent_Session_Loop_Open(
         &loop,
         &torrent,

@@ -10,11 +10,13 @@ import rl "vendor:raylib"
 
 
 SETTINGS_FILE           :: "settings.bin"
-SETTINGS_VERSION             :: u32(4)
+SETTINGS_VERSION             :: u32(5)
 SETTINGS_V2_HEADER_SIZE       :: 36
 SETTINGS_HEADER_SIZE          :: 40
 SETTINGS_RAM_LIMIT_FLAG       :: u32(1)
 SETTINGS_DURRENT_PROVIDER_FLAG :: u32(2)
+SETTINGS_MSE_PREFERRED_FLAG  :: u32(4)
+SETTINGS_MSE_REQUIRED_FLAG   :: u32(8)
 
 EnsureDownloadDirectory :: proc(path: string) -> bool {
     if len(path) == 0 {
@@ -131,6 +133,11 @@ SaveSettings :: proc(app: ^App) -> bool {
     if app.download_provider == .Durrent {
         settings_flags |= SETTINGS_DURRENT_PROVIDER_FLAG
     }
+    if app.mse_mode == .Preferred {
+        settings_flags |= SETTINGS_MSE_PREFERRED_FLAG
+    } else if app.mse_mode == .Required {
+        settings_flags |= SETTINGS_MSE_REQUIRED_FLAG
+    }
     endian.put_u32(settings_data[36:40], .Little, settings_flags)
 
     offset := SETTINGS_HEADER_SIZE
@@ -225,7 +232,7 @@ LoadSettings :: proc(app: ^App) -> bool {
     }
     if version == 2 {
         settings_header_size = SETTINGS_V2_HEADER_SIZE
-    } else if version != SETTINGS_VERSION {
+    } else if version != u32(4) && version != SETTINGS_VERSION {
         fmt.printf(
             "[SETTINGS] Unsupported settings version %d (expected %d)\n",
             version,
@@ -240,16 +247,24 @@ LoadSettings :: proc(app: ^App) -> bool {
 
     use_ram_limit := false
     download_provider := DownloadProvider(.RealDebrid)
+    settings_flags: u32
     if version >= 3 {
-        settings_flags, flags_ok := endian.get_u32(settings_data[36:40], .Little)
+        settings_flags_read, flags_ok := endian.get_u32(settings_data[36:40], .Little)
         if !flags_ok {
             fmt.printf("[SETTINGS] Ignoring %s with invalid option flags\n", SETTINGS_FILE)
             return false
         }
+        settings_flags = settings_flags_read
         use_ram_limit = (settings_flags & SETTINGS_RAM_LIMIT_FLAG) != 0
         if version >= 4 && (settings_flags & SETTINGS_DURRENT_PROVIDER_FLAG) != 0 {
             download_provider = .Durrent
         }
+    }
+    mse_mode := MSE_Mode.Disabled
+    if version >= 5 && settings_flags & SETTINGS_MSE_REQUIRED_FLAG != 0 {
+        mse_mode = .Required
+    } else if version >= 5 && settings_flags & SETTINGS_MSE_PREFERRED_FLAG != 0 {
+        mse_mode = .Preferred
     }
 
     access_len_u32, access_ok := endian.get_u32(settings_data[8:12], .Little)
@@ -338,6 +353,7 @@ LoadSettings :: proc(app: ^App) -> bool {
     app.rd_token_expires_at = i64(expires_u64)
     app.use_ram_limit = use_ram_limit
     app.download_provider = download_provider
+    app.mse_mode = mse_mode
 
     fmt.printf(
         "[SETTINGS] Loaded version %d from %s (provider=%s)\n",
@@ -467,7 +483,61 @@ RenderSetupScreen :: proc(
                 }
             }
 
-            if app.download_provider == .RealDebrid {
+                        orui.label(
+                            orui.id("mse_label"),
+                            "Durrent encryption (MSE/PE)",
+                            {
+                                font_size = 12,
+                                color = TEXT_MUTED,
+                            },
+                        )
+                        orui.label(
+                            orui.id("mse_help"),
+                            "Disabled is the default. Preferred tries encrypted negotiation first and permits one safe plaintext retry on a fresh connection.",
+                            {
+                                font_size = 12,
+                                color = TEXT_MUTED,
+                                overflow = .Wrap,
+                            },
+                        )
+                        {
+                            orui.container(
+                                orui.id("mse_selector"),
+                                {
+                                    layout = .Flex,
+                                    direction = .LeftToRight,
+                                    width = orui.grow(),
+                                    height = orui.fixed(36),
+                                    gap = 8,
+                                },
+                            )
+                            if orui.button(orui.id("btn_mse_disabled"), "Disabled", {
+                                width = orui.grow(), height = orui.grow(),
+                                background_color = app.mse_mode == .Disabled ? ACCENT_COLOR : ROW_HOVER_BACKGROUND,
+                                color = app.mse_mode == .Disabled ? APP_BACKGROUND : TEXT_PRIMARY,
+                                corner_radius = orui.corner(5),
+                            }) {
+                                app.mse_mode = .Disabled
+                            }
+                            if orui.button(orui.id("btn_mse_preferred"), "Preferred", {
+                                width = orui.grow(), height = orui.grow(),
+                                background_color = app.mse_mode == .Preferred ? ACCENT_COLOR : ROW_HOVER_BACKGROUND,
+                                color = app.mse_mode == .Preferred ? APP_BACKGROUND : TEXT_PRIMARY,
+                                corner_radius = orui.corner(5),
+                            }) {
+                                app.mse_mode = .Preferred
+                            }
+                            if orui.button(orui.id("btn_mse_required"), "Required", {
+                                width = orui.grow(), height = orui.grow(),
+                                background_color = app.mse_mode == .Required ? ACCENT_COLOR : ROW_HOVER_BACKGROUND,
+                                color = app.mse_mode == .Required ? APP_BACKGROUND : TEXT_PRIMARY,
+                                corner_radius = orui.corner(5),
+                            }) {
+                                app.mse_mode = .Required
+                            }
+                        }
+
+            			if app.download_provider == .RealDebrid {
                 orui.label(
                     orui.id("api_key_label"),
                     "Real-Debrid account",
