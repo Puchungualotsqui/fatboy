@@ -254,6 +254,13 @@ Torrent_Session_Loop_Tick :: proc(loop: ^Torrent_Session_Loop, now: time.Time) -
 	loop_accept_peers_locked(loop)
 	loop_consume_dht_result_locked(loop)
 	finished_dht: ^thread.Thread
+	connect_budget := 4
+	if len(loop.Peers) > 0 {
+		// Existing peers must be polled promptly; do not spend the whole
+		// tick dialing several additional candidates while they wait for
+		// interested/unchoke and piece traffic.
+		connect_budget = 1
+	}
 	if loop.DHT_Worker != nil && !loop.DHT_Worker_Started && thread.is_done(loop.DHT_Worker) {
 		finished_dht = loop.DHT_Worker
 		loop.DHT_Worker = nil
@@ -277,7 +284,7 @@ Torrent_Session_Loop_Tick :: proc(loop: ^Torrent_Session_Loop, now: time.Time) -
 		}
 	}
 	sync.mutex_unlock(&loop.Mutex)
-	loop_connect_pending_peers(loop, 4)
+	loop_connect_pending_peers(loop, connect_budget)
 	sync.mutex_lock(&loop.Mutex)
 	loop_poll_peers_locked(loop)
 	loop_update_rates_locked(loop, now)

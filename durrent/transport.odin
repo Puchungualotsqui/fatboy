@@ -69,13 +69,14 @@ Peer_Transport_Connect :: proc(transport: ^Peer_Transport, address: string, time
 			if dial_failed {
 				return .Resolve
 			}
-			if timeout > 0 && (net.set_option(socket, .Receive_Timeout, timeout) != nil || net.set_option(socket, .Send_Timeout, timeout) != nil) {
+			read_timeout := 100 * time.Millisecond if timeout > 0 else time.Duration(0)
+			if timeout > 0 && (net.set_option(socket, .Receive_Timeout, read_timeout) != nil || net.set_option(socket, .Send_Timeout, timeout) != nil) {
 				net.close(socket)
 				return .Timeout
 			}
 			transport.Socket = socket
 			transport.Connected = true
-			transport.Read_Timeout = timeout
+			transport.Read_Timeout = read_timeout
 			transport.Write_Timeout = timeout
 			return .None
 		}
@@ -150,13 +151,14 @@ Peer_Transport_Adopt :: proc(transport: ^Peer_Transport, socket: net.TCP_Socket,
 	if transport == nil || transport.Connected || socket == net.TCP_Socket(0) {
 		return .Invalid_Transport
 	}
-	if timeout > 0 && (net.set_option(socket, .Receive_Timeout, timeout) != nil || net.set_option(socket, .Send_Timeout, timeout) != nil) {
+	read_timeout := 100 * time.Millisecond if timeout > 0 else time.Duration(0)
+	if timeout > 0 && (net.set_option(socket, .Receive_Timeout, read_timeout) != nil || net.set_option(socket, .Send_Timeout, timeout) != nil) {
 		net.close(socket)
 		return .Timeout
 	}
 	transport.Socket = socket
 	transport.Connected = true
-	transport.Read_Timeout = timeout
+	transport.Read_Timeout = read_timeout
 	transport.Write_Timeout = timeout
 	return .None
 }
