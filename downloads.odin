@@ -1236,6 +1236,14 @@ download_resolve_durrent_torrent :: proc(
     download_set_metadata_cancel(manager, &cancel_token)
     options := durrent.Metadata_Resolver_Default_Options()
     options.Cancel = &cancel_token
+    state_directory := download_state_directory(app.download_path)
+    defer delete(state_directory)
+    if !os.exists(state_directory) {
+        _ = os.make_directory_all(state_directory)
+    }
+    routing_cache_path := fmt.aprintf("%s/dht-routing.bin", state_directory)
+    defer delete(routing_cache_path)
+    options.Routing_Cache_Path = routing_cache_path
     fmt.printf("[DOWNLOAD] Starting Durrent metadata resolver entry=%d\n", entry_index)
     metadata, resolver_error := durrent.Resolve_Magnet_Metadata(
         &magnet,

@@ -18,7 +18,10 @@ Metadata_Resolver_Options :: struct {
 	Peer_Limit:            u32,
 	Max_Metadata_Size:     u32,
 	Enable_DHT:            bool,
+	Enable_PEX:            bool,
 	Bootstrap:             []DHT_Node,
+	Routing_Cache_Path:   string,
+	Max_Candidates:       u32,
 	Cancel:                ^Metadata_Resolver_Cancel_Token,
 }
 
@@ -69,6 +72,8 @@ Metadata_Resolver_Default_Options :: proc() -> Metadata_Resolver_Options {
 		Peer_Limit = 8,
 		Max_Metadata_Size = Metadata_Default_Max_Size,
 		Enable_DHT = true,
+		Enable_PEX = true,
+		Max_Candidates = 32,
 	}
 }
 
@@ -187,6 +192,45 @@ metadata_resolver_add_dht_peers :: proc(
 }
 
 
+metadata_resolver_process_pex_event :: proc(
+	event: ^Peer_Event,
+	remote_pex_id: ^byte,
+	candidates: ^[dynamic]metadata_resolver_candidate,
+	limit: u32,
+) {
+	if event == nil || remote_pex_id == nil || candidates == nil || len(event.Payload) == 0 {
+		return
+	}
+	extension_id := event.Payload[0]
+	payload := event.Payload[1:]
+	if extension_id == 0 {
+		id, parse_error := PEX_Parse_Extension_Handshake(payload)
+		if parse_error == .None {
+			remote_pex_id^ = id
+		}
+		return
+	}
+	if extension_id != remote_pex_id^ || remote_pex_id^ == 0 {
+		return
+	}
+	message, parse_error := PEX_Parse_Message(payload)
+	if parse_error != .None {
+		return
+	}
+	defer Destroy_PEX_Message(&message)
+	before := len(candidates)
+	for peer in message.Added {
+		if len(candidates) >= int(limit) {
+			break
+		}
+		_ = metadata_resolver_add_candidate(candidates, peer, limit)
+	}
+	if len(candidates) > before {
+		fmt.printf("[DURRENT-META] PEX added candidates=%d total=%d\\n", len(candidates)-before, len(candidates))
+	}
+}
+
+
 metadata_resolver_bootstrap_from_candidates :: proc(
 	candidates: []metadata_resolver_candidate,
 	bootstrap: ^[dynamic]DHT_Node,
@@ -216,6 +260,8 @@ metadata_resolver_try_peer :: proc(
 	peer_id: [20]byte,
 	options: Metadata_Resolver_Options,
 	deadline: time.Time,
+	candidates: ^[dynamic]metadata_resolver_candidate,
+	max_candidates: u32,
 ) -> ([]byte, Metadata_Resolver_Error) {
 	fmt.printf("[DURRENT-META] Trying peer %s\n", candidate.Address)
 	if metadata_resolver_cancelled(options) {
@@ -250,6 +296,14 @@ metadata_resolver_try_peer :: proc(
 	}
 	defer Metadata_Downloader_Destroy(&downloader)
 
+	remote_pex_id: byte
+	if options.Enable_PEX {
+		payload := PEX_Encode_Extension_Handshake()
+		pex_error := Peer_Session_Queue_Extended(&session, 0, payload)
+		delete(payload)
+		fmt.printf("[DURRENT-META] PEX handshake queued peer=%s result=%v\\n", candidate.Address, pex_error)
+	}
+
 	peer_deadline := time.time_add(time.now(), options.Peer_Metadata_Timeout)
 	if options.Peer_Metadata_Timeout <= 0 {
 		peer_deadline = time.time_add(time.now(), 20*time.Second)
@@ -276,6 +330,15 @@ metadata_resolver_try_peer :: proc(
 				&session,
 				&event,
 			)
+			if options.Enable_PEX && event.Kind == .Extended &&
+			   candidates != nil && u32(len(candidates)) < max_candidates {
+				metadata_resolver_process_pex_event(
+					&event,
+					&remote_pex_id,
+					candidates,
+					max_candidates,
+				)
+			}
 			Destroy_Peer_Event(&event)
 			if event_error != .None {
 				fmt.printf("[DURRENT-META] Metadata event failed address=%s error=%v\n", candidate.Address, event_error)
@@ -403,7 +466,7 @@ Resolve_Magnet_Metadata :: proc(
 		if options.Enable_DHT && len(bootstrap) == 0 && len(candidates) > 0 {
 			metadata_resolver_bootstrap_from_candidates(candidates[:], &bootstrap)
 		}
-		if options.Enable_DHT && len(bootstrap) > 0 && !metadata_resolver_expired(deadline) {
+		if options.Enable_DHT && !metadata_resolver_expired(deadline) {
 			dht: DHT_Client
 			dht_error := DHT_Client_Init(
 				&dht,
@@ -413,6 +476,10 @@ Resolve_Magnet_Metadata :: proc(
 			)
 			fmt.printf("[DURRENT-META] DHT init result=%v bootstrap=%d\n", dht_error, len(bootstrap))
 			if dht_error == .None {
+				if len(options.Routing_Cache_Path) > 0 {
+					load_error := DHT_Client_Load_Routing(&dht, options.Routing_Cache_Path)
+					fmt.printf("[DURRENT-META] DHT routing cache load path=%s result=%v\n", options.Routing_Cache_Path, load_error)
+				}
 				dht_options := DHT_Default_Network_Options()
 				dht_options.Timeout = time.Second
 				dht_options.Max_Queries = 8
@@ -434,23 +501,36 @@ Resolve_Magnet_Metadata :: proc(
 					fmt.printf("[DURRENT-META] DHT lookup failed error=%v\n", lookup_error)
 				}
 				Destroy_DHT_Lookup_Result(&result)
+				if len(options.Routing_Cache_Path) > 0 {
+					save_error := DHT_Client_Save_Routing(&dht, options.Routing_Cache_Path)
+					fmt.printf("[DURRENT-META] DHT routing cache save path=%s result=%v\n", options.Routing_Cache_Path, save_error)
+				}
 			}
 			DHT_Client_Destroy(&dht)
 		}
 
-		for candidate in candidates {
+		candidate_index := 0
+		max_candidates := options.Max_Candidates
+		if max_candidates == 0 {
+			max_candidates = 32
+		}
+		for candidate_index < len(candidates) {
+			candidate := candidates[candidate_index]
+			candidate_index += 1
 			if metadata_resolver_cancelled(options) {
 				return nil, .Cancelled
 			}
 			if metadata_resolver_expired(deadline) {
 				return nil, .Timed_Out
 			}
-			metadata, peer_error := metadata_resolver_try_peer(
+				metadata, peer_error := metadata_resolver_try_peer(
 				candidate,
 				magnet.Info_Hash,
 				peer_id,
 				options,
 				deadline,
+				&candidates,
+				max_candidates,
 			)
 			if peer_error == .None {
 				return metadata, .None

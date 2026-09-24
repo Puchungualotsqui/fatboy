@@ -15,6 +15,50 @@ DHT_Default_Network_Options :: proc() -> DHT_Network_Options {
 	return DHT_Network_Options{Timeout = 3 * time.Second, Max_Queries = 32}
 }
 
+// DHT_Default_Bootstrap_Nodes returns well-known public DHT router seeds.
+// Their IDs are synthetic until a response supplies the real remote ID; the
+// endpoint is what matters for the initial query.
+DHT_Default_Bootstrap_Nodes :: proc() -> [dynamic]DHT_Node {
+	seeds: [dynamic]DHT_Node
+	endpoints: [3]DHT_Endpoint
+	endpoints[0].IP[0] = 87
+	endpoints[0].IP[1] = 98
+	endpoints[0].IP[2] = 162
+	endpoints[0].IP[3] = 88
+	endpoints[0].Port = 6881
+	endpoints[1].IP[0] = 82
+	endpoints[1].IP[1] = 221
+	endpoints[1].IP[2] = 103
+	endpoints[1].IP[3] = 244
+	endpoints[1].Port = 6881
+	endpoints[2].IP[0] = 67
+	endpoints[2].IP[1] = 215
+	endpoints[2].IP[2] = 246
+	endpoints[2].IP[3] = 10
+	endpoints[2].Port = 6881
+	for endpoint, index in endpoints {
+		append(&seeds, DHT_Node{
+			ID = DHT_Node_ID_Generate(u64(0xD71000 + index + 1)),
+			Endpoint = endpoint,
+		})
+	}
+	return seeds
+}
+
+DHT_Client_Load_Routing :: proc(client: ^DHT_Client, path: string) -> DHT_Error {
+	if client == nil || len(path) == 0 {
+		return .Invalid_DHT
+	}
+	return DHT_Routing_Load(&client.Routing, path)
+}
+
+DHT_Client_Save_Routing :: proc(client: ^DHT_Client, path: string) -> DHT_Error {
+	if client == nil || len(path) == 0 {
+		return .Invalid_DHT
+	}
+	return DHT_Routing_Save(&client.Routing, path)
+}
+
 DHT_Lookup_Target :: struct {
 	Node:  DHT_Node,
 	Token: []byte,
@@ -138,11 +182,32 @@ DHT_Client_Get_Peers :: proc(
 	}
 	queue: [dynamic]DHT_Node
 	visited: [dynamic]DHT_Node_ID
-	for node in bootstrap {
-		if node.Endpoint.Port == 0 || dht_client_seen_node(queue, node.ID) {
+	closest := DHT_Routing_Closest(&client.Routing, DHT_Node_ID(info_hash), 16)
+	defer delete(closest)
+	for node in closest {
+		if node.Endpoint.Port == 0 {
+			continue
+		}
+		if dht_client_seen_endpoint(queue[:], node.Endpoint) {
 			continue
 		}
 		append(&queue, node)
+	}
+	cached := DHT_Default_Bootstrap_Nodes()
+	defer delete(cached)
+	for node in bootstrap {
+		if node.Endpoint.Port == 0 || dht_client_seen_endpoint(queue[:], node.Endpoint) {
+			continue
+		}
+		append(&queue, node)
+	}
+	for node in cached {
+		if node.Endpoint.Port == 0 || dht_client_seen_endpoint(queue[:], node.Endpoint) {
+			continue
+		}
+		append(&queue, node)
+	}
+	for node in queue {
 		_ = DHT_Routing_Add_Node(&client.Routing, node)
 	}
 	max_queries := options.Max_Queries if options.Max_Queries > 0 else u32(1)
@@ -164,6 +229,13 @@ DHT_Client_Get_Peers :: proc(
 			continue
 		}
 		if message.Kind == .Response {
+			zero_id: DHT_Node_ID
+			if message.Sender != zero_id {
+				_ = DHT_Routing_Add_Node(&client.Routing, DHT_Node{
+					ID = message.Sender,
+					Endpoint = node.Endpoint,
+				})
+			}
 			if len(message.Peers) > 0 {
 				append(&result.Peers, ..message.Peers[:])
 			}
@@ -179,7 +251,7 @@ DHT_Client_Get_Peers :: proc(
 				append(&result.Targets, DHT_Lookup_Target{Node = node, Token = token})
 			}
 			for discovered in message.Nodes {
-				if !dht_client_seen_id(visited, discovered.ID) && !dht_client_seen_node(queue, discovered.ID) {
+				if !dht_client_seen_id(visited, discovered.ID) && !dht_client_seen_node(queue[:], discovered.ID) {
 					append(&queue, discovered)
 					_ = DHT_Routing_Add_Node(&client.Routing, discovered)
 				}
@@ -328,8 +400,20 @@ dht_client_seen_id :: proc(ids: [dynamic]DHT_Node_ID, id: DHT_Node_ID) -> bool {
 	return false
 }
 
-dht_client_seen_node :: proc(nodes: [dynamic]DHT_Node, id: DHT_Node_ID) -> bool {
-	for node in nodes {
+dht_client_seen_endpoint :: proc(queue: []DHT_Node, endpoint: DHT_Endpoint) -> bool {
+	for node in queue {
+		if node.Endpoint.IP == endpoint.IP &&
+		   node.Endpoint.Port == endpoint.Port &&
+		   node.Endpoint.IPv6 == endpoint.IPv6 {
+			return true
+		}
+	}
+	return false
+}
+
+
+dht_client_seen_node :: proc(queue: []DHT_Node, id: DHT_Node_ID) -> bool {
+	for node in queue {
 		if node.ID == id {
 			return true
 		}

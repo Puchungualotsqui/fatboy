@@ -179,6 +179,16 @@ Torrent_Session_Loop_Start :: proc(loop: ^Torrent_Session_Loop) -> Torrent_Loop_
 	worker.data = loop
 	loop.Worker = worker
 	thread.start(worker)
+	if loop.DHT_Enabled && loop.DHT_Worker == nil {
+		dht_worker := thread.create(torrent_session_loop_dht_worker)
+		if dht_worker != nil {
+			dht_worker.data = loop
+			loop.DHT_Worker = dht_worker
+			loop.DHT_Worker_Started = true
+			loop.DHT_Stop_Requested = false
+			thread.start(dht_worker)
+		}
+	}
 	return .None
 }
 
@@ -520,7 +530,7 @@ torrent_session_loop_dht_worker :: proc(thread_value: ^thread.Thread) {
 	port := loop.Port
 	append(&bootstrap, ..loop.DHT_Bootstrap[:])
 	sync.mutex_unlock(&loop.Mutex)
-	if stop || len(bootstrap) == 0 {
+	if stop {
 		delete(bootstrap)
 		return
 	}
