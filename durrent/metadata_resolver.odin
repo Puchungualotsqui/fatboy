@@ -1,6 +1,7 @@
 package durrent
 
 import "core:fmt"
+import "core:strings"
 import "core:sync"
 import "core:time"
 
@@ -90,12 +91,38 @@ metadata_resolver_cancelled :: proc(options: Metadata_Resolver_Options) -> bool 
 }
 
 
+metadata_resolver_endpoint_allowed :: proc(endpoint: PEX_Peer) -> bool {
+	if endpoint.Port == 0 || endpoint.IPv6 {
+		return endpoint.Port != 0
+	}
+	first := endpoint.IP[0]
+	second := endpoint.IP[1]
+	if first == 0 || first == 10 || first == 127 || first >= 224 {
+		return false
+	}
+	if first == 100 && second >= 64 && second <= 127 {
+		return false
+	}
+	if first == 169 && second == 254 {
+		return false
+	}
+	if first == 172 && second >= 16 && second <= 31 {
+		return false
+	}
+	if first == 192 && second == 168 {
+		return false
+	}
+	return true
+}
+
+
 metadata_resolver_add_candidate :: proc(
 	candidates: ^[dynamic]metadata_resolver_candidate,
 	endpoint: PEX_Peer,
 	limit: u32,
 ) -> bool {
-	if candidates == nil || endpoint.Port == 0 || (limit > 0 && u32(len(candidates)) >= limit) {
+	if candidates == nil || !metadata_resolver_endpoint_allowed(endpoint) ||
+	   (limit > 0 && u32(len(candidates)) >= limit) {
 		return false
 	}
 	address := PEX_Peer_Address(endpoint)
@@ -441,8 +468,32 @@ Resolve_Magnet_Metadata :: proc(
 		Compact = true,
 		Event = .Started,
 	}
+	tracker_magnet: Magnet_Link
+	tracker_magnet.Info_Hash = magnet.Info_Hash
+	for tracker_url in magnet.Trackers {
+		copy, copy_ok := torrent_clone(tracker_url)
+		if !copy_ok {
+			Destroy_Magnet_Link(&tracker_magnet)
+			return nil, .Out_Of_Memory
+		}
+		append(&tracker_magnet.Trackers, copy)
+	}
+	if len(tracker_magnet.Trackers) == 0 {
+		fallback_trackers := [4]string{
+			"udp://tracker.opentrackr.org:1337/announce",
+			"udp://open.stealth.si:80/announce",
+			"udp://tracker.torrent.eu.org:451/announce",
+			"http://tracker.openbittorrent.com:80/announce",
+		}
+		for tracker_url in fallback_trackers {
+			copy := strings.clone(tracker_url, context.allocator)
+			append(&tracker_magnet.Trackers, transmute([]byte)copy)
+		}
+		fmt.printf("[DURRENT-META] No magnet trackers; using fallback trackers=%d\\n", len(tracker_magnet.Trackers))
+	}
+	defer Destroy_Magnet_Link(&tracker_magnet)
 	tracker: Tracker_Manager
-	tracker_error := Tracker_Manager_Init_Magnet(&tracker, magnet, request)
+	tracker_error := Tracker_Manager_Init_Magnet(&tracker, &tracker_magnet, request)
 	fmt.printf("[DURRENT-META] Tracker manager initialized result=%v\n", tracker_error)
 	if tracker_error != .None && tracker_error != .No_Trackers {
 		return nil, .Tracker
