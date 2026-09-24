@@ -1,5 +1,6 @@
 package durrent
 
+import "core:fmt"
 import endian "core:encoding/endian"
 import "core:crypto/hash"
 import "core:net"
@@ -210,6 +211,7 @@ DHT_Client_Get_Peers :: proc(
 	for node in queue {
 		_ = DHT_Routing_Add_Node(&client.Routing, node)
 	}
+	fmt.printf("[DURRENT-DHT] Lookup seeds=%d explicit=%d cached=%d\n", len(queue), len(bootstrap), len(closest))
 	max_queries := options.Max_Queries if options.Max_Queries > 0 else u32(1)
 	queries: u32
 	for len(queue) > 0 && queries < max_queries {
@@ -221,13 +223,25 @@ DHT_Client_Get_Peers :: proc(
 		}
 		append(&visited, node.ID)
 		queries += 1
+		fmt.printf(
+			"[DURRENT-DHT] Query %d/%d endpoint=%d.%d.%d.%d:%d\n",
+			queries,
+			max_queries,
+			node.Endpoint.IP[0],
+			node.Endpoint.IP[1],
+			node.Endpoint.IP[2],
+			node.Endpoint.IP[3],
+			node.Endpoint.Port,
+		)
 		transaction := dht_client_next_transaction(client)
 		packet := DHT_Encode_Get_Peers(transaction[:], client.Node_ID, info_hash)
 		message, query_error := dht_client_exchange_locked(client, node.Endpoint, packet, transaction[:], options)
 		delete(packet)
 		if query_error != .None {
+			fmt.printf("[DURRENT-DHT] Query failed error=%v\n", query_error)
 			continue
 		}
+		fmt.printf("[DURRENT-DHT] Response peers=%d nodes=%d token=%v\n", len(message.Peers), len(message.Nodes), len(message.Token) > 0)
 		if message.Kind == .Response {
 			zero_id: DHT_Node_ID
 			if message.Sender != zero_id {
@@ -355,6 +369,7 @@ dht_client_exchange_locked :: proc(
 		net_endpoint = net.Endpoint{address = ip4, port = int(endpoint.Port)}
 	}
 	if _, send_error := net.send_udp(socket, packet, net_endpoint); send_error != .None {
+		fmt.printf("[DURRENT-DHT] UDP send failed endpoint=%v error=%v\\n", net_endpoint, send_error)
 		return DHT_Message{}, .Send
 	}
 	timeout := options.Timeout if options.Timeout > 0 else DHT_Default_Network_Options().Timeout
@@ -366,19 +381,23 @@ dht_client_exchange_locked :: proc(
 	count, _, receive_error := net.recv_udp(socket, buffer)
 	if receive_error == .Timeout || receive_error == .Would_Block {
 		delete(buffer)
+		fmt.printf("[DURRENT-DHT] UDP receive timeout endpoint=%v\n", net_endpoint)
 		return DHT_Message{}, .Timeout
 	}
 	if receive_error != .None {
 		delete(buffer)
+		fmt.printf("[DURRENT-DHT] UDP receive failed endpoint=%v error=%v\\n", net_endpoint, receive_error)
 		return DHT_Message{}, .Receive
 	}
 	message, parse_error := DHT_Parse_Message(buffer[:count])
 	delete(buffer)
 	if parse_error != .None {
+		fmt.printf("[DURRENT-DHT] KRPC parse failed bytes=%d error=%v\\n", count, parse_error)
 		return DHT_Message{}, parse_error
 	}
 	if !bytes_equal(message.Transaction, transaction) {
 		Destroy_DHT_Message(&message)
+		fmt.println("[DURRENT-DHT] KRPC transaction mismatch")
 		return DHT_Message{}, .Transaction_Mismatch
 	}
 	return message, .None

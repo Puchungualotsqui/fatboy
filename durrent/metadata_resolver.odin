@@ -394,6 +394,10 @@ Resolve_Magnet_Metadata :: proc(
 	if peer_limit == 0 {
 		peer_limit = 8
 	}
+	candidate_limit := options.Max_Candidates
+	if candidate_limit == 0 {
+		candidate_limit = 32
+	}
 	retry_count := options.Retry_Count
 	if retry_count == 0 {
 		retry_count = 1
@@ -451,7 +455,7 @@ Resolve_Magnet_Metadata :: proc(
 			)
 			if announce_error == .None {
 				before := len(candidates)
-				metadata_resolver_add_tracker_peers(&candidates, &response, peer_limit)
+				metadata_resolver_add_tracker_peers(&candidates, &response, candidate_limit)
 				fmt.printf(
 					"[DURRENT-META] Tracker announce returned peers=%d new_candidates=%d\n",
 					len(response.Peers)+len(response.Peers6),
@@ -482,7 +486,7 @@ Resolve_Magnet_Metadata :: proc(
 				}
 				dht_options := DHT_Default_Network_Options()
 				dht_options.Timeout = time.Second
-				dht_options.Max_Queries = 8
+				dht_options.Max_Queries = 32
 				result, lookup_error := DHT_Client_Get_Peers(
 					&dht,
 					magnet.Info_Hash,
@@ -491,7 +495,7 @@ Resolve_Magnet_Metadata :: proc(
 				)
 				if lookup_error == .None {
 					before := len(candidates)
-					metadata_resolver_add_dht_peers(&candidates, &result, peer_limit)
+					metadata_resolver_add_dht_peers(&candidates, &result, candidate_limit)
 					fmt.printf(
 						"[DURRENT-META] DHT returned peers=%d new_candidates=%d\n",
 						len(result.Peers),
@@ -510,10 +514,7 @@ Resolve_Magnet_Metadata :: proc(
 		}
 
 		candidate_index := 0
-		max_candidates := options.Max_Candidates
-		if max_candidates == 0 {
-			max_candidates = 32
-		}
+		max_candidates := candidate_limit
 		for candidate_index < len(candidates) {
 			candidate := candidates[candidate_index]
 			candidate_index += 1
