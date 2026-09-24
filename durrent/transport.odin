@@ -1,5 +1,6 @@
 package durrent
 
+import "core:fmt"
 import "core:net"
 import "core:strings"
 import "core:sync"
@@ -184,11 +185,13 @@ Peer_Transport_Flush :: proc(transport: ^Peer_Transport) -> Peer_Transport_Error
 	if len(transport.Write_Buffer) == 0 {
 		return .None
 	}
+	buffered := len(transport.Write_Buffer)
 	sent, send_error := net.send_tcp(transport.Socket, transport.Write_Buffer[:])
 	if send_error == net.TCP_Send_Error.Timeout || send_error == net.TCP_Send_Error.Would_Block {
 		return .Timeout
 	}
 	if send_error != net.TCP_Send_Error.None {
+		fmt.printf("[DURRENT-WIRE] send failed socket_error=%v sent=%d buffered=%d\n", send_error, sent, buffered)
 		transport.Connected = false
 		return .Write
 	}
@@ -198,10 +201,12 @@ Peer_Transport_Flush :: proc(transport: ^Peer_Transport) -> Peer_Transport_Error
 	}
 	if sent == len(transport.Write_Buffer) {
 		resize(&transport.Write_Buffer, 0)
+		fmt.printf("[DURRENT-WIRE] send complete bytes=%d\n", sent)
 		return .None
 	}
 	if sent > 0 {
 		remaining := len(transport.Write_Buffer)-sent
+		fmt.printf("[DURRENT-WIRE] send partial sent=%d remaining=%d\n", sent, remaining)
 		copy(transport.Write_Buffer[:remaining], transport.Write_Buffer[sent:])
 		resize(&transport.Write_Buffer, remaining)
 	}

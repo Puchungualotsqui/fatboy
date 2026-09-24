@@ -51,6 +51,7 @@ Torrent_Loop_Peer :: struct {
 	Remote_PEX_ID:        byte,
 	PEX_Handshake_Sent:   bool,
 	PEX_Last_Sent:        time.Time,
+	Ready_Since:          time.Time,
 }
 
 Torrent_Session_Loop :: struct {
@@ -256,10 +257,19 @@ Torrent_Session_Loop_Tick :: proc(loop: ^Torrent_Session_Loop, now: time.Time) -
 	finished_dht: ^thread.Thread
 	connect_budget := 4
 	if len(loop.Peers) > 0 {
-		// Existing peers must be polled promptly; do not spend the whole
-		// tick dialing several additional candidates while they wait for
-		// interested/unchoke and piece traffic.
-		connect_budget = 1
+		// Peer_Transport_Connect can consume its entire dial timeout. Do not
+		// delay an established peer's wire polling behind another synchronous
+		// dial: it delays flushing Interested and receiving Unchoke/Piece.
+		// If every ready peer remains choked for a while, admit one additional
+		// candidate to find an uploader without starving existing connections.
+		connect_budget = 0
+		for peer in loop.Peers {
+			if peer.Session.State == .Ready && peer.Session.Remote_Choking &&
+			   time.diff(peer.Ready_Since, now) >= 15*time.Second {
+				connect_budget = 1
+				break
+			}
+		}
 	}
 	if loop.DHT_Worker != nil && !loop.DHT_Worker_Started && thread.is_done(loop.DHT_Worker) {
 		finished_dht = loop.DHT_Worker
@@ -840,6 +850,7 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 				continue
 			}
 			peer.Registered = true
+			peer.Ready_Since = time.now()
 			fmt.printf(
 				"[DURRENT-PEER] ready address=%s extensions=%v\n",
 				peer.Address,
