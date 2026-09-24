@@ -779,6 +779,13 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 				continue
 			}
 			peer.Registered = true
+			// A peer starts us choked. BitTorrent peers normally unchoke only
+			// after receiving this message; without it the scheduler can never
+			// send requests, even when the handshake and bitfield succeeded.
+			if Peer_Session_Queue_Interested(&peer.Session, true) != .None {
+				loop_remove_peer_locked(loop, index)
+				continue
+			}
 		}
 		if loop.PEX_Enabled && peer.Session.State == .Ready && !peer.PEX_Handshake_Sent {
 			payload := PEX_Encode_Extension_Handshake()

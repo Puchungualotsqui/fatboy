@@ -1452,6 +1452,7 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
 
     completed := false
     stats_log_at := time.time_add(time.now(), 2*time.Second)
+    no_progress_since := time.now()
     for {
         if download_should_cancel(manager, entry_index) {
             _ = durrent.Torrent_Session_Loop_Shutdown(&loop)
@@ -1492,6 +1493,15 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
             entry_index,
             stats.Download_Bytes_Per_Second,
         )
+        if completed_bytes > 0 {
+            no_progress_since = time.now()
+        }
+        if completed_bytes == 0 && stats.Connected_Peers == 0 &&
+           time.diff(no_progress_since, time.now()) >= 5*time.Minute {
+            _ = durrent.Torrent_Session_Loop_Shutdown(&loop)
+            download_fail_entry(manager, entry_index, "No reachable data peers were found.")
+            return
+        }
         if time.diff(stats_log_at, time.now()) >= 0 {
             fmt.printf(
                 "[DOWNLOAD] Durrent stats state=%v peers=%d connected=%d progress=%.1f%% bytes=%d/%d speed=%.1f KiB/s\n",
