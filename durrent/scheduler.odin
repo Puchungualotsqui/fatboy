@@ -97,7 +97,9 @@ Piece_Scheduler_Init :: proc(
 	scheduler.Block_Received = block_received
 	scheduler.Availability = availability
 	scheduler.Request_Timeout = request_timeout
-	scheduler.Max_Requests_Per_Peer = 5
+	// Keep up to 512 KiB in flight per peer (32 × 16 KiB blocks). A five
+	// block window stalls badly on ordinary public-internet round-trip times.
+	scheduler.Max_Requests_Per_Peer = 32
 	scheduler.Endgame_Piece_Threshold = 2
 	scheduler.Seeding = piece_count == 0
 	return .None

@@ -201,7 +201,6 @@ Peer_Transport_Flush :: proc(transport: ^Peer_Transport) -> Peer_Transport_Error
 	}
 	if sent == len(transport.Write_Buffer) {
 		resize(&transport.Write_Buffer, 0)
-		fmt.printf("[DURRENT-WIRE] send complete bytes=%d\n", sent)
 		return .None
 	}
 	if sent > 0 {

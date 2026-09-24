@@ -1100,7 +1100,9 @@ loop_queue_peer_requests_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torr
 		}
 		queued += 1
 	}
-	if queued > 0 {
+	// Log initial pipeline fills, but not every single-block refill; the latter
+	// is normal steady-state behavior and floods the console at download speed.
+	if queued > 1 {
 		fmt.printf("[DURRENT-PEER] requests queued address=%s count=%d\n", peer.Address, queued)
 	}
 }
