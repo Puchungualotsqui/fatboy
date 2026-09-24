@@ -392,7 +392,7 @@ dht_client_exchange_locked :: proc(
 	message, parse_error := DHT_Parse_Message(buffer[:count])
 	delete(buffer)
 	if parse_error != .None {
-		fmt.printf("[DURRENT-DHT] KRPC parse failed bytes=%d error=%v\\n", count, parse_error)
+		fmt.printf("[DURRENT-DHT] KRPC parse failed bytes=%d error=%v\n", count, parse_error)
 		return DHT_Message{}, parse_error
 	}
 	if !bytes_equal(message.Transaction, transaction) {

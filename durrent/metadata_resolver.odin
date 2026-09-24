@@ -236,12 +236,12 @@ metadata_resolver_cleanup_peer :: proc(
 	downloader: ^Metadata_Downloader,
 	address: string,
 ) {
-	fmt.printf("[DURRENT-META] Cleanup downloader begin peer=%s\\n", address)
+	fmt.printf("[DURRENT-META] Cleanup downloader begin peer=%s\n", address)
 	Metadata_Downloader_Destroy(downloader)
-	fmt.printf("[DURRENT-META] Cleanup downloader done peer=%s\\n", address)
-	fmt.printf("[DURRENT-META] Cleanup session begin peer=%s\\n", address)
+	fmt.printf("[DURRENT-META] Cleanup downloader done peer=%s\n", address)
+	fmt.printf("[DURRENT-META] Cleanup session begin peer=%s\n", address)
 	Destroy_Peer_Session(session)
-	fmt.printf("[DURRENT-META] Cleanup session done peer=%s\\n", address)
+	fmt.printf("[DURRENT-META] Cleanup session done peer=%s\n", address)
 }
 
 
@@ -323,7 +323,15 @@ metadata_resolver_try_peer :: proc(
 		poll_error := Peer_Session_Poll(&session)
 		if poll_error != .None &&
 			poll_error != .Timeout {
-			fmt.printf("[DURRENT-META] Peer poll failed address=%s error=%v\n", candidate.Address, poll_error)
+			fmt.printf(
+				"[DURRENT-META] Peer poll failed address=%s error=%v state=%v session_error=%v remote_extensions=%v events=%d\n",
+				candidate.Address,
+				poll_error,
+				session.State,
+				session.Error,
+				session.Remote_Extensions,
+				len(session.Events),
+			)
 			break
 		}
 
@@ -342,7 +350,7 @@ metadata_resolver_try_peer :: proc(
 				pex_error := Peer_Session_Queue_Extended(&session, 0, payload)
 				delete(payload)
 				pex_handshake_sent = pex_error == .None
-				fmt.printf("[DURRENT-META] PEX handshake queued peer=%s result=%v\\n", candidate.Address, pex_error)
+				fmt.printf("[DURRENT-META] PEX handshake queued peer=%s result=%v\n", candidate.Address, pex_error)
 			}
 			if options.Enable_PEX && event.Kind == .Extended &&
 			   candidates != nil && u32(len(candidates)) < max_candidates {
