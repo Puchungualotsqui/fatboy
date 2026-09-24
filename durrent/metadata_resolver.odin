@@ -66,8 +66,8 @@ Metadata_Resolver_Is_Cancelled :: proc(token: ^Metadata_Resolver_Cancel_Token) -
 Metadata_Resolver_Default_Options :: proc() -> Metadata_Resolver_Options {
 	return Metadata_Resolver_Options{
 		Total_Timeout = 180 * time.Second,
-		Peer_Connect_Timeout = 5 * time.Second,
-		Peer_Metadata_Timeout = 20 * time.Second,
+		Peer_Connect_Timeout = 3 * time.Second,
+		Peer_Metadata_Timeout = 10 * time.Second,
 		Tracker_Timeout_Seconds = 20,
 		Retry_Count = 3,
 		Peer_Limit = 8,
@@ -543,7 +543,8 @@ Resolve_Magnet_Metadata :: proc(
 		if options.Enable_DHT && len(bootstrap) == 0 && len(candidates) > 0 {
 			metadata_resolver_bootstrap_from_candidates(candidates[:], &bootstrap)
 		}
-		if options.Enable_DHT && !metadata_resolver_expired(deadline) {
+		if options.Enable_DHT && u32(len(candidates)) < candidate_limit &&
+		   !metadata_resolver_expired(deadline) {
 			dht: DHT_Client
 			dht_error := DHT_Client_Init(
 				&dht,
