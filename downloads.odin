@@ -1199,7 +1199,14 @@ download_resolve_durrent_torrent :: proc(
     info_hash := download_torrent_hash_to_string(magnet.Info_Hash)
     defer delete(info_hash)
     cache_path := download_metadata_cache_path(app.download_path, info_hash)
+    fmt.printf(
+        "[DOWNLOAD] Durrent metadata entry=%d hash=%s cache=%s\n",
+        entry_index,
+        info_hash,
+        cache_path,
+    )
     if download_validate_metadata_cache(cache_path, magnet.Info_Hash) {
+        fmt.printf("[DOWNLOAD] Durrent metadata cache hit entry=%d\n", entry_index)
         download_set_entry_local_torrent_path(manager, entry_index, cache_path)
         sync.mutex_lock(&manager.mutex)
         game_index := manager.entries[entry_index].game_index
@@ -1214,7 +1221,10 @@ download_resolve_durrent_torrent :: proc(
         return cache_path, "", false
     }
     if os.exists(cache_path) {
+        fmt.printf("[DOWNLOAD] Durrent metadata cache invalid; deleting %s\n", cache_path)
         download_remove_local_path(cache_path, "invalid metadata cache")
+    } else {
+        fmt.printf("[DOWNLOAD] Durrent metadata cache miss entry=%d\n", entry_index)
     }
 
     download_set_state(manager, entry_index, .Resolving)
@@ -1226,12 +1236,19 @@ download_resolve_durrent_torrent :: proc(
     download_set_metadata_cancel(manager, &cancel_token)
     options := durrent.Metadata_Resolver_Default_Options()
     options.Cancel = &cancel_token
+    fmt.printf("[DOWNLOAD] Starting Durrent metadata resolver entry=%d\n", entry_index)
     metadata, resolver_error := durrent.Resolve_Magnet_Metadata(
         &magnet,
         download_durrent_peer_id(),
         options,
     )
     download_set_metadata_cancel(manager, nil)
+    fmt.printf(
+        "[DOWNLOAD] Durrent metadata resolver finished entry=%d result=%v bytes=%d\n",
+        entry_index,
+        resolver_error,
+        len(metadata),
+    )
     if resolver_error != .None {
         if resolver_error == .Cancelled ||
            download_should_cancel(manager, entry_index) ||
@@ -1245,8 +1262,10 @@ download_resolve_durrent_torrent :: proc(
     defer delete(metadata)
 
     if !download_write_metadata_cache(cache_path, metadata) {
+        fmt.printf("[DOWNLOAD] ERROR: could not write Durrent metadata cache %s\n", cache_path)
         return "", "Could not cache the resolved torrent metadata.", false
     }
+    fmt.printf("[DOWNLOAD] Durrent metadata cache written path=%s bytes=%d\n", cache_path, len(metadata))
     download_set_entry_local_torrent_path(manager, entry_index, cache_path)
     sync.mutex_lock(&manager.mutex)
     game_index := manager.entries[entry_index].game_index
@@ -1298,6 +1317,7 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
     }
 
     torrent_path := download_copy_local_torrent_path(manager, entry_index)
+    fmt.printf("[DOWNLOAD] Durrent entry=%d torrent_path=%s\n", entry_index, torrent_path)
     if len(torrent_path) == 0 {
         resolved_path, resolve_error, cancelled := download_resolve_durrent_torrent(
             manager,
@@ -1312,9 +1332,9 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
             return
         }
         if len(resolve_error) > 0 {
+            // Resolver error messages and the empty path may be string
+            // literals, so neither result is owned by this caller.
             download_fail_entry(manager, entry_index, resolve_error)
-            delete(resolve_error)
-            delete(resolved_path)
             return
         }
         delete(torrent_path)
@@ -1333,6 +1353,7 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
     defer delete(data)
 
     torrent, parse_error := durrent.Parse_Torrent(data[:])
+    fmt.printf("[DOWNLOAD] Durrent torrent parse entry=%d result=%v bytes=%d\n", entry_index, parse_error, len(data))
     if parse_error != .None {
         download_fail_entry(manager, entry_index, "The local .torrent file is invalid.")
         return
@@ -1362,6 +1383,13 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
     }
 
     loop: durrent.Torrent_Session_Loop
+    fmt.printf(
+        "[DOWNLOAD] Opening Durrent session entry=%d output=%s files=%d multi=%v\n",
+        entry_index,
+        app.download_path,
+        len(torrent.Files),
+        torrent.Multi_File,
+    )
     open_error := durrent.Torrent_Session_Loop_Open(
         &loop,
         &torrent,
@@ -1369,12 +1397,14 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
         download_durrent_peer_id(),
         0,
     )
+    fmt.printf("[DOWNLOAD] Durrent session open entry=%d result=%v\n", entry_index, open_error)
     if open_error != .None {
         download_fail_entry(manager, entry_index, "Could not open the local torrent session.")
         return
     }
 
     start_error := durrent.Torrent_Session_Loop_Start(&loop)
+    fmt.printf("[DOWNLOAD] Durrent session start entry=%d result=%v\n", entry_index, start_error)
     if start_error != .None {
         _ = durrent.Torrent_Session_Loop_Shutdown(&loop)
         download_fail_entry(manager, entry_index, "Could not start the local torrent session.")
@@ -1439,13 +1469,15 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
         time.sleep(250 * time.Millisecond)
     }
 
-    _ = durrent.Torrent_Session_Loop_Shutdown(&loop)
+    shutdown_error := durrent.Torrent_Session_Loop_Shutdown(&loop)
+    fmt.printf("[DOWNLOAD] Durrent session shutdown entry=%d result=%v completed=%v\n", entry_index, shutdown_error, completed)
     if !completed {
         download_fail_entry(manager, entry_index, "Durrent stopped before the torrent completed.")
         return
     }
 
     archive_path := download_find_torrent_archive(&torrent, app.download_path)
+    fmt.printf("[DOWNLOAD] Durrent archive scan entry=%d archive=%s\n", entry_index, archive_path)
     if len(archive_path) == 0 {
         install_target := download_torrent_install_target(&torrent, app.download_path)
         defer delete(install_target)

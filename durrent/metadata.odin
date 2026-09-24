@@ -55,8 +55,10 @@ Metadata_Downloader_Destroy :: proc(downloader: ^Metadata_Downloader) {
 	sync.mutex_lock(&downloader.Mutex)
 	delete(downloader.Data)
 	delete(downloader.Received)
-	downloader^ = Metadata_Downloader{}
 	sync.mutex_unlock(&downloader.Mutex)
+	// The mutex is part of the struct. Resetting the struct while holding
+	// the mutex corrupts it before the unlock and can abort during cleanup.
+	downloader^ = Metadata_Downloader{}
 }
 
 Metadata_Downloader_Begin :: proc(downloader: ^Metadata_Downloader, session: ^Peer_Session) -> Metadata_Error {

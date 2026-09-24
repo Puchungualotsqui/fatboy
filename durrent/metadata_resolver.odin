@@ -1,5 +1,6 @@
 package durrent
 
+import "core:fmt"
 import "core:sync"
 import "core:time"
 
@@ -73,7 +74,9 @@ Metadata_Resolver_Default_Options :: proc() -> Metadata_Resolver_Options {
 
 
 metadata_resolver_expired :: proc(deadline: time.Time) -> bool {
-	return time.diff(deadline, time.now()) <= 0
+	// time.diff(a, b) returns b-a. A deadline is expired once now has
+	// reached or passed it.
+	return time.diff(deadline, time.now()) >= 0
 }
 
 
@@ -214,6 +217,7 @@ metadata_resolver_try_peer :: proc(
 	options: Metadata_Resolver_Options,
 	deadline: time.Time,
 ) -> ([]byte, Metadata_Resolver_Error) {
+	fmt.printf("[DURRENT-META] Trying peer %s\n", candidate.Address)
 	if metadata_resolver_cancelled(options) {
 		return nil, .Cancelled
 	}
@@ -228,9 +232,12 @@ metadata_resolver_try_peer :: proc(
 	if connect_timeout <= 0 {
 		connect_timeout = 5 * time.Second
 	}
-	if Peer_Session_Connect(&session, candidate.Address, connect_timeout) != .None {
+	connect_error := Peer_Session_Connect(&session, candidate.Address, connect_timeout)
+	if connect_error != .None {
+		fmt.printf("[DURRENT-META] Peer connect failed address=%s error=%v\n", candidate.Address, connect_error)
 		return nil, .No_Peers
 	}
+	fmt.printf("[DURRENT-META] Peer connected address=%s\n", candidate.Address)
 
 	downloader: Metadata_Downloader
 	metadata_error := Metadata_Downloader_Init(
@@ -255,6 +262,7 @@ metadata_resolver_try_peer :: proc(
 		poll_error := Peer_Session_Poll(&session)
 		if poll_error != .None &&
 			poll_error != .Timeout {
+			fmt.printf("[DURRENT-META] Peer poll failed address=%s error=%v\n", candidate.Address, poll_error)
 			break
 		}
 
@@ -270,17 +278,20 @@ metadata_resolver_try_peer :: proc(
 			)
 			Destroy_Peer_Event(&event)
 			if event_error != .None {
+				fmt.printf("[DURRENT-META] Metadata event failed address=%s error=%v\n", candidate.Address, event_error)
 				break
 			}
 		}
 
-		if Metadata_Downloader_Is_Complete(&downloader) {
-			metadata, finish_error := Metadata_Downloader_Finish_Bencoded(&downloader)
-			if finish_error == .None {
-				return metadata, .None
-			}
-			return nil, .Metadata
+	if Metadata_Downloader_Is_Complete(&downloader) {
+		metadata, finish_error := Metadata_Downloader_Finish_Bencoded(&downloader)
+		if finish_error == .None {
+			fmt.printf("[DURRENT-META] Metadata completed from peer %s bytes=%d\n", candidate.Address, len(metadata))
+			return metadata, .None
 		}
+		fmt.printf("[DURRENT-META] Metadata verification failed address=%s error=%v\n", candidate.Address, finish_error)
+		return nil, .Metadata
+	}
 		time.sleep(10 * time.Millisecond)
 	}
 
@@ -288,8 +299,10 @@ metadata_resolver_try_peer :: proc(
 		return nil, .Cancelled
 	}
 	if metadata_resolver_expired(deadline) {
+		fmt.printf("[DURRENT-META] Peer attempt timed out address=%s\n", candidate.Address)
 		return nil, .Timed_Out
 	}
+	fmt.printf("[DURRENT-META] Peer attempt ended without metadata address=%s\n", candidate.Address)
 	return nil, .No_Peers
 }
 
@@ -323,6 +336,14 @@ Resolve_Magnet_Metadata :: proc(
 		retry_count = 1
 	}
 
+	fmt.printf(
+		"[DURRENT-META] Resolve start trackers=%d peer_limit=%d retries=%d total_timeout=%v\n",
+		len(magnet.Trackers),
+		peer_limit,
+		retry_count,
+		total_timeout,
+	)
+
 	request := Tracker_Announce_Request{
 		Info_Hash = magnet.Info_Hash,
 		Peer_ID = peer_id,
@@ -333,6 +354,7 @@ Resolve_Magnet_Metadata :: proc(
 	}
 	tracker: Tracker_Manager
 	tracker_error := Tracker_Manager_Init_Magnet(&tracker, magnet, request)
+	fmt.printf("[DURRENT-META] Tracker manager initialized result=%v\n", tracker_error)
 	if tracker_error != .None && tracker_error != .No_Trackers {
 		return nil, .Tracker
 	}
@@ -347,6 +369,7 @@ Resolve_Magnet_Metadata :: proc(
 	}
 
 	for attempt := u32(0); attempt < retry_count; attempt += 1 {
+		fmt.printf("[DURRENT-META] Attempt %d/%d candidates=%d\n", attempt+1, retry_count, len(candidates))
 		if metadata_resolver_cancelled(options) {
 			return nil, .Cancelled
 		}
@@ -364,7 +387,15 @@ Resolve_Magnet_Metadata :: proc(
 				metadata_resolver_tracker_options(options),
 			)
 			if announce_error == .None {
+				before := len(candidates)
 				metadata_resolver_add_tracker_peers(&candidates, &response, peer_limit)
+				fmt.printf(
+					"[DURRENT-META] Tracker announce returned peers=%d new_candidates=%d\n",
+					len(response.Peers)+len(response.Peers6),
+					len(candidates)-before,
+				)
+			} else {
+				fmt.printf("[DURRENT-META] Tracker announce failed error=%v\n", announce_error)
 			}
 			Destroy_Tracker_Response(&response)
 		}
@@ -380,6 +411,7 @@ Resolve_Magnet_Metadata :: proc(
 				DHT_Node_ID_Generate(u64(attempt + 100)),
 				0,
 			)
+			fmt.printf("[DURRENT-META] DHT init result=%v bootstrap=%d\n", dht_error, len(bootstrap))
 			if dht_error == .None {
 				dht_options := DHT_Default_Network_Options()
 				dht_options.Timeout = time.Second
@@ -391,7 +423,15 @@ Resolve_Magnet_Metadata :: proc(
 					dht_options,
 				)
 				if lookup_error == .None {
+					before := len(candidates)
 					metadata_resolver_add_dht_peers(&candidates, &result, peer_limit)
+					fmt.printf(
+						"[DURRENT-META] DHT returned peers=%d new_candidates=%d\n",
+						len(result.Peers),
+						len(candidates)-before,
+					)
+				} else {
+					fmt.printf("[DURRENT-META] DHT lookup failed error=%v\n", lookup_error)
 				}
 				Destroy_DHT_Lookup_Result(&result)
 			}
@@ -428,7 +468,9 @@ Resolve_Magnet_Metadata :: proc(
 		return nil, .Timed_Out
 	}
 	if len(candidates) == 0 {
+		fmt.println("[DURRENT-META] Resolution ended with no peer candidates")
 		return nil, .No_Peers
 	}
+	fmt.printf("[DURRENT-META] Resolution ended without metadata candidates=%d\n", len(candidates))
 	return nil, .Metadata
 }

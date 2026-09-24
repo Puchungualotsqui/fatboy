@@ -100,8 +100,12 @@ Peer_Transport_Close :: proc(transport: ^Peer_Transport) {
 		sync.mutex_lock(&job.Mutex)
 		job.Canceled = true
 		if job.Done {
-			delete(job.Address)
-			free(job)
+			// A detached worker owns cleanup once it has observed
+			// Detached. Do not free the job a second time here.
+			if !job.Detached {
+				delete(job.Address)
+				free(job)
+			}
 		} else {
 			job.Detached = true
 		}
