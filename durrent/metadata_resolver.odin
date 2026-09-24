@@ -39,8 +39,9 @@ Metadata_Resolver_Error :: enum {
 }
 
 metadata_resolver_candidate :: struct {
-	Address:  string,
-	Endpoint: PEX_Peer,
+	Address:   string,
+	Endpoint:  PEX_Peer,
+	Attempted: bool,
 }
 
 Metadata_Resolver_Cancel :: proc(token: ^Metadata_Resolver_Cancel_Token) {
@@ -148,6 +149,23 @@ metadata_resolver_destroy_candidates :: proc(candidates: ^[dynamic]metadata_reso
 		delete(candidate.Address)
 	}
 	delete(candidates^)
+}
+
+
+metadata_resolver_prune_attempted :: proc(candidates: ^[dynamic]metadata_resolver_candidate) {
+	if candidates == nil {
+		return
+	}
+	remaining: [dynamic]metadata_resolver_candidate
+	for candidate in candidates^ {
+		if candidate.Attempted {
+			delete(candidate.Address)
+			continue
+		}
+		append(&remaining, candidate)
+	}
+	delete(candidates^)
+	candidates^ = remaining
 }
 
 
@@ -590,6 +608,11 @@ Resolve_Magnet_Metadata :: proc(
 		candidate_index := 0
 		max_candidates := candidate_limit
 		for candidate_index < len(candidates) {
+			if candidates[candidate_index].Attempted {
+				candidate_index += 1
+				continue
+			}
+			candidates[candidate_index].Attempted = true
 			candidate := candidates[candidate_index]
 			candidate_index += 1
 			if metadata_resolver_cancelled(options) {
@@ -614,6 +637,7 @@ Resolve_Magnet_Metadata :: proc(
 				return nil, peer_error
 			}
 		}
+		metadata_resolver_prune_attempted(&candidates)
 	}
 
 	if metadata_resolver_cancelled(options) {
