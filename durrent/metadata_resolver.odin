@@ -647,7 +647,14 @@ Resolve_Magnet_Metadata :: proc(
 		if options.Enable_DHT && len(bootstrap) == 0 && len(candidates) > 0 {
 			metadata_resolver_bootstrap_from_candidates(candidates[:], &bootstrap)
 		}
-		if options.Enable_DHT && u32(len(candidates)) < candidate_limit &&
+		// Trackerless magnets use fallback trackers, but those responses can
+		// fill the normal candidate budget with stale peers. Always reserve
+		// additional capacity for DHT candidates in that case.
+		dht_candidate_limit := candidate_limit + 16
+		if len(magnet.Trackers) == 0 {
+			dht_candidate_limit = candidate_limit + 32
+		}
+		if options.Enable_DHT && u32(len(candidates)) < dht_candidate_limit &&
 		   !metadata_resolver_expired(deadline) {
 			dht: DHT_Client
 			dht_error := DHT_Client_Init(
@@ -673,7 +680,7 @@ Resolve_Magnet_Metadata :: proc(
 				)
 				if lookup_error == .None {
 					before := len(candidates)
-					metadata_resolver_add_dht_peers(&candidates, &result, candidate_limit)
+					metadata_resolver_add_dht_peers(&candidates, &result, dht_candidate_limit)
 					fmt.printf(
 						"[DURRENT-META] DHT returned peers=%d new_candidates=%d\n",
 						len(result.Peers),
