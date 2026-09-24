@@ -1011,7 +1011,7 @@ download_remove_durrent_artifacts :: proc(
 
 
 download_durrent_peer_id :: proc() -> (peer_id: [20]byte) {
-    value := "-FB0100-DURRENT-01"
+    value := "-FB0100-DURRENT-0001"
     for index := 0; index < len(value) && index < len(peer_id); index += 1 {
         peer_id[index] = value[index]
     }

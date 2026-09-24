@@ -182,7 +182,7 @@ Peer_Transport_Flush :: proc(transport: ^Peer_Transport) -> Peer_Transport_Error
 	if len(transport.Write_Buffer) == 0 {
 		return .None
 	}
-	_, send_error := net.send_tcp(transport.Socket, transport.Write_Buffer[:])
+	sent, send_error := net.send_tcp(transport.Socket, transport.Write_Buffer[:])
 	if send_error == net.TCP_Send_Error.Timeout || send_error == net.TCP_Send_Error.Would_Block {
 		return .Timeout
 	}
@@ -190,8 +190,20 @@ Peer_Transport_Flush :: proc(transport: ^Peer_Transport) -> Peer_Transport_Error
 		transport.Connected = false
 		return .Write
 	}
-	resize(&transport.Write_Buffer, 0)
-	return .None
+	if sent < 0 || sent > len(transport.Write_Buffer) {
+		transport.Connected = false
+		return .Write
+	}
+	if sent == len(transport.Write_Buffer) {
+		resize(&transport.Write_Buffer, 0)
+		return .None
+	}
+	if sent > 0 {
+		remaining := len(transport.Write_Buffer)-sent
+		copy(transport.Write_Buffer[:remaining], transport.Write_Buffer[sent:])
+		resize(&transport.Write_Buffer, remaining)
+	}
+	return .Timeout
 }
 
 Peer_Transport_Receive :: proc(transport: ^Peer_Transport, buffer: []byte) -> (int, Peer_Transport_Error) {

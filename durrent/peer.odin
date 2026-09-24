@@ -1,5 +1,6 @@
 package durrent
 
+import "core:fmt"
 import "core:net"
 import "core:sync"
 import "core:time"
@@ -228,13 +229,25 @@ Peer_Session_Poll :: proc(session: ^Peer_Session) -> Peer_Error {
 		return .Invalid_State
 	}
 	if len(session.Outgoing) > 0 {
-		if Peer_Transport_Queue(&session.Transport, session.Outgoing[:]) != .None {
+		queued_bytes := len(session.Outgoing)
+		queue_error := Peer_Transport_Queue(&session.Transport, session.Outgoing[:])
+		if queue_error != .None {
+			fmt.printf("[DURRENT-WIRE] queue failed error=%v bytes=%d\n", queue_error, queued_bytes)
 			return peer_session_fail_locked(session, .Transport)
 		}
 		resize(&session.Outgoing, 0)
 	}
-	if Peer_Transport_Flush(&session.Transport) != .None {
+	flush_error := Peer_Transport_Flush(&session.Transport)
+	if flush_error != .None && flush_error != .Timeout {
+		fmt.printf(
+			"[DURRENT-WIRE] flush failed error=%v buffered=%d\n",
+			flush_error,
+			len(session.Transport.Write_Buffer),
+		)
 		return peer_session_fail_locked(session, .Transport)
+	}
+	if flush_error == .Timeout {
+		return .Timeout
 	}
 	buffer: [16 * 1024]byte
 	count, receive_error := Peer_Transport_Receive(&session.Transport, buffer[:])
@@ -242,10 +255,12 @@ Peer_Session_Poll :: proc(session: ^Peer_Session) -> Peer_Error {
 		return .Timeout
 	}
 	if receive_error == .Disconnected {
+		fmt.printf("[DURRENT-WIRE] peer disconnected\n")
 		session.State = .Closed
 		return .Disconnected
 	}
 	if receive_error != .None {
+		fmt.printf("[DURRENT-WIRE] receive failed error=%v bytes=%d\n", receive_error, count)
 		return peer_session_fail_locked(session, .Transport)
 	}
 	return peer_session_process_locked(session) if count == 0 else peer_session_feed_locked(session, buffer[:count])

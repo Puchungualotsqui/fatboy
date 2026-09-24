@@ -707,8 +707,16 @@ loop_consume_dht_result_locked :: proc(loop: ^Torrent_Session_Loop) {
 }
 
 loop_add_peer_address_locked :: proc(loop: ^Torrent_Session_Loop, address: string, endpoint: PEX_Peer) {
-	if loop == nil || endpoint.Port == 0 ||
-	   len(loop.Peers)+len(loop.Pending_Peers) >= int(loop.Peer_Limit) ||
+	if loop == nil {
+		delete(address)
+		return
+	}
+	candidate_limit := int(loop.Peer_Limit) * 8
+	if candidate_limit < int(loop.Peer_Limit) {
+		candidate_limit = int(loop.Peer_Limit)
+	}
+	if endpoint.Port == 0 ||
+	   len(loop.Peers)+len(loop.Pending_Peers) >= candidate_limit ||
 	   loop_has_peer_address(loop, address) ||
 	   loop_has_pending_peer_address(loop, endpoint) {
 		delete(address)
@@ -833,14 +841,18 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 			// A peer starts us choked. BitTorrent peers normally unchoke only
 			// after receiving this message; without it the scheduler can never
 			// send requests, even when the handshake and bitfield succeeded.
-			if Peer_Session_Queue_Interested(&peer.Session, true) != .None {
+			interest_error := Peer_Session_Queue_Interested(&peer.Session, true)
+			fmt.printf("[DURRENT-PEER] interested address=%s result=%v\n", peer.Address, interest_error)
+			if interest_error != .None {
 				loop_remove_peer_locked(loop, index)
 				continue
 			}
 		}
 		if loop.PEX_Enabled && peer.Session.State == .Ready && !peer.PEX_Handshake_Sent {
 			payload := PEX_Encode_Extension_Handshake()
-			if Peer_Session_Queue_Extended(&peer.Session, 0, payload) == .None {
+			pex_error := Peer_Session_Queue_Extended(&peer.Session, 0, payload)
+			fmt.printf("[DURRENT-PEER] pex handshake address=%s result=%v\n", peer.Address, pex_error)
+			if pex_error == .None {
 				peer.PEX_Handshake_Sent = true
 			}
 			delete(payload)
