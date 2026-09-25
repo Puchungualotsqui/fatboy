@@ -97,12 +97,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p release/linux release/windows
-          cp Fatboy release/linux/Fatboy
+          mkdir -p release/linux/lib release/windows
+          cp Fatboy release/linux/Fatboy.bin
           cp Fatboy.exe release/windows/Fatboy.exe
+
+          # The Ubuntu build links mbedTLS dynamically. Bundle the exact
+          # runtime libraries used by the executable for Steam Deck users.
+          if ldd Fatboy | grep -q 'not found'; then
+            echo 'Linux executable has unresolved shared-library dependencies:' >&2
+            ldd Fatboy >&2
+            exit 1
+          fi
+          while IFS= read -r library; do
+            cp --dereference "$library" release/linux/lib/
+          done < <(ldd Fatboy | awk '$1 ~ /^libmbed/ && index($3, "/") == 1 {print $3}' | sort -u)
+
+          cat > release/linux/Fatboy <<'EOF'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+          export LD_LIBRARY_PATH="$script_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "$script_dir/Fatboy.bin" "$@"
+          EOF
+          chmod +x release/linux/Fatboy
+
           tar --create --gzip \
             --file Fatboy-linux-x86_64.tar.gz \
-            --directory release/linux Fatboy
+            --directory release/linux Fatboy Fatboy.bin lib
           zip --quiet Fatboy-windows-x86_64.zip release/windows/Fatboy.exe
 
       - name: Publish GitHub release
