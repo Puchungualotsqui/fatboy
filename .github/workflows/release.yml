@@ -33,6 +33,7 @@ jobs:
             libgl1-mesa-dev \
             libmbedtls-dev \
             libwayland-dev \
+            lld \
             libx11-dev \
             libxcursor-dev \
             libxinerama-dev \
