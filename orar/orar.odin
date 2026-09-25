@@ -76,6 +76,11 @@ Archive :: struct {
 	Current_Data:    []byte,
 	Current_Loaded:  bool,
 	At_EOF:          bool,
+	// Large stored RAR4 archives are parsed from their headers and streamed
+	// from disk instead of being copied into one enormous in-memory buffer.
+	Source_File:          ^os.File,
+	Source_File_Backed:   bool,
+	Current_Source_Read:  u64,
 }
 
 // Detect identifies an archive from its signature. It does not validate the
@@ -137,12 +142,162 @@ Open_Bytes_Borrowed :: proc(data: []byte) -> (Archive, Error) {
 // Open_File reads the complete file using Odin's cross-platform OS package;
 // no platform archive or compression library is loaded.
 Open_File :: proc(path: string) -> (Archive, Error) {
+	file, open_error := os.open(path, os.O_RDONLY)
+	if open_error != nil {
+		return Archive{}, .Invalid_Archive
+	}
+
+	file_size, size_error := os.file_size(file)
+	if size_error == nil && file_size > i64(1 << 30) {
+		if _, seek_error := os.seek(file, 0, .Start); seek_error == nil {
+			signature: [8]byte
+			read_count, read_error := os.read(file, signature[:])
+			if read_error == nil && read_count == len(signature) &&
+			   Detect(signature[:]) == .RAR4 {
+				archive, parse_error := open_file_backed_rar4(file, file_size)
+				if parse_error == .None {
+					return archive, .None
+				}
+				return Archive{}, parse_error
+			}
+		}
+	}
+	os.close(file)
+
 	data, read_error := os.read_entire_file_from_path(path, context.allocator)
 	if read_error != nil {
 		return Archive{}, .Invalid_Archive
 	}
 	archive, err := open_owned_bytes(data)
 	return archive, err
+}
+
+orar_file_read_at :: proc(file: ^os.File, offset: i64, buffer: []byte) -> bool {
+	if _, seek_error := os.seek(file, offset, .Start); seek_error != nil {
+		return false
+	}
+	read_count, read_error := os.read(file, buffer)
+	return read_error == nil && read_count == len(buffer)
+}
+
+// open_file_backed_rar4 parses only RAR headers.  The archive used by FitGirl
+// is a RAR4 archive whose members are stored (method 0), so their payloads can
+// be streamed directly from disk without allocating the 39 GB container.
+open_file_backed_rar4 :: proc(file: ^os.File, file_size: i64) -> (Archive, Error) {
+	archive := Archive{
+		Format = .RAR4,
+		Cursor = -1,
+		Current = -1,
+		Source_File = file,
+		Source_File_Backed = true,
+	}
+	position: i64 = RAR_SIGNATURE_SIZE
+	saw_main := false
+	saw_end := false
+	main_flags: u16 = 0
+
+	for position < file_size {
+		prefix: [7]byte
+		if !orar_file_read_at(file, position, prefix[:]) {
+			Destroy_Archive(&archive)
+			return Archive{}, .Truncated
+		}
+		stored_crc := u16(prefix[0]) | u16(prefix[1]) << 8
+		header_type := prefix[2]
+		flags := u16(prefix[3]) | u16(prefix[4]) << 8
+		header_size := u16(prefix[5]) | u16(prefix[6]) << 8
+		if header_size < 7 {
+			Destroy_Archive(&archive)
+			return Archive{}, .Invalid_Archive
+		}
+		header, header_error := make([]byte, int(header_size), context.allocator)
+		if header_error != nil {
+			Destroy_Archive(&archive)
+			return Archive{}, .Out_Of_Memory
+		}
+		if !orar_file_read_at(file, position, header) {
+			delete(header)
+			Destroy_Archive(&archive)
+			return Archive{}, .Truncated
+		}
+		defer delete(header)
+		if (crc32(0, header[2:]) & 0xffff) != u32(stored_crc) {
+			Destroy_Archive(&archive)
+			return Archive{}, .Invalid_Archive
+		}
+
+		packed_size: u64 = 0
+		if header_type == RAR_TYPE_FILE_HEADER || (flags & RAR_LHD_LONG_BLOCK) != 0 {
+			if header_size < 11 {
+				Destroy_Archive(&archive)
+				return Archive{}, .Invalid_Archive
+			}
+			packed_size = u64(header[7]) | u64(header[8]) << 8 |
+				u64(header[9]) << 16 | u64(header[10]) << 24
+		}
+
+		switch header_type {
+		case RAR_TYPE_MAIN_HEADER:
+			if saw_main || position != i64(RAR_SIGNATURE_SIZE) || header_size < 13 {
+				Destroy_Archive(&archive)
+				return Archive{}, .Invalid_Archive
+			}
+			main_flags = flags
+			if (flags & (RAR_MHD_VOLUME | RAR_MHD_PASSWORD | RAR_MHD_ENCRYPTVER)) != 0 {
+				Destroy_Archive(&archive)
+				return Archive{}, .Unsupported_Feature
+			}
+			saw_main = true
+		case RAR_TYPE_FILE_HEADER:
+			if !saw_main || saw_end {
+				Destroy_Archive(&archive)
+				return Archive{}, .Invalid_Archive
+			}
+			entry, entry_error := rar_parse_file_header(header, 0, int(header_size), packed_size, flags, main_flags)
+			if entry_error != .None {
+				Destroy_Archive(&archive)
+				return Archive{}, entry_error
+			}
+			if entry.Method != u16(RAR_METHOD_STORE) {
+				Destroy_Archive(&archive)
+				return Archive{}, .Unsupported_Feature
+			}
+			if entry.Compressed_Size > u64(file_size-position-i64(header_size)) {
+				Destroy_Archive(&archive)
+				return Archive{}, .Truncated
+			}
+			entry.Offset = position
+			entry.Data_Offset = position + i64(header_size)
+			append(&archive.Entries, entry)
+			packed_size = entry.Compressed_Size
+		case RAR_TYPE_END_HEADER:
+			if !saw_main || saw_end {
+				Destroy_Archive(&archive)
+				return Archive{}, .Invalid_Archive
+			}
+			saw_end = true
+		case RAR_TYPE_NEWSUB_HEADER:
+			if !saw_main || saw_end {
+				Destroy_Archive(&archive)
+				return Archive{}, .Invalid_Archive
+			}
+		case:
+			if !saw_main || saw_end {
+				Destroy_Archive(&archive)
+				return Archive{}, .Invalid_Archive
+			}
+		}
+
+		position += i64(header_size) + i64(packed_size)
+		if saw_end {
+			break
+		}
+	}
+	if !saw_main || !saw_end {
+		Destroy_Archive(&archive)
+		return Archive{}, .Invalid_Archive
+	}
+	return archive, .None
 }
 
 open_owned_bytes :: proc(data: []byte) -> (Archive, Error) {
@@ -191,6 +346,9 @@ Destroy_Archive :: proc(archive: ^Archive) {
 	if archive.Owns_Data {
 		delete(archive.Data)
 	}
+	if archive.Source_File_Backed {
+		os.close(archive.Source_File)
+	}
 	archive^ = Archive{Cursor = -1, Current = -1}
 }
 
@@ -210,6 +368,7 @@ Next :: proc(archive: ^Archive) -> (Entry, Error) {
 	archive.Current_Data = nil
 	archive.Current_Loaded = false
 	archive.Current_Offset = 0
+	archive.Current_Source_Read = 0
 
 	next := archive.Cursor + 1
 	if next < 0 || next >= len(archive.Entries) {
@@ -314,6 +473,30 @@ Read_Current :: proc(archive: ^Archive, dst: []byte) -> (int, Error) {
 	}
 	if len(dst) == 0 {
 		return 0, .None
+	}
+	if archive.Source_File_Backed {
+		entry := archive.Entries[archive.Current]
+		if entry.Method != u16(RAR_METHOD_STORE) {
+			return 0, .Unsupported_Feature
+		}
+		if archive.Current_Source_Read >= entry.Size {
+			return 0, .End
+		}
+		remaining := entry.Size - archive.Current_Source_Read
+		count := u64(len(dst))
+		if count > remaining {
+			count = remaining
+		}
+		if _, seek_error := os.seek(archive.Source_File, entry.Data_Offset + i64(archive.Current_Source_Read), .Start); seek_error != nil {
+			return 0, .Invalid_Archive
+		}
+		read_count, read_error := os.read(archive.Source_File, dst[:int(count)])
+		if read_error != nil || read_count != int(count) {
+			return read_count, .Truncated
+		}
+		archive.Current_Source_Read += u64(read_count)
+		archive.Current_Offset += u64(read_count)
+		return read_count, .None
 	}
 	if !archive.Current_Loaded {
 		data, err := decode_entry(archive, archive.Current)
