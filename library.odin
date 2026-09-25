@@ -252,21 +252,19 @@ RenderLibraryScreen :: proc(
     filtered_count := len(app.filtered_game_indices)
     page_start := 0
     page_end := filtered_count
-    catalog_count_label := fmt.tprintf(
-        "%d Games on Page %d",
+    release_heading := fmt.tprintf(
+        "RELEASES · %d",
         filtered_count,
-        app.catalog_page + 1,
     )
     if app.show_installed_only {
-        catalog_count_label = fmt.tprintf(
-            "%d Installed / In-progress on Page %d",
+        release_heading = fmt.tprintf(
+            "INSTALLED & IN-PROGRESS · %d",
             filtered_count,
-            app.catalog_page + 1,
         )
     }
 
     if app.loader_thread != nil {
-        catalog_count_label = "Loading catalog..."
+        release_heading = "LOADING RELEASES"
     }
 
     {
@@ -292,7 +290,7 @@ RenderLibraryScreen :: proc(
                     layout = .Flex,
                     direction = .LeftToRight,
                     width = orui.grow(),
-                    height = orui.fixed(80),
+                    height = orui.fixed(72),
 
                     align_cross = .Center,
                     align_main = .SpaceBetween,
@@ -318,16 +316,6 @@ RenderLibraryScreen :: proc(
             )
 
             {
-                orui.container(
-                    orui.id("brand_wrap"),
-                    {
-                        layout = .Flex,
-                        direction = .TopToBottom,
-                        width = orui.fit(),
-                        height = orui.fit(),
-                    },
-                )
-
                 orui.label(
                     orui.id("title"),
                     "Fatboy",
@@ -336,39 +324,9 @@ RenderLibraryScreen :: proc(
                         color = TEXT_PRIMARY,
                     },
                 )
-
-                orui.label(
-                    orui.id("subtitle"),
-                    "Real-Debrid Library Integration",
-                    {
-                        font_size = 13,
-                        color = ACCENT_COLOR,
-                    },
-                )
             }
 
             {
-                orui.container(
-                    orui.id("status_wrap"),
-                    {
-                        layout = .Flex,
-                        direction = .TopToBottom,
-                        width = orui.fit(),
-                        height = orui.fit(),
-                        align_cross = .End,
-                        gap = 4,
-                    },
-                )
-
-                orui.label(
-                    orui.id("catalog count"),
-                    catalog_count_label,
-                    {
-                        font_size = 14,
-                        color = TEXT_PRIMARY,
-                    },
-                )
-
                 if orui.button(
                     orui.id("btn_settings"),
                     "⚙ Settings",
@@ -445,7 +403,7 @@ RenderLibraryScreen :: proc(
 
                 orui.label(
                     orui.id("release heading title"),
-                    "AVAILABLE RELEASES",
+                    release_heading,
                     {
                         font_size = 14,
                         color = TEXT_MUTED,
@@ -552,7 +510,15 @@ RenderLibraryScreen :: proc(
                         badgeTextColor = ACCENT_COLOR
                     }
 
-                    badgeText := DownloadStateText(download_snapshot.state)
+                    // The primary action already says “Download”; the idle
+                    // badge should communicate availability, not repeat it.
+                    badgeText := download_snapshot.found ? DownloadStateText(download_snapshot.state) : "AVAILABLE"
+                    if download_snapshot.found &&
+                       download_snapshot.state == .NotDownloaded {
+                        badgeText = "AVAILABLE"
+                    } else if download_snapshot.state == .Paused {
+                        badgeText = "PAUSED"
+                    }
                     if download_snapshot.state == .Downloading ||
                        download_snapshot.state == .Extracting {
                         badgeText = fmt.tprintf(
@@ -589,6 +555,7 @@ RenderLibraryScreen :: proc(
                                     border = orui.border(1),
                                     border_color = rowBorder,
                                     corner_radius = orui.corner(6),
+                                    clip = {.Self, {}},
                                     focusable = true,
                                     block = .True,
                                     cursor = .Pointing_Hand,
@@ -607,6 +574,7 @@ RenderLibraryScreen :: proc(
                                 {
                                     layout = .Flex,
                                     direction = .LeftToRight,
+                                    width = orui.grow(),
                                     height = orui.grow(),
                                     align_cross = .Center,
                                     gap = 16,
@@ -661,8 +629,10 @@ RenderLibraryScreen :: proc(
                                     {
                                         layout = .Flex,
                                         direction = .TopToBottom,
+                                        width = orui.grow(),
                                         height = orui.fit(),
                                         gap = 4,
+                                        clip = {.Intersect, {}},
                                     },
                                 )
 
@@ -675,8 +645,12 @@ RenderLibraryScreen :: proc(
                                     ),
                                     game.title,
                                     {
-                                        font_size = 18,
+                                        width = orui.grow(),
+                                        font_size = 16,
+                                        line_height = 1.1,
                                         color = titleColor,
+                                        overflow = .Wrap,
+                                        clip = {.Intersect, {}},
                                         disabled = .True,
                                     },
                                 )
@@ -719,8 +693,11 @@ RenderLibraryScreen :: proc(
                                         ),
                                         progress_label,
                                         {
+                                            width = orui.grow(),
                                             font_size = 12,
                                             color = progress_color,
+                                            overflow = .Wrap,
+                                            clip = {.Intersect, {}},
                                             disabled = .True,
                                         },
                                     )
@@ -739,8 +716,11 @@ RenderLibraryScreen :: proc(
                                         ),
                                         resolving_message,
                                         {
+                                            width = orui.grow(),
                                             font_size = 12,
                                             color = TEXT_MUTED,
+                                            overflow = .Wrap,
+                                            clip = {.Intersect, {}},
                                             disabled = .True,
                                         },
                                     )
@@ -755,8 +735,11 @@ RenderLibraryScreen :: proc(
                                         ),
                                         "Installing through GE-Proton8-25...",
                                         {
+                                            width = orui.grow(),
                                             font_size = 12,
                                             color = STATUS_OK,
+                                            overflow = .Wrap,
+                                            clip = {.Intersect, {}},
                                             disabled = .True,
                                         },
                                     )
@@ -775,8 +758,11 @@ RenderLibraryScreen :: proc(
                                         ),
                                         extracted_message,
                                         {
+                                            width = orui.grow(),
                                             font_size = 12,
                                             color = ACCENT_COLOR,
+                                            overflow = .Wrap,
+                                            clip = {.Intersect, {}},
                                             disabled = .True,
                                         },
                                     )
@@ -795,8 +781,11 @@ RenderLibraryScreen :: proc(
                                         ),
                                         failure_message,
                                         {
+                                            width = orui.grow(),
                                             font_size = 12,
                                             color = STATUS_ERR,
+                                            overflow = .Wrap,
+                                            clip = {.Intersect, {}},
                                             disabled = .True,
                                         },
                                     )
@@ -1016,8 +1005,11 @@ RenderLibraryScreen :: proc(
                     orui.id("catalog_empty"),
                     empty_message,
                     {
+                        width = orui.grow(),
                         font_size = 14,
                         color = TEXT_MUTED,
+                        overflow = .Wrap,
+                        clip = {.Intersect, {}},
                     },
                 )
             }
@@ -1047,14 +1039,6 @@ RenderLibraryScreen :: proc(
                     },
                 )
 
-                orui.label(
-                    orui.id("footer source"),
-                    "SOURCE: FITGIRL-REPACKS.SITE",
-                    {
-                        font_size = 11,
-                        color = TEXT_MUTED,
-                    },
-                )
 
                 {
                     orui.container(
@@ -1089,9 +1073,8 @@ RenderLibraryScreen :: proc(
                     }
 
                     page_label := fmt.tprintf(
-                        "Page %d  (%d games)",
+                        "Page %d",
                         app.catalog_page + 1,
-                        filtered_count,
                     )
 
                     orui.label(
@@ -1127,8 +1110,11 @@ RenderLibraryScreen :: proc(
                     orui.id("footer msg"),
                     app.status_message,
                     {
+                        width = orui.grow(),
                         font_size = 11,
                         color = ACCENT_COLOR,
+                        overflow = .Wrap,
+                        clip = {.Intersect, {}},
                     },
                 )
             }

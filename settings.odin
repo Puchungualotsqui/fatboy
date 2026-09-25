@@ -483,61 +483,63 @@ RenderSetupScreen :: proc(
                 }
             }
 
-                        orui.label(
-                            orui.id("mse_label"),
-                            "Durrent encryption (MSE/PE)",
-                            {
-                                font_size = 12,
-                                color = TEXT_MUTED,
-                            },
-                        )
-                        orui.label(
-                            orui.id("mse_help"),
-                            "Disabled is the default. Preferred tries encrypted negotiation first and permits one safe plaintext retry on a fresh connection.",
-                            {
-                                font_size = 12,
-                                color = TEXT_MUTED,
-                                overflow = .Wrap,
-                            },
-                        )
+            if app.download_provider == .Durrent {
+                orui.label(
+                    orui.id("mse_label"),
+                    "Durrent encryption (MSE/PE)",
+                    {
+                        font_size = 12,
+                        color = TEXT_MUTED,
+                    },
+                )
+                orui.label(
+                    orui.id("mse_help"),
+                    "Disabled is the default. Preferred tries encrypted negotiation first and permits one safe plaintext retry on a fresh connection.",
+                    {
+                        font_size = 12,
+                        color = TEXT_MUTED,
+                        overflow = .Wrap,
+                    },
+                )
+                {
+                    orui.container(
+                        orui.id("mse_selector"),
                         {
-                            orui.container(
-                                orui.id("mse_selector"),
-                                {
-                                    layout = .Flex,
-                                    direction = .LeftToRight,
-                                    width = orui.grow(),
-                                    height = orui.fixed(36),
-                                    gap = 8,
-                                },
-                            )
-                            if orui.button(orui.id("btn_mse_disabled"), "Disabled", {
-                                width = orui.grow(), height = orui.grow(),
-                                background_color = app.mse_mode == .Disabled ? ACCENT_COLOR : ROW_HOVER_BACKGROUND,
-                                color = app.mse_mode == .Disabled ? APP_BACKGROUND : TEXT_PRIMARY,
-                                corner_radius = orui.corner(5),
-                            }) {
-                                app.mse_mode = .Disabled
-                            }
-                            if orui.button(orui.id("btn_mse_preferred"), "Preferred", {
-                                width = orui.grow(), height = orui.grow(),
-                                background_color = app.mse_mode == .Preferred ? ACCENT_COLOR : ROW_HOVER_BACKGROUND,
-                                color = app.mse_mode == .Preferred ? APP_BACKGROUND : TEXT_PRIMARY,
-                                corner_radius = orui.corner(5),
-                            }) {
-                                app.mse_mode = .Preferred
-                            }
-                            if orui.button(orui.id("btn_mse_required"), "Required", {
-                                width = orui.grow(), height = orui.grow(),
-                                background_color = app.mse_mode == .Required ? ACCENT_COLOR : ROW_HOVER_BACKGROUND,
-                                color = app.mse_mode == .Required ? APP_BACKGROUND : TEXT_PRIMARY,
-                                corner_radius = orui.corner(5),
-                            }) {
-                                app.mse_mode = .Required
-                            }
-                        }
+                            layout = .Flex,
+                            direction = .LeftToRight,
+                            width = orui.grow(),
+                            height = orui.fixed(36),
+                            gap = 8,
+                        },
+                    )
+                    if orui.button(orui.id("btn_mse_disabled"), "Disabled", {
+                        width = orui.grow(), height = orui.grow(),
+                        background_color = app.mse_mode == .Disabled ? ACCENT_COLOR : ROW_HOVER_BACKGROUND,
+                        color = app.mse_mode == .Disabled ? APP_BACKGROUND : TEXT_PRIMARY,
+                        corner_radius = orui.corner(5),
+                    }) {
+                        app.mse_mode = .Disabled
+                    }
+                    if orui.button(orui.id("btn_mse_preferred"), "Preferred", {
+                        width = orui.grow(), height = orui.grow(),
+                        background_color = app.mse_mode == .Preferred ? ACCENT_COLOR : ROW_HOVER_BACKGROUND,
+                        color = app.mse_mode == .Preferred ? APP_BACKGROUND : TEXT_PRIMARY,
+                        corner_radius = orui.corner(5),
+                    }) {
+                        app.mse_mode = .Preferred
+                    }
+                    if orui.button(orui.id("btn_mse_required"), "Required", {
+                        width = orui.grow(), height = orui.grow(),
+                        background_color = app.mse_mode == .Required ? ACCENT_COLOR : ROW_HOVER_BACKGROUND,
+                        color = app.mse_mode == .Required ? APP_BACKGROUND : TEXT_PRIMARY,
+                        corner_radius = orui.corner(5),
+                    }) {
+                        app.mse_mode = .Required
+                    }
+                }
+            }
 
-            			if app.download_provider == .RealDebrid {
+            if app.download_provider == .RealDebrid {
                 orui.label(
                     orui.id("api_key_label"),
                     "Real-Debrid account",
