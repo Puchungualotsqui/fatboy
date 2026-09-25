@@ -188,7 +188,9 @@ Torrent_Session_Loop_Open :: proc(
 	// A larger connection set is important for public swarms, where most
 	// tracker/DHT endpoints are stale and peers selectively unchoke only a
 	// few interested clients.
-	loop.Peer_Limit = 16
+	// Public swarms commonly return mostly stale endpoints. Keep enough active
+	// candidates to retain several productive peers when one throttles or chokes.
+	loop.Peer_Limit = 32
 	loop.Tick_Interval = 100 * time.Millisecond
 	// Dials are asynchronous, so allow ordinary high-latency/NAT peers enough
 	// time to complete TCP without delaying established peer traffic.
@@ -1198,8 +1200,6 @@ loop_connect_pending_peers :: proc(loop: ^Torrent_Session_Loop, maximum: int) {
 		piece_count := loop.Scheduler.Piece_Count
 		piece_length := loop.Scheduler.Piece_Length
 		total_length := loop.Scheduler.Total_Length
-		utp_socket := loop.UDP_Listener6 if endpoint.IPv6 else loop.UDP_Listener
-		utp_socket_open := loop.UDP_Listener6_Open if endpoint.IPv6 else loop.UDP_Listener_Open
 		sync.mutex_unlock(&loop.Mutex)
 
 		peer := new(Torrent_Loop_Peer, context.allocator)
@@ -1208,21 +1208,14 @@ loop_connect_pending_peers :: proc(loop: ^Torrent_Session_Loop, maximum: int) {
 		peer.Address = PEX_Peer_Address(endpoint)
 		peer.Dial_Started = time.now()
 		mse_policy := loop.MSE_Policy
-		use_utp := loop.UTP_Enabled
 		peer_error := Peer_Session_Init(&peer.Session, info_hash, local_peer_id, piece_count, piece_length, total_length)
 		if peer_error == .None {
 			peer_error = Peer_Session_Set_MSE_Policy(&peer.Session, mse_policy)
 		}
-		if peer_error == .None && use_utp {
-			remote := loop_pex_endpoint(endpoint)
-			if utp_socket_open {
-				peer_error = Peer_Session_Begin_Shared_UTP_Connect(&peer.Session, utp_socket, remote)
-			} else {
-				peer_error = Peer_Session_Begin_UTP_Connect(&peer.Session, remote)
-			}
-			peer.Using_UTP = peer_error == .None
-		}
-		if peer_error == .None && !peer.Using_UTP {
+		// Prefer TCP for the initial attempt. Tracker/DHT records do not advertise
+		// uTP capability, and TCP reaches interoperable peers immediately; uTP is
+		// retained as a fallback for UDP-only peers.
+		if peer_error == .None {
 			peer_error = Peer_Session_Begin_Connect(&peer.Session, peer.Address)
 		}
 		if peer_error != .None {
@@ -1274,20 +1267,32 @@ loop_pex_endpoint :: proc(peer: PEX_Peer) -> net.Endpoint {
 	}
 }
 
-// uTP capability is not advertised by tracker/DHT candidates. Once a SYN
-// fails, retry the same endpoint over TCP exactly once instead of discarding a
-// potentially useful conventional BitTorrent peer.
-loop_fallback_to_tcp_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torrent_Loop_Peer) -> bool {
-	if loop == nil || peer == nil || !peer.Using_UTP || peer.UTP_Fallback_Used {
+// uTP capability is not advertised by tracker/DHT candidates. Use it after a
+// TCP attempt fails, avoiding a five-second uTP SYN delay for every ordinary
+// TCP-only peer while still reaching UDP-only implementations.
+loop_fallback_to_utp_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torrent_Loop_Peer) -> bool {
+	if loop == nil || peer == nil || !loop.UTP_Enabled || peer.Using_UTP || peer.UTP_Fallback_Used {
 		return false
 	}
 	if Peer_Session_Reset_For_Transport_Fallback(&peer.Session) != .None {
 		return false
 	}
-	peer.Using_UTP = false
+	remote := loop_pex_endpoint(peer.Endpoint)
+	socket := loop.UDP_Listener6 if peer.Endpoint.IPv6 else loop.UDP_Listener
+	socket_open := loop.UDP_Listener6_Open if peer.Endpoint.IPv6 else loop.UDP_Listener_Open
 	peer.UTP_Fallback_Used = true
 	peer.Dial_Started = time.now()
-	return Peer_Session_Begin_Connect(&peer.Session, peer.Address) == .None
+	fallback_error: Peer_Error
+	if socket_open {
+		fallback_error = Peer_Session_Begin_Shared_UTP_Connect(&peer.Session, socket, remote)
+	} else {
+		fallback_error = Peer_Session_Begin_UTP_Connect(&peer.Session, remote)
+	}
+	if fallback_error != .None {
+		return false
+	}
+	peer.Using_UTP = true
+	return true
 }
 
 loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
@@ -1302,8 +1307,8 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 		}
 		if peer.Session.State == .New {
 			if time.diff(peer.Dial_Started, time.now()) >= loop.Peer_Connect_Timeout {
-				if loop_fallback_to_tcp_locked(loop, peer) {
-					fmt.printf("[DURRENT-uTP] SYN timed out; retrying TCP address=%s\n", peer.Address)
+				if loop_fallback_to_utp_locked(loop, peer) {
+					fmt.printf("[DURRENT-PEER] TCP dial timed out; trying uTP address=%s\n", peer.Address)
 					index += 1
 					continue
 				}
@@ -1313,8 +1318,8 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 			}
 			dial_done, dial_error := Peer_Session_Poll_Connect(&peer.Session, loop.Peer_Connect_Timeout)
 			if dial_error != .None {
-				if loop_fallback_to_tcp_locked(loop, peer) {
-					fmt.printf("[DURRENT-uTP] connect failed; retrying TCP address=%s\n", peer.Address)
+				if loop_fallback_to_utp_locked(loop, peer) {
+					fmt.printf("[DURRENT-PEER] TCP dial failed; trying uTP address=%s\n", peer.Address)
 					index += 1
 					continue
 				}
@@ -1438,6 +1443,7 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 			peer.Last_Choke_Log = time.now()
 		}
 		if peer.Registered && peer.Session.State == .Ready && peer.Session.Remote_Choking &&
+		   loop_unchoked_peer_count_locked(loop) >= 4 &&
 		   time.diff(peer.Interested_At, time.now()) >= 45*time.Second {
 			fmt.printf("[DURRENT-PEER] dropping long-choked peer address=%s score=%d waited=%v\n", peer.Address, peer.Quality_Score, time.diff(peer.Interested_At, time.now()))
 			loop_remove_peer_locked(loop, index)
@@ -1452,6 +1458,17 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 		}
 		index += 1
 	}
+}
+
+loop_unchoked_peer_count_locked :: proc(loop: ^Torrent_Session_Loop) -> int {
+	if loop == nil { return 0 }
+	count := 0
+	for peer in loop.Peers {
+		if peer.Registered && peer.Session.State == .Ready && !peer.Session.Remote_Choking {
+			count += 1
+		}
+	}
+	return count
 }
 
 loop_process_peer_events_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torrent_Loop_Peer) {
