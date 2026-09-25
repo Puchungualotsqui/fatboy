@@ -54,6 +54,18 @@ torrent_session_loop_tick_and_seeding_test :: proc(t: ^testing.T) {
 }
 
 @(test)
+torrent_session_loop_request_pipeline_test :: proc(t: ^testing.T) {
+	peer: Torrent_Loop_Peer
+	testing.expect_value(t, loop_peer_request_target(&peer), u32(32))
+	peer.Downloaded_Bytes = 16 * 1024
+	testing.expect_value(t, loop_peer_request_target(&peer), u32(32))
+	peer.Recent_Rate = 64 * 1024
+	testing.expect_value(t, loop_peer_request_target(&peer), u32(16))
+	peer.Recent_Rate = 2 * 1024 * 1024
+	testing.expect_value(t, loop_peer_request_target(&peer), u32(96))
+}
+
+@(test)
 torrent_session_loop_tracker_recovery_test :: proc(t: ^testing.T) {
 	torrent := tracker_test_torrent()
 	defer tracker_test_destroy_torrent(&torrent)

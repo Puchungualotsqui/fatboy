@@ -81,8 +81,9 @@ Torrent_Session_Loop :: struct {
 	Peer_Connect_Timeout:  time.Duration,
 	// Disabled unless the caller explicitly opts into a fully validated MSE mode.
 	MSE_Policy:             MSE_Policy,
-	// uTP is attempted for outbound peers and falls back to TCP when a peer
-	// does not answer the BEP 29 SYN. Call Set_UTP_Enabled before Open to opt out.
+	// uTP is available as an explicit opt-in. Public tracker/DHT candidates do
+	// not advertise uTP capability, so unconditional fallback can hold scarce
+	// peer slots on UDP handshakes that never reach PWP.
 	UTP_Enabled:            bool,
 	UTP_Configured:         bool,
 	Scheduler:             Piece_Scheduler,
@@ -197,7 +198,10 @@ Torrent_Session_Loop_Open :: proc(
 	// Public swarms commonly return mostly stale endpoints. Keep enough active
 	// candidates to retain several productive peers when one throttles or chokes.
 	loop.Peer_Limit = 32
-	loop.Tick_Interval = 100 * time.Millisecond
+	// Non-blocking peer I/O lets the loop service ready sockets promptly without
+	// an idle peer stretching every poll round. Twenty milliseconds keeps request
+	// and pipeline refill latency low while retaining a bounded worker cadence.
+	loop.Tick_Interval = 20 * time.Millisecond
 	// Dials are asynchronous, so allow ordinary high-latency/NAT peers enough
 	// time to complete TCP without delaying established peer traffic.
 	loop.Peer_Connect_Timeout = 5 * time.Second
@@ -209,7 +213,9 @@ Torrent_Session_Loop_Open :: proc(
 	// traffic, preventing them from reaching the normal unchoke stage.
 	loop.PEX_Enabled = false
 	if !loop.UTP_Configured {
-		loop.UTP_Enabled = true
+		// Keep the proven TCP path responsive by default. Callers that have
+		// validated uTP for their network can explicitly enable it before Open.
+		loop.UTP_Enabled = false
 	}
 	if Torrent_Allows_DHT(torrent) && loop.UDP_Listener_Open {
 		loop.DHT_Enabled = DHT_Client_Init_External(
@@ -228,8 +234,9 @@ Torrent_Session_Loop_Open :: proc(
 	return .None
 }
 
-// Torrent_Session_Loop_Set_UTP_Enabled must be called before Open. TCP remains
-// available as the automatic fallback for peers that do not implement BEP 29.
+// Torrent_Session_Loop_Set_UTP_Enabled must be called before Open. TCP is
+// always attempted first; enabling uTP additionally allows fallback for peers
+// that do not accept the TCP connection.
 Torrent_Session_Loop_Set_UTP_Enabled :: proc(loop: ^Torrent_Session_Loop, enabled: bool) -> Torrent_Loop_Error {
 	if loop == nil {
 		return .Invalid_Loop
@@ -1722,11 +1729,13 @@ loop_queue_pex_snapshot_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torre
 	delete(added)
 }
 
-// Fast peers get enough in-flight data to cover their bandwidth-delay product;
-// new and slow peers stay cheap until they prove useful.
+// Fast peers get enough in-flight data to cover their bandwidth-delay product.
+// Keep a useful startup pipeline until a real throughput sample is available;
+// otherwise a peer drops from 16 requests to 8 immediately after its first
+// block, before its rate window can measure it.
 loop_peer_request_target :: proc(peer: ^Torrent_Loop_Peer) -> u32 {
-	if peer == nil || peer.Downloaded_Bytes == 0 {
-		return 16
+	if peer == nil || peer.Downloaded_Bytes == 0 || peer.Recent_Rate <= 0 {
+		return 32
 	}
 	if peer.Recent_Rate >= 2*1024*1024 {
 		return 96
@@ -1737,7 +1746,7 @@ loop_peer_request_target :: proc(peer: ^Torrent_Loop_Peer) -> u32 {
 	if peer.Recent_Rate >= 128*1024 {
 		return 32
 	}
-	return 8
+	return 16
 }
 
 loop_queue_peer_requests_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torrent_Loop_Peer) {

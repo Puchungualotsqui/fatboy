@@ -112,14 +112,17 @@ Peer_Transport_Poll_Connect :: proc(transport: ^Peer_Transport, timeout: time.Du
 	if dial_failed {
 		return true, .Resolve
 	}
-	read_timeout := 100 * time.Millisecond if timeout > 0 else time.Duration(0)
-	if timeout > 0 && (net.set_option(socket, .Receive_Timeout, read_timeout) != nil || net.set_option(socket, .Send_Timeout, timeout) != nil) {
+	// The session loop services many peers in one worker. A blocking receive
+	// here would let every idle socket delay all productive peers, so TCP peer
+	// sockets are always readiness-polled through non-blocking I/O.
+	if net.set_blocking(socket, false) != nil ||
+	   (timeout > 0 && net.set_option(socket, .Send_Timeout, timeout) != nil) {
 		net.close(socket)
 		return true, .Timeout
 	}
 	transport.Socket = socket
 	transport.Connected = true
-	transport.Read_Timeout = read_timeout
+	transport.Read_Timeout = 0
 	transport.Write_Timeout = timeout
 	return true, .None
 }
@@ -150,14 +153,14 @@ Peer_Transport_Connect :: proc(transport: ^Peer_Transport, address: string, time
 			if dial_failed {
 				return .Resolve
 			}
-			read_timeout := 100 * time.Millisecond if timeout > 0 else time.Duration(0)
-			if timeout > 0 && (net.set_option(socket, .Receive_Timeout, read_timeout) != nil || net.set_option(socket, .Send_Timeout, timeout) != nil) {
+			if net.set_blocking(socket, false) != nil ||
+			   (timeout > 0 && net.set_option(socket, .Send_Timeout, timeout) != nil) {
 				net.close(socket)
 				return .Timeout
 			}
 			transport.Socket = socket
 			transport.Connected = true
-			transport.Read_Timeout = read_timeout
+			transport.Read_Timeout = 0
 			transport.Write_Timeout = timeout
 			return .None
 		}
@@ -270,14 +273,14 @@ Peer_Transport_Adopt :: proc(transport: ^Peer_Transport, socket: net.TCP_Socket,
 	if transport == nil || transport.Connected || socket == net.TCP_Socket(0) {
 		return .Invalid_Transport
 	}
-	read_timeout := 100 * time.Millisecond if timeout > 0 else time.Duration(0)
-	if timeout > 0 && (net.set_option(socket, .Receive_Timeout, read_timeout) != nil || net.set_option(socket, .Send_Timeout, timeout) != nil) {
+	if net.set_blocking(socket, false) != nil ||
+	   (timeout > 0 && net.set_option(socket, .Send_Timeout, timeout) != nil) {
 		net.close(socket)
 		return .Timeout
 	}
 	transport.Socket = socket
 	transport.Connected = true
-	transport.Read_Timeout = read_timeout
+	transport.Read_Timeout = 0
 	transport.Write_Timeout = timeout
 	return .None
 }

@@ -340,21 +340,30 @@ Peer_Session_Poll :: proc(session: ^Peer_Session) -> Peer_Error {
 	if flush_error == .Timeout {
 		return .Timeout
 	}
+	// TCP peers use non-blocking sockets. Drain a bounded amount of currently
+	// available input so a busy peer is not limited to one 16 KiB block per loop
+	// tick, while still giving every peer a fair chance to make progress.
 	buffer: [16 * 1024]byte
-	count, receive_error := Peer_Transport_Receive(&session.Transport, buffer[:])
-	if receive_error == .Timeout {
-		return .Timeout
+	for receive_pass := 0; receive_pass < 16; receive_pass += 1 {
+		count, receive_error := Peer_Transport_Receive(&session.Transport, buffer[:])
+		if receive_error == .Timeout {
+			return .None
+		}
+		if receive_error == .Disconnected {
+			fmt.printf("[DURRENT-WIRE] peer disconnected\n")
+			session.State = .Closed
+			return .Disconnected
+		}
+		if receive_error != .None {
+			fmt.printf("[DURRENT-WIRE] receive failed error=%v bytes=%d\n", receive_error, count)
+			return peer_session_fail_locked(session, .Transport)
+		}
+		feed_error := peer_session_feed_locked(session, buffer[:count])
+		if feed_error != .None {
+			return feed_error
+		}
 	}
-	if receive_error == .Disconnected {
-		fmt.printf("[DURRENT-WIRE] peer disconnected\n")
-		session.State = .Closed
-		return .Disconnected
-	}
-	if receive_error != .None {
-		fmt.printf("[DURRENT-WIRE] receive failed error=%v bytes=%d\n", receive_error, count)
-		return peer_session_fail_locked(session, .Transport)
-	}
-	return peer_session_process_locked(session) if count == 0 else peer_session_feed_locked(session, buffer[:count])
+	return .None
 }
 
 Peer_Session_Take_Output :: proc(session: ^Peer_Session) -> ([]byte, Peer_Error) {
