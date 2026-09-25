@@ -27,6 +27,9 @@ Piece_Scheduler :: struct {
 	Total_Length:             u64,
 	Completed:                Bitfield,
 	Block_Received:           [dynamic][]byte,
+	Block_Requested:          [dynamic][]byte,
+	Received_Block_Count:     []u32,
+	Outstanding_Block_Count:  []u32,
 	Availability:             []u32,
 	Peers:                    [dynamic]Piece_Scheduler_Peer,
 	Request_Timeout:          time.Duration,
@@ -67,26 +70,38 @@ Piece_Scheduler_Init :: proc(
 		return .Out_Of_Memory
 	}
 	block_received: [dynamic][]byte
+	block_requested: [dynamic][]byte
 	for index: u32 = 0; index < piece_count; index += 1 {
 		length := Piece_Length(index, piece_length, total_length)
 		block_count := u32((u64(length)+u64(Block_Size)-1)/u64(Block_Size))
-		bitmap, bitmap_error := make([]byte, int((u64(block_count)+7)/8), context.allocator)
-		if bitmap_error != nil {
-			for existing in block_received {
-				delete(existing)
-			}
+		bitmap_length := int((u64(block_count)+7)/8)
+		received, received_error := make([]byte, bitmap_length, context.allocator)
+		// Counts (rather than a bitset) preserve duplicate requests in endgame.
+		requested, requested_error := make([]byte, int(block_count), context.allocator)
+		if received_error != nil || requested_error != nil {
+			delete(received)
+			delete(requested)
+			for existing in block_received { delete(existing) }
+			for existing in block_requested { delete(existing) }
 			delete(block_received)
+			delete(block_requested)
 			Destroy_Bitfield(&completed)
 			return .Out_Of_Memory
 		}
-		append(&block_received, bitmap)
+		append(&block_received, received)
+		append(&block_requested, requested)
 	}
-	availability, alloc_error := make([]u32, int(piece_count), context.allocator)
-	if alloc_error != nil {
-		for existing in block_received {
-			delete(existing)
-		}
+	received_block_count, received_count_error := make([]u32, int(piece_count), context.allocator)
+	outstanding_block_count, outstanding_count_error := make([]u32, int(piece_count), context.allocator)
+	availability, availability_error := make([]u32, int(piece_count), context.allocator)
+	if received_count_error != nil || outstanding_count_error != nil || availability_error != nil {
+		delete(received_block_count)
+		delete(outstanding_block_count)
+		delete(availability)
+		for existing in block_received { delete(existing) }
+		for existing in block_requested { delete(existing) }
 		delete(block_received)
+		delete(block_requested)
 		Destroy_Bitfield(&completed)
 		return .Out_Of_Memory
 	}
@@ -95,6 +110,9 @@ Piece_Scheduler_Init :: proc(
 	scheduler.Total_Length = total_length
 	scheduler.Completed = completed
 	scheduler.Block_Received = block_received
+	scheduler.Block_Requested = block_requested
+	scheduler.Received_Block_Count = received_block_count
+	scheduler.Outstanding_Block_Count = outstanding_block_count
 	scheduler.Availability = availability
 	scheduler.Request_Timeout = request_timeout
 	// The loop chooses a bounded per-peer target from measured throughput.
@@ -117,13 +135,18 @@ Piece_Scheduler_Destroy :: proc(scheduler: ^Piece_Scheduler) {
 	}
 	delete(scheduler.Peers)
 	Destroy_Bitfield(&scheduler.Completed)
-	for bitmap in scheduler.Block_Received {
-		delete(bitmap)
-	}
+	for bitmap in scheduler.Block_Received { delete(bitmap) }
+	for bitmap in scheduler.Block_Requested { delete(bitmap) }
 	delete(scheduler.Block_Received)
+	delete(scheduler.Block_Requested)
+	delete(scheduler.Received_Block_Count)
+	delete(scheduler.Outstanding_Block_Count)
 	delete(scheduler.Availability)
 	scheduler.Peers = nil
 	scheduler.Block_Received = nil
+	scheduler.Block_Requested = nil
+	scheduler.Received_Block_Count = nil
+	scheduler.Outstanding_Block_Count = nil
 	scheduler.Availability = nil
 	scheduler.Piece_Count = 0
 	scheduler.Piece_Length = 0
@@ -183,6 +206,9 @@ Piece_Scheduler_Remove_Peer :: proc(scheduler: ^Piece_Scheduler, id: u64) -> Pie
 			if Bitfield_Has_Piece(&peer.Pieces, index) {
 				scheduler.Availability[index] -= 1
 			}
+		}
+		for request in peer.In_Flight {
+			piece_scheduler_unmark_request_locked(scheduler, request.Index, request.Begin)
 		}
 		Destroy_Bitfield(&peer.Pieces)
 		delete(peer.In_Flight)
@@ -368,6 +394,7 @@ Piece_Scheduler_Next_Request_With_Limit :: proc(
 		Attempts = 1,
 	}
 	append(&peer.In_Flight, request)
+	piece_scheduler_mark_request_locked(scheduler, request.Index, request.Begin)
 	return request, true, .None
 }
 
@@ -381,7 +408,7 @@ Piece_Scheduler_Drop_Request :: proc(scheduler: ^Piece_Scheduler, peer_id: u64, 
 	if peer == nil {
 		return .Invalid_Peer
 	}
-	piece_scheduler_remove_request_locked(peer, index, begin)
+	piece_scheduler_remove_request_locked(scheduler, peer, index, begin)
 	return .None
 }
 
@@ -398,7 +425,7 @@ Piece_Scheduler_Complete_Block :: proc(scheduler: ^Piece_Scheduler, index, begin
 		return .Invalid_Piece
 	}
 	for &peer in scheduler.Peers {
-		piece_scheduler_remove_request_locked(&peer, index, begin)
+		piece_scheduler_remove_request_locked(scheduler, &peer, index, begin)
 	}
 	piece_scheduler_mark_block_received_locked(scheduler, index, begin)
 	return .None
@@ -424,12 +451,13 @@ Piece_Scheduler_Reset_Piece :: proc(scheduler: ^Piece_Scheduler, index: u32) -> 
 	}
 	Bitfield_Clear_Piece(&scheduler.Completed, index)
 	if index < u32(len(scheduler.Block_Received)) {
-		for &value in scheduler.Block_Received[index] {
-			value = 0
-		}
+		for &value in scheduler.Block_Received[index] { value = 0 }
+	}
+	if index < u32(len(scheduler.Received_Block_Count)) {
+		scheduler.Received_Block_Count[index] = 0
 	}
 	for &peer in scheduler.Peers {
-		piece_scheduler_remove_piece_requests_locked(&peer, index)
+		piece_scheduler_remove_piece_requests_locked(scheduler, &peer, index)
 	}
 	scheduler.Seeding = false
 	return .None
@@ -448,7 +476,7 @@ Piece_Scheduler_Complete_Piece :: proc(scheduler: ^Piece_Scheduler, index: u32) 
 	Bitfield_Set_Piece(&scheduler.Completed, index)
 	piece_scheduler_mark_all_blocks_locked(scheduler, index)
 	for &peer in scheduler.Peers {
-		piece_scheduler_remove_piece_requests_locked(&peer, index)
+		piece_scheduler_remove_piece_requests_locked(scheduler, &peer, index)
 		if peer.Session != nil {
 			append(&sessions, peer.Session)
 		}
@@ -482,8 +510,7 @@ Piece_Scheduler_Expire_Requests :: proc(scheduler: ^Piece_Scheduler, now: time.T
 			}
 			request.Attempts += 1
 			append(&expired, request)
-			copy(peer.In_Flight[index:], peer.In_Flight[index+1:])
-			resize(&peer.In_Flight, len(peer.In_Flight)-1)
+			piece_scheduler_remove_request_locked(scheduler, &peer, request.Index, request.Begin)
 		}
 	}
 	return expired, .None
@@ -547,26 +574,29 @@ piece_scheduler_block_received :: proc(scheduler: ^Piece_Scheduler, index, begin
 	return piece_bitmap_has(scheduler.Block_Received[index], begin/Block_Size)
 }
 
+piece_scheduler_block_requested_locked :: proc(scheduler: ^Piece_Scheduler, index, begin: u32) -> bool {
+	if !piece_scheduler_block_valid(scheduler, index, begin) || index >= u32(len(scheduler.Block_Requested)) {
+		return false
+	}
+	return scheduler.Block_Requested[index][begin/Block_Size] != 0
+}
+
 piece_scheduler_all_blocks_received_locked :: proc(scheduler: ^Piece_Scheduler, index: u32) -> bool {
-	if scheduler == nil || index >= scheduler.Piece_Count || index >= u32(len(scheduler.Block_Received)) {
+	if scheduler == nil || index >= scheduler.Piece_Count || index >= u32(len(scheduler.Received_Block_Count)) {
 		return false
 	}
 	length := Piece_Length(index, scheduler.Piece_Length, scheduler.Total_Length)
-	if length == 0 {
-		return false
-	}
 	block_count := u32((u64(length)+u64(Block_Size)-1)/u64(Block_Size))
-	for block: u32 = 0; block < block_count; block += 1 {
-		if !piece_bitmap_has(scheduler.Block_Received[index], block) {
-			return false
-		}
-	}
-	return true
+	return block_count > 0 && scheduler.Received_Block_Count[index] == block_count
 }
 
 piece_scheduler_mark_block_received_locked :: proc(scheduler: ^Piece_Scheduler, index, begin: u32) {
-	if index < u32(len(scheduler.Block_Received)) {
-		piece_bitmap_set(scheduler.Block_Received[index], begin/Block_Size)
+	if index >= u32(len(scheduler.Block_Received)) || piece_bitmap_has(scheduler.Block_Received[index], begin/Block_Size) {
+		return
+	}
+	piece_bitmap_set(scheduler.Block_Received[index], begin/Block_Size)
+	if index < u32(len(scheduler.Received_Block_Count)) {
+		scheduler.Received_Block_Count[index] += 1
 	}
 }
 
@@ -579,6 +609,9 @@ piece_scheduler_mark_all_blocks_locked :: proc(scheduler: ^Piece_Scheduler, inde
 	for block: u32 = 0; block < block_count; block += 1 {
 		piece_bitmap_set(scheduler.Block_Received[index], block)
 	}
+	if index < u32(len(scheduler.Received_Block_Count)) {
+		scheduler.Received_Block_Count[index] = block_count
+	}
 }
 
 piece_scheduler_find_peer :: proc(scheduler: ^Piece_Scheduler, id: u64) -> ^Piece_Scheduler_Peer {
@@ -590,26 +623,12 @@ piece_scheduler_find_peer :: proc(scheduler: ^Piece_Scheduler, id: u64) -> ^Piec
 	return nil
 }
 
-// A piece is active if it has already received data or if any peer has an
-// outstanding request for it. This concentrates intermittent peer bandwidth on
-// completing verifiable pieces instead of indefinitely accumulating fragments.
+// A piece is active if it has already received data or has outstanding
+// requests. Cached counts keep this hot scheduler decision O(1).
 piece_scheduler_piece_in_progress_locked :: proc(scheduler: ^Piece_Scheduler, index: u32) -> bool {
-	if scheduler == nil || index >= u32(len(scheduler.Block_Received)) {
-		return false
-	}
-	for received in scheduler.Block_Received[index] {
-		if received != 0 {
-			return true
-		}
-	}
-	for peer in scheduler.Peers {
-		for request in peer.In_Flight {
-			if request.Index == index {
-				return true
-			}
-		}
-	}
-	return false
+	return scheduler != nil && index < u32(len(scheduler.Received_Block_Count)) &&
+	       index < u32(len(scheduler.Outstanding_Block_Count)) &&
+	       (scheduler.Received_Block_Count[index] > 0 || scheduler.Outstanding_Block_Count[index] > 0)
 }
 
 piece_scheduler_find_block_locked :: proc(
@@ -629,7 +648,7 @@ piece_scheduler_find_block_locked :: proc(
 		if piece_scheduler_peer_has_request(peer, index, begin) || piece_scheduler_block_received(scheduler, index, begin) {
 			continue
 		}
-		if !endgame && piece_scheduler_any_request(scheduler, index, begin) {
+		if !endgame && piece_scheduler_block_requested_locked(scheduler, index, begin) {
 			continue
 		}
 		return begin, length, true
@@ -646,13 +665,30 @@ piece_scheduler_peer_has_request :: proc(peer: ^Piece_Scheduler_Peer, index, beg
 	return false
 }
 
-piece_scheduler_any_request :: proc(scheduler: ^Piece_Scheduler, index, begin: u32) -> bool {
-	for &peer in scheduler.Peers {
-		if piece_scheduler_peer_has_request(&peer, index, begin) {
-			return true
+piece_scheduler_mark_request_locked :: proc(scheduler: ^Piece_Scheduler, index, begin: u32) {
+	if !piece_scheduler_block_valid(scheduler, index, begin) || index >= u32(len(scheduler.Block_Requested)) {
+		return
+	}
+	block := begin / Block_Size
+	if scheduler.Block_Requested[index][block] < 0xff {
+		scheduler.Block_Requested[index][block] += 1
+	}
+	if index < u32(len(scheduler.Outstanding_Block_Count)) {
+		scheduler.Outstanding_Block_Count[index] += 1
+	}
+}
+
+piece_scheduler_unmark_request_locked :: proc(scheduler: ^Piece_Scheduler, index, begin: u32) {
+	if !piece_scheduler_block_valid(scheduler, index, begin) || index >= u32(len(scheduler.Block_Requested)) {
+		return
+	}
+	block := begin / Block_Size
+	if scheduler.Block_Requested[index][block] > 0 {
+		scheduler.Block_Requested[index][block] -= 1
+		if index < u32(len(scheduler.Outstanding_Block_Count)) && scheduler.Outstanding_Block_Count[index] > 0 {
+			scheduler.Outstanding_Block_Count[index] -= 1
 		}
 	}
-	return false
 }
 
 piece_scheduler_endgame_locked :: proc(scheduler: ^Piece_Scheduler) -> bool {
@@ -665,7 +701,7 @@ piece_scheduler_endgame_locked :: proc(scheduler: ^Piece_Scheduler) -> bool {
 	return missing <= scheduler.Endgame_Piece_Threshold
 }
 
-piece_scheduler_remove_request_locked :: proc(peer: ^Piece_Scheduler_Peer, index, begin: u32) {
+piece_scheduler_remove_request_locked :: proc(scheduler: ^Piece_Scheduler, peer: ^Piece_Scheduler_Peer, index, begin: u32) {
 	index_to_remove := -1
 	for request, request_index in peer.In_Flight {
 		if request.Index == index && request.Begin == begin {
@@ -674,18 +710,21 @@ piece_scheduler_remove_request_locked :: proc(peer: ^Piece_Scheduler_Peer, index
 		}
 	}
 	if index_to_remove >= 0 {
+		piece_scheduler_unmark_request_locked(scheduler, index, begin)
 		copy(peer.In_Flight[index_to_remove:], peer.In_Flight[index_to_remove+1:])
 		resize(&peer.In_Flight, len(peer.In_Flight)-1)
 	}
 }
 
-piece_scheduler_remove_piece_requests_locked :: proc(peer: ^Piece_Scheduler_Peer, index: u32) {
+piece_scheduler_remove_piece_requests_locked :: proc(scheduler: ^Piece_Scheduler, peer: ^Piece_Scheduler_Peer, index: u32) {
 	request_index := 0
 	for request_index < len(peer.In_Flight) {
-		if peer.In_Flight[request_index].Index != index {
+		request := peer.In_Flight[request_index]
+		if request.Index != index {
 			request_index += 1
 			continue
 		}
+		piece_scheduler_unmark_request_locked(scheduler, request.Index, request.Begin)
 		copy(peer.In_Flight[request_index:], peer.In_Flight[request_index+1:])
 		resize(&peer.In_Flight, len(peer.In_Flight)-1)
 	}

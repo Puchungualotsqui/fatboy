@@ -92,6 +92,33 @@ piece_scheduler_finishes_active_piece_before_opening_new_piece_test :: proc(t: ^
 }
 
 @(test)
+piece_scheduler_cached_request_state_cleanup_test :: proc(t: ^testing.T) {
+	scheduler: Piece_Scheduler
+	defer Piece_Scheduler_Destroy(&scheduler)
+	testing.expect_value(t, Piece_Scheduler_Init(&scheduler, 1, 32 * 1024, 32 * 1024, time.Second), Piece_Scheduler_Error.None)
+	pieces := scheduler_test_bitfield(1, 0)
+	defer Destroy_Bitfield(&pieces)
+	testing.expect_value(t, Piece_Scheduler_Add_Peer(&scheduler, 1, &pieces, nil), Piece_Scheduler_Error.None)
+	testing.expect_value(t, Piece_Scheduler_Set_Peer_Choked(&scheduler, 1, false), Piece_Scheduler_Error.None)
+
+	request, found, request_error := Piece_Scheduler_Next_Request(&scheduler, 1, time.now())
+	testing.expect(t, found)
+	testing.expect_value(t, request_error, Piece_Scheduler_Error.None)
+	testing.expect_value(t, scheduler.Outstanding_Block_Count[0], u32(1))
+	testing.expect_value(t, scheduler.Block_Requested[0][0], byte(1))
+	testing.expect_value(t, Piece_Scheduler_Drop_Request(&scheduler, 1, request.Index, request.Begin), Piece_Scheduler_Error.None)
+	testing.expect_value(t, scheduler.Outstanding_Block_Count[0], u32(0))
+	testing.expect_value(t, scheduler.Block_Requested[0][0], byte(0))
+
+	request, found, request_error = Piece_Scheduler_Next_Request(&scheduler, 1, time.now())
+	testing.expect(t, found)
+	testing.expect_value(t, request_error, Piece_Scheduler_Error.None)
+	testing.expect_value(t, Piece_Scheduler_Complete_Block(&scheduler, request.Index, request.Begin), Piece_Scheduler_Error.None)
+	testing.expect_value(t, scheduler.Outstanding_Block_Count[0], u32(0))
+	testing.expect_value(t, scheduler.Received_Block_Count[0], u32(1))
+}
+
+@(test)
 piece_scheduler_expiry_endgame_and_seeding_test :: proc(t: ^testing.T) {
 	scheduler: Piece_Scheduler
 	defer Piece_Scheduler_Destroy(&scheduler)
@@ -110,6 +137,10 @@ piece_scheduler_expiry_endgame_and_seeding_test :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(expired), 1)
 	testing.expect_value(t, expired[0].Attempts, u32(2))
 	delete(expired)
+	// Expiry must release cached request state so another peer can retry it.
+	_, found, request_error = Piece_Scheduler_Next_Request(&scheduler, 1, time.now())
+	testing.expect(t, found)
+	testing.expect_value(t, request_error, Piece_Scheduler_Error.None)
 
 	testing.expect_value(t, Piece_Scheduler_Complete_Piece(&scheduler, 0), Piece_Scheduler_Error.None)
 	testing.expect(t, Piece_Scheduler_Is_Endgame(&scheduler))
