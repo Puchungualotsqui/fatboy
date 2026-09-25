@@ -2336,7 +2336,10 @@ download_file_once :: proc(
     curl.easy_setopt(handle, .TIMEOUT, 0)
     curl.easy_setopt(handle, .CONNECTTIMEOUT, 30)
     curl.easy_setopt(handle, .LOW_SPEED_LIMIT, 1)
-    curl.easy_setopt(handle, .LOW_SPEED_TIME, 60)
+    // Large archives can briefly stop delivering bytes while the host or
+    // network route recovers. Keep the transfer alive long enough for that
+    // pause, while still detecting a genuinely dead connection.
+    curl.easy_setopt(handle, .LOW_SPEED_TIME, 300)
     curl.easy_setopt(handle, .NOPROGRESS, 0)
     curl.easy_setopt(handle, .XFERINFOFUNCTION, download_file_progress_callback)
     curl.easy_setopt(handle, .XFERINFODATA, &transfer)
@@ -2425,6 +2428,10 @@ download_file :: proc(
     url, part_path, file_name: string,
     expected_size: i64,
 ) -> (completed, cancelled: bool, error_message: string) {
+    // A direct Real-Debrid URL can time out even though the local partial
+    // file is valid. Retry the same URL first; download_file_once resumes
+    // from the bytes already written instead of starting over.
+    timeout_retries := 0
     for attempt := 0; attempt < 2; attempt += 1 {
         completed, cancelled, restart, transfer_error := download_file_once(
             manager,
@@ -2435,6 +2442,20 @@ download_file :: proc(
             expected_size,
         )
         if !restart {
+            if !completed && !cancelled &&
+               strings.contains(transfer_error, "E_OPERATION_TIMEDOUT") &&
+               timeout_retries < 2 {
+                timeout_retries += 1
+                fmt.printf(
+                    "[DOWNLOAD] Transfer timed out; preserving partial file and retrying (%d/2) name=%s\n",
+                    timeout_retries,
+                    file_name,
+                )
+                delete(transfer_error)
+                time.sleep(2 * time.Second)
+                attempt = attempt - 1
+                continue
+            }
             return completed, cancelled, transfer_error
         }
 
