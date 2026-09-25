@@ -1329,6 +1329,15 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 		peer := loop.Peers[index]
 		if peer.Session.State == .Handshaking &&
 			time.diff(peer.Dial_Started, time.now()) >= loop.Peer_Connect_Timeout {
+			if Peer_Session_Can_Retry_Plaintext(&peer.Session) &&
+			   Peer_Session_Reset_For_Plaintext_Retry(&peer.Session) == .None {
+				peer.Dial_Started = time.now()
+				if Peer_Session_Begin_Connect(&peer.Session, peer.Address) == .None {
+					fmt.printf("[DURRENT-PEER] MSE negotiation timed out; retrying plaintext on fresh TCP address=%s\n", peer.Address)
+					index += 1
+					continue
+				}
+			}
 			fmt.printf("[DURRENT-PEER] handshake timed out address=%s\n", peer.Address)
 			loop_remove_peer_locked(loop, index)
 			continue

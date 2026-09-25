@@ -3,8 +3,8 @@ package durrent
 import "core:sync"
 import "core:time"
 
-// An MSE Preferred downgrade is safe only before the initiator receives a
-// valid Yb. At that point no MSE authentication/control byte was accepted.
+// Preferred means encryption is attempted first, then plaintext is tried once
+// on a fresh TCP stream if MSE never completes. Required never downgrades.
 Peer_Session_Can_Retry_Plaintext :: proc(session: ^Peer_Session) -> bool {
 	if session == nil {
 		return false
@@ -15,8 +15,7 @@ Peer_Session_Can_Retry_Plaintext :: proc(session: ^Peer_Session) -> bool {
 		!session.MSE_Inbound &&
 		!session.MSE_Plaintext_Retry_Used &&
 		session.MSE_Negotiating &&
-		session.MSE.Role == .Initiator &&
-		session.MSE.State == .Await_DH_Public
+		session.MSE.Role == .Initiator
 }
 
 // Resets only volatile transport/MSE state. The caller must establish a fresh
@@ -29,7 +28,7 @@ Peer_Session_MSE_Early_Timed_Out :: proc(session: ^Peer_Session, timeout: time.D
 	defer sync.mutex_unlock(&session.Mutex)
 	return session.MSE_Policy == .Preferred && !session.MSE_Inbound &&
 		!session.MSE_Plaintext_Retry_Used && session.MSE_Negotiating &&
-		session.MSE.Role == .Initiator && session.MSE.State == .Await_DH_Public &&
+		session.MSE.Role == .Initiator &&
 		time.diff(session.MSE_Started_At, time.now()) >= timeout
 }
 
@@ -72,7 +71,7 @@ Peer_Session_Reset_For_Plaintext_Retry :: proc(session: ^Peer_Session) -> Peer_E
 	sync.mutex_lock(&session.Mutex)
 	defer sync.mutex_unlock(&session.Mutex)
 	if session.MSE_Policy != .Preferred || session.MSE_Inbound || session.MSE_Plaintext_Retry_Used ||
-	   !session.MSE_Negotiating || session.MSE.Role != .Initiator || session.MSE.State != .Await_DH_Public {
+	   !session.MSE_Negotiating || session.MSE.Role != .Initiator {
 		return .Invalid_State
 	}
 	Peer_Transport_Close(&session.Transport)

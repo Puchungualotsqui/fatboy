@@ -40,19 +40,28 @@ peer_mse_preferred_early_failure_retries_once_as_plaintext_test :: proc(t: ^test
 }
 
 @(test)
-peer_mse_required_and_authenticated_failures_never_downgrade_test :: proc(t: ^testing.T) {
+peer_mse_required_never_downgrades_and_preferred_retries_incomplete_negotiation_test :: proc(t: ^testing.T) {
 	required: Peer_Session
 	defer Destroy_Peer_Session(&required)
 	peer_mse_retry_test_prepare(&required, .Required)
 	testing.expect(t, !Peer_Session_Can_Retry_Plaintext(&required))
 	testing.expect_value(t, Peer_Session_Reset_For_Plaintext_Retry(&required), Peer_Error.Invalid_State)
 
-	authenticated: Peer_Session
-	defer Destroy_Peer_Session(&authenticated)
-	peer_mse_retry_test_prepare(&authenticated, .Preferred)
-	// Await_Response is reached only after a valid remote DH public value and
-	// locally generated req1/req2 control bytes; it is never downgrade-safe.
-	authenticated.MSE.State = .Await_Response
-	testing.expect(t, !Peer_Session_Can_Retry_Plaintext(&authenticated))
-	testing.expect_value(t, Peer_Session_Reset_For_Plaintext_Retry(&authenticated), Peer_Error.Invalid_State)
+	incomplete: Peer_Session
+	defer Destroy_Peer_Session(&incomplete)
+	peer_mse_retry_test_prepare(&incomplete, .Preferred)
+	// Protocol failures can occur after receiving Yb but before a usable MSE
+	// session exists. Preferred retries plaintext once on a fresh connection.
+	incomplete.MSE.State = .Await_Response
+	testing.expect(t, Peer_Session_Can_Retry_Plaintext(&incomplete))
+	testing.expect_value(t, Peer_Session_Reset_For_Plaintext_Retry(&incomplete), Peer_Error.None)
+
+	negotiated: Peer_Session
+	defer Destroy_Peer_Session(&negotiated)
+	peer_mse_retry_test_prepare(&negotiated, .Preferred)
+	negotiated.MSE.State = .Complete
+	negotiated.MSE_Negotiating = false
+	negotiated.MSE_Active = true
+	testing.expect(t, !Peer_Session_Can_Retry_Plaintext(&negotiated))
+	testing.expect_value(t, Peer_Session_Reset_For_Plaintext_Retry(&negotiated), Peer_Error.Invalid_State)
 }
