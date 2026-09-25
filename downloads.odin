@@ -1009,13 +1009,9 @@ download_remove_durrent_artifacts :: proc(
         download_remove_local_path(output_root, "Durrent torrent data")
     }
 
-    resume_path := fmt.aprintf(
-        "%s/.%s.durrent.resume",
-        output_directory,
-        string(torrent.Name),
-    )
-    defer delete(resume_path)
-    download_remove_local_path(resume_path, "Durrent resume data")
+    if resume_error := durrent.Torrent_Remove_Resume_Data(&torrent, output_directory); resume_error != .None {
+        fmt.printf("[DOWNLOAD] WARNING: could not remove Durrent resume data: %v\n", resume_error)
+    }
 }
 
 
@@ -1572,6 +1568,9 @@ download_process_durrent_entry :: proc(manager: ^DownloadManager, entry_index: i
     if !completed {
         download_fail_entry(manager, entry_index, "Durrent stopped before the torrent completed.")
         return
+    }
+    if resume_error := durrent.Torrent_Remove_Resume_Data(&torrent, app.download_path); resume_error != .None {
+        fmt.printf("[DOWNLOAD] WARNING: could not remove completed Durrent resume data: %v\n", resume_error)
     }
 
     archive_path := download_find_torrent_archive(&torrent, app.download_path)

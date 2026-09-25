@@ -85,6 +85,39 @@ torrent_storage_single_file_resume_test :: proc(t: ^testing.T) {
 }
 
 @(test)
+torrent_storage_resume_location_and_lifecycle_test :: proc(t: ^testing.T) {
+	base, base_error := os.make_directory_temp("", "durrent-resume-*", context.allocator)
+	testing.expect_value(t, base_error, nil)
+	defer os.remove_all(base)
+	defer delete(base)
+
+	torrent := storage_test_single_torrent()
+	defer Destroy_Torrent(&torrent)
+	resume_path, resume_path_error := storage_resume_path(base, torrent.Info_Hash)
+	testing.expect_value(t, resume_path_error, Torrent_Storage_Error.None)
+	defer delete(resume_path)
+	expected_resume_path, expected_resume_path_error := filepath.join({base, ".fatboy", "durrent", "0000000000000000000000000000000000000000.resume"}, context.allocator)
+	testing.expect_value(t, expected_resume_path_error, nil)
+	defer delete(expected_resume_path)
+	testing.expect_value(t, resume_path, expected_resume_path)
+
+	storage: Torrent_Storage
+	defer Destroy_Torrent_Storage(&storage)
+	testing.expect_value(t, Torrent_Storage_Open(&storage, &torrent, base), Torrent_Storage_Error.None)
+	testing.expect_value(t, storage.Resume_Path, resume_path)
+	testing.expect(t, os.exists(resume_path))
+	testing.expect_value(t, Torrent_Storage_Write_Piece(&storage, 0, []byte{'a', 'b', 'c', 'd'}), Torrent_Storage_Error.None)
+	testing.expect_value(t, Torrent_Storage_Close(&storage), Torrent_Storage_Error.None)
+	testing.expect(t, os.exists(resume_path))
+
+	testing.expect_value(t, Torrent_Storage_Open(&storage, &torrent, base), Torrent_Storage_Error.None)
+	testing.expect_value(t, Torrent_Storage_Write_Piece(&storage, 1, []byte{'e', 'f', 'g', 'h'}), Torrent_Storage_Error.None)
+	testing.expect_value(t, Torrent_Storage_Close(&storage), Torrent_Storage_Error.None)
+	testing.expect(t, !os.exists(resume_path))
+}
+
+
+@(test)
 torrent_storage_multi_file_mapping_test :: proc(t: ^testing.T) {
 	base, base_error := os.make_directory_temp("", "durrent-multi-*", context.allocator)
 	testing.expect_value(t, base_error, nil)

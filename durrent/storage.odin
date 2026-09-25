@@ -32,10 +32,10 @@ Torrent_Storage_File :: struct {
 }
 
 Torrent_Storage :: struct {
-	Mutex:        sync.Mutex,
-	Root:         string,
-	Resume_Path:  string,
-	Files:        [dynamic]Torrent_Storage_File,
+	Mutex:       sync.Mutex,
+	Root:        string,
+	Resume_Path: string,
+	Files:       [dynamic]Torrent_Storage_File,
 	Piece_Hashes: [dynamic]Torrent_Hash,
 	Pieces:       Bitfield,
 	Piece_Length: u64,
@@ -82,17 +82,22 @@ Torrent_Storage_Open :: proc(storage: ^Torrent_Storage, torrent: ^Torrent, outpu
 		return .Unsafe_Path
 	}
 
-	resume_name: [dynamic]byte
-	append(&resume_name, byte('.'))
-	append(&resume_name, ..torrent.Name)
-	append(&resume_name, ".durrent.resume")
-	resume_path, resume_error := storage_join({output_directory, string(resume_name[:])})
-	storage.Resume_Path = resume_path
-	delete(resume_name)
+	resume_directory, resume_directory_error := storage_join({output_directory, ".fatboy", "durrent"})
+	if resume_directory_error != .None {
+		storage_clear_locked(storage)
+		return resume_directory_error
+	}
+	defer delete(resume_directory)
+	if storage_prepare_directory(resume_directory) != .None {
+		storage_clear_locked(storage)
+		return .Unsafe_Path
+	}
+	resume_path, resume_error := storage_resume_path(output_directory, torrent.Info_Hash)
 	if resume_error != .None {
 		storage_clear_locked(storage)
 		return resume_error
 	}
+	storage.Resume_Path = resume_path
 
 	if path_error := storage_validate_file_paths(storage.Root, torrent); path_error != .None {
 		storage_clear_locked(storage)
@@ -184,7 +189,7 @@ Torrent_Storage_Open :: proc(storage: ^Torrent_Storage, torrent: ^Torrent, outpu
 			return .IO
 		}
 	}
-	if storage_save_resume_locked(storage) != .None {
+	if storage_persist_resume_locked(storage) != .None {
 		storage_clear_locked(storage)
 		return .IO
 	}
@@ -200,7 +205,10 @@ Torrent_Storage_Close :: proc(storage: ^Torrent_Storage) -> Torrent_Storage_Erro
 	if !storage.Open {
 		return .None
 	}
-	result := storage_flush_locked(storage)
+	result := storage_flush_files_locked(storage)
+	if result == .None {
+		result = storage_persist_resume_locked(storage)
+	}
 	storage_clear_locked(storage)
 	return result
 }
@@ -449,10 +457,24 @@ storage_write_locked :: proc(storage: ^Torrent_Storage, offset: u64, data: []byt
 }
 
 storage_flush_locked :: proc(storage: ^Torrent_Storage) -> Torrent_Storage_Error {
+	if flush_error := storage_flush_files_locked(storage); flush_error != .None {
+		return flush_error
+	}
+	return storage_persist_resume_locked(storage)
+}
+
+storage_flush_files_locked :: proc(storage: ^Torrent_Storage) -> Torrent_Storage_Error {
 	for file in storage.Files {
 		if os.flush(file.Handle) != nil || os.sync(file.Handle) != nil {
 			return .IO
 		}
+	}
+	return .None
+}
+
+storage_persist_resume_locked :: proc(storage: ^Torrent_Storage) -> Torrent_Storage_Error {
+	if Bitfield_Is_Complete(&storage.Pieces) {
+		return storage_remove_resume_locked(storage)
 	}
 	return storage_save_resume_locked(storage)
 }
@@ -487,25 +509,33 @@ storage_save_resume_locked :: proc(storage: ^Torrent_Storage) -> Torrent_Storage
 }
 
 storage_load_resume_locked :: proc(storage: ^Torrent_Storage) {
-	data, read_error := os.read_entire_file_from_path(storage.Resume_Path, context.allocator)
+	_ = storage_load_resume_path_locked(storage, storage.Resume_Path)
+}
+
+storage_load_resume_path_locked :: proc(storage: ^Torrent_Storage, path: string) -> bool {
+	if len(path) == 0 {
+		return false
+	}
+	data, read_error := os.read_entire_file_from_path(path, context.allocator)
 	if read_error != nil {
-		return
+		return false
 	}
 	defer delete(data)
 	minimum := 8 + 20 + 4
 	if len(data) < minimum || !bytes_equal(data[:8], []byte{'D', 'U', 'R', 'R', 'R', 'E', 'S', '1'}) || !bytes_equal(data[8:28], storage.Info_Hash[:]) {
-		return
+		return false
 	}
 	piece_count, piece_count_ok := endian.get_u32(data[28:32], .Big)
 	if !piece_count_ok || piece_count != storage.Pieces.Piece_Count {
-		return
+		return false
 	}
 	loaded, loaded_error := Bitfield_From_Raw(data[32:], piece_count)
 	if loaded_error != .None {
-		return
+		return false
 	}
 	Destroy_Bitfield(&storage.Pieces)
 	storage.Pieces = loaded
+	return true
 }
 
 storage_validate_file_paths :: proc(root: string, torrent: ^Torrent) -> Torrent_Storage_Error {
@@ -555,6 +585,41 @@ storage_prepare_file_parent :: proc(root: string, torrent: ^Torrent, path: [dyna
 	}
 	defer delete(current)
 	return storage_prepare_directory(current)
+}
+
+storage_resume_path :: proc(output_directory: string, info_hash: Torrent_Hash) -> (string, Torrent_Storage_Error) {
+	filename: [40 + len(".resume")]byte
+	hex := "0123456789abcdef"
+	for value, index in info_hash {
+		filename[index*2] = hex[value >> 4]
+		filename[index*2+1] = hex[value & 0x0f]
+	}
+	copy(filename[40:], ".resume")
+	return storage_join({output_directory, ".fatboy", "durrent", string(filename[:])})
+}
+
+
+storage_remove_path :: proc(path: string) -> Torrent_Storage_Error {
+	if len(path) != 0 && os.exists(path) && os.remove(path) != nil {
+		return .IO
+	}
+	return .None
+}
+
+storage_remove_resume_locked :: proc(storage: ^Torrent_Storage) -> Torrent_Storage_Error {
+	return storage_remove_path(storage.Resume_Path)
+}
+
+Torrent_Remove_Resume_Data :: proc(torrent: ^Torrent, output_directory: string) -> Torrent_Storage_Error {
+	if torrent == nil || len(output_directory) == 0 {
+		return .Invalid_Path
+	}
+	resume_path, resume_error := storage_resume_path(output_directory, torrent.Info_Hash)
+	if resume_error != .None {
+		return resume_error
+	}
+	defer delete(resume_path)
+	return storage_remove_path(resume_path)
 }
 
 storage_prepare_directory :: proc(path: string) -> Torrent_Storage_Error {
