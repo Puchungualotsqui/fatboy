@@ -229,7 +229,9 @@ Peer_Transport_Close :: proc(transport: ^Peer_Transport) {
 	}
 	if transport.Kind == .UTP {
 		UTP_Connection_Close(&transport.UTP)
-	} else if transport.Connected {
+	} else if transport.Socket != net.TCP_Socket(0) {
+		// Receive/send failures clear Connected before the owning session is
+		// destroyed. The descriptor is still live and must be released here.
 		net.close(transport.Socket)
 	}
 	delete(transport.Write_Buffer)

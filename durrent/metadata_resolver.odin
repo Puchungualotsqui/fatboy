@@ -82,7 +82,10 @@ Metadata_Resolver_Default_Options :: proc() -> Metadata_Resolver_Options {
 		Max_Metadata_Size = Metadata_Default_Max_Size,
 		Enable_DHT = true,
 		Enable_PEX = true,
-		Max_Candidates = 32,
+		// Public tracker/DHT endpoint lists are frequently stale. Retain a
+		// larger candidate set and let the existing bounded peer batches use the
+		// overall deadline, rather than repeatedly sampling only 32 addresses.
+		Max_Candidates = 128,
 	}
 }
 
