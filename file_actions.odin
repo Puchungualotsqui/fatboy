@@ -417,6 +417,82 @@ LaunchDownloadInstaller :: proc(
 }
 
 
+download_installer_candidate :: struct {
+    path:  string,
+    score: int,
+}
+
+
+find_download_installer_candidates :: proc(
+    directory: string,
+    candidates: ^[dynamic]download_installer_candidate,
+) {
+    entries, read_err := os.read_all_directory_by_path(directory, context.allocator)
+    if read_err != nil {
+        return
+    }
+    defer os.file_info_slice_delete(entries, context.allocator)
+
+    for info in entries {
+        if os.is_directory(info.fullpath) {
+            find_download_installer_candidates(info.fullpath, candidates)
+            continue
+        }
+        if !os.is_file(info.fullpath) || !strings.ends_with(strings.to_lower(info.name, context.temp_allocator), ".exe") {
+            continue
+        }
+
+        lower_name := strings.to_lower(info.name, context.allocator)
+        if lower_name == "quicksfv.exe" {
+            delete(lower_name)
+            continue
+        }
+        score := 100
+        if lower_name == "setup.exe" {
+            score = 10000
+        } else if strings.contains(lower_name, "setup") {
+            score = 5000 - len(lower_name)
+        } else if strings.contains(lower_name, "install") {
+            score = 4000 - len(lower_name)
+        } else if strings.contains(lower_name, "installer") {
+            score = 3000 - len(lower_name)
+        }
+        delete(lower_name)
+        append(candidates, download_installer_candidate{
+            path = strings.clone(info.fullpath, context.allocator),
+            score = score,
+        })
+    }
+}
+
+
+FindDownloadInstaller :: proc(extracted_directory: string) -> string {
+    if len(extracted_directory) == 0 || !os.is_directory(extracted_directory) {
+        return ""
+    }
+    candidates: [dynamic]download_installer_candidate
+    defer {
+        for candidate in candidates {
+            delete(candidate.path)
+        }
+        delete(candidates)
+    }
+    find_download_installer_candidates(extracted_directory, &candidates)
+    if len(candidates) == 0 {
+        return ""
+    }
+
+    best := 0
+    for index := 1; index < len(candidates); index += 1 {
+        if candidates[index].score > candidates[best].score ||
+           (candidates[index].score == candidates[best].score && candidates[index].path < candidates[best].path) {
+            best = index
+        }
+    }
+    return strings.clone(candidates[best].path, context.allocator)
+}
+
+
 LaunchNativeDownloadInstaller :: proc(
     manager: ^DownloadManager,
     entry_index: int,
@@ -432,26 +508,10 @@ LaunchNativeDownloadInstaller :: proc(
         return .InstallerFailed, strings.clone("Extract the archive first; the extraction folder was not found.", context.allocator)
     }
 
-    installer_names := []string{"setup.exe", "install.exe", "installer.exe"}
-    installer_path := ""
-    for installer_name in installer_names {
-        candidate, join_err := filepath.join(
-            {extracted_directory, installer_name},
-            context.allocator,
-        )
-        if join_err != nil {
-            continue
-        }
-        if os.is_file(candidate) {
-            installer_path = candidate
-            break
-        }
-        delete(candidate)
-    }
-
+    installer_path := FindDownloadInstaller(extracted_directory)
     if len(installer_path) == 0 {
         return .InstallerNotFound, fmt.aprintf(
-            "Archive extracted to %s, but no Windows installer was found.",
+            "Archive extracted to %s, but no Windows .exe installer was found.",
             extracted_directory,
         )
     }

@@ -599,14 +599,10 @@ LaunchGEProtonInstaller :: proc(
     } else {
         extracted_directory := DownloadArchiveExtractDirectory(archive_path)
         defer delete(extracted_directory)
-        installer_path, join_err := filepath.join(
-            {extracted_directory, "setup.exe"},
-            context.allocator,
-        )
-        if join_err != nil || !os.is_file(installer_path) {
-            delete(installer_path)
+        installer_path := FindDownloadInstaller(extracted_directory)
+        if len(installer_path) == 0 {
             return .InstallerNotFound, fmt.aprintf(
-                "Archive extracted to %s, but setup.exe was not found. The archive is extracted but not installed.",
+                "Archive extracted to %s, but no Windows .exe installer was found. The archive is extracted but not installed.",
                 extracted_directory,
             )
         }
