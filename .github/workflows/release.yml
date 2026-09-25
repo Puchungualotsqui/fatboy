@@ -1,0 +1,93 @@
+name: Build and publish release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+env:
+  # Keep CI on the same Odin version used during local development.
+  ODIN_VERSION: dev-2026-08
+
+jobs:
+  release:
+    name: Build Linux and Windows releases
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libasound2-dev \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxinerama-dev \
+            libxkbcommon-dev \
+            libxrandr-dev \
+            libxi-dev \
+            zip
+
+      - name: Install Odin
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/odin"
+          curl --fail --location --retry 3 \
+            "https://github.com/odin-lang/Odin/releases/download/${ODIN_VERSION}/odin-linux-amd64-${ODIN_VERSION}.tar.gz" \
+            --output "$RUNNER_TEMP/odin.tar.gz"
+          tar --extract --gzip --strip-components=1 \
+            --file "$RUNNER_TEMP/odin.tar.gz" \
+            --directory "$RUNNER_TEMP/odin"
+          echo "$RUNNER_TEMP/odin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/odin:$PATH"
+          odin version
+
+      - name: Install xwin
+        run: cargo install xwin --locked
+
+      - name: Install Windows SDK libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          xwin --accept-license \
+            --cache-dir "$HOME/.xwin-cache" \
+            splat --copy \
+            --output "$HOME/.xwin"
+
+      - name: Run orui tests
+        run: odin test orui/test
+
+      - name: Build Linux executable
+        run: bash buildL.sh
+
+      - name: Build Windows executable
+        run: bash buildW.sh
+
+      - name: Package release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release/linux release/windows
+          cp Fatboy release/linux/Fatboy
+          cp Fatboy.exe release/windows/Fatboy.exe
+          tar --create --gzip \
+            --file Fatboy-linux-x86_64.tar.gz \
+            --directory release/linux Fatboy
+          zip --quiet Fatboy-windows-x86_64.zip release/windows/Fatboy.exe
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            Fatboy-linux-x86_64.tar.gz
+            Fatboy-windows-x86_64.zip
