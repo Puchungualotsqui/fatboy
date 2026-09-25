@@ -93,8 +93,11 @@ else
 fi
 
 odin_root="$(odin root)"
-raylib_lib="${FATBOY_RAYLIB_LIB:-${odin_root}/vendor/raylib/windows/raylib.lib}"
-curl_lib="${FATBOY_CURL_LIB:-${odin_root}/vendor/curl/lib/libcurl.lib}"
+# Release archives may omit vendor binaries for targets other than the host.
+# CI can point this at a matching Odin source tree instead.
+odin_vendor_root="${FATBOY_ODIN_VENDOR_ROOT:-${odin_root}/vendor}"
+raylib_lib="${FATBOY_RAYLIB_LIB:-${odin_vendor_root}/raylib/windows/raylib.lib}"
+curl_lib="${FATBOY_CURL_LIB:-${odin_vendor_root}/curl/lib/libcurl.lib}"
 tinyfiledialogs_lib="${FATBOY_TINYFILEDIALOGS_LIB:-${script_dir}/tinyfiledialogs/windows/tinyfiledialogs.lib}"
 
 for library_file in "$raylib_lib" "$curl_lib" "$tinyfiledialogs_lib"; do

@@ -57,6 +57,21 @@ jobs:
           export PATH="$RUNNER_TEMP/odin:$PATH"
           odin version
 
+      - name: Download Odin vendor libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/odin-source"
+          curl --fail --location --retry 3 \
+            "https://github.com/odin-lang/Odin/archive/refs/tags/${ODIN_VERSION}.tar.gz" \
+            --output "$RUNNER_TEMP/odin-source.tar.gz"
+          tar --extract --gzip --strip-components=1 \
+            --file "$RUNNER_TEMP/odin-source.tar.gz" \
+            --directory "$RUNNER_TEMP/odin-source"
+          test -f "$RUNNER_TEMP/odin-source/vendor/raylib/windows/raylib.lib"
+          test -f "$RUNNER_TEMP/odin-source/vendor/curl/lib/libcurl.lib"
+          echo "FATBOY_ODIN_VENDOR_ROOT=$RUNNER_TEMP/odin-source/vendor" >> "$GITHUB_ENV"
+
       - name: Install xwin
         run: cargo install xwin --locked
 
