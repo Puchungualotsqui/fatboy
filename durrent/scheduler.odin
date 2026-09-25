@@ -325,6 +325,7 @@ Piece_Scheduler_Next_Request_With_Limit :: proc(
 	best_begin: u32
 	best_length: u32
 	best_availability := u32(0xffffffff)
+	best_in_progress := false
 	found := false
 	for index: u32 = 0; index < scheduler.Piece_Count; index += 1 {
 		if Bitfield_Has_Piece(&scheduler.Completed, index) || !Bitfield_Has_Piece(&peer.Pieces, index) {
@@ -339,13 +340,20 @@ Piece_Scheduler_Next_Request_With_Limit :: proc(
 			continue
 		}
 		availability := scheduler.Availability[index]
-		if found && availability > best_availability {
+		// First finish pieces that already have received or outstanding blocks.
+		// Public swarms often give short, intermittent unchokes; spreading a few
+		// blocks over hundreds of multi-megabyte pieces leaves no verifiable
+		// progress. Within the active set, retain rarest-first selection.
+		in_progress := piece_scheduler_piece_in_progress_locked(scheduler, index)
+		if found && (!in_progress && best_in_progress ||
+		   in_progress == best_in_progress && availability >= best_availability) {
 			continue
 		}
 		best_piece = index
 		best_begin = begin
 		best_length = length
 		best_availability = availability
+		best_in_progress = in_progress
 		found = true
 	}
 	if !found {
@@ -580,6 +588,28 @@ piece_scheduler_find_peer :: proc(scheduler: ^Piece_Scheduler, id: u64) -> ^Piec
 		}
 	}
 	return nil
+}
+
+// A piece is active if it has already received data or if any peer has an
+// outstanding request for it. This concentrates intermittent peer bandwidth on
+// completing verifiable pieces instead of indefinitely accumulating fragments.
+piece_scheduler_piece_in_progress_locked :: proc(scheduler: ^Piece_Scheduler, index: u32) -> bool {
+	if scheduler == nil || index >= u32(len(scheduler.Block_Received)) {
+		return false
+	}
+	for received in scheduler.Block_Received[index] {
+		if received != 0 {
+			return true
+		}
+	}
+	for peer in scheduler.Peers {
+		for request in peer.In_Flight {
+			if request.Index == index {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 piece_scheduler_find_block_locked :: proc(

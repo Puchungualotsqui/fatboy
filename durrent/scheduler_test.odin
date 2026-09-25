@@ -69,6 +69,29 @@ piece_scheduler_rarest_first_and_pipeline_test :: proc(t: ^testing.T) {
 }
 
 @(test)
+piece_scheduler_finishes_active_piece_before_opening_new_piece_test :: proc(t: ^testing.T) {
+	scheduler: Piece_Scheduler
+	defer Piece_Scheduler_Destroy(&scheduler)
+	testing.expect_value(t, Piece_Scheduler_Init(&scheduler, 2, 32 * 1024, 64 * 1024, time.Second), Piece_Scheduler_Error.None)
+	first := scheduler_test_bitfield(2, 0, 1)
+	second := scheduler_test_bitfield(2, 1)
+	defer Destroy_Bitfield(&first)
+	defer Destroy_Bitfield(&second)
+	testing.expect_value(t, Piece_Scheduler_Add_Peer(&scheduler, 1, &first, nil), Piece_Scheduler_Error.None)
+	testing.expect_value(t, Piece_Scheduler_Add_Peer(&scheduler, 2, &second, nil), Piece_Scheduler_Error.None)
+	testing.expect_value(t, Piece_Scheduler_Set_Peer_Choked(&scheduler, 1, false), Piece_Scheduler_Error.None)
+
+	// Piece 0 is rarer, but piece 1 has already received its first block. The
+	// next request should complete the active piece rather than start piece 0.
+	testing.expect_value(t, Piece_Scheduler_Complete_Block(&scheduler, 1, 0), Piece_Scheduler_Error.None)
+	request, found, request_error := Piece_Scheduler_Next_Request(&scheduler, 1, time.now())
+	testing.expect(t, found)
+	testing.expect_value(t, request_error, Piece_Scheduler_Error.None)
+	testing.expect_value(t, request.Index, u32(1))
+	testing.expect_value(t, request.Begin, Block_Size)
+}
+
+@(test)
 piece_scheduler_expiry_endgame_and_seeding_test :: proc(t: ^testing.T) {
 	scheduler: Piece_Scheduler
 	defer Piece_Scheduler_Destroy(&scheduler)
