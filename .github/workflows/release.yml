@@ -18,8 +18,10 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Check out source
+      - name: Check out source and submodules
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install Linux build dependencies
         run: |
