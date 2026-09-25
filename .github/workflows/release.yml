@@ -15,7 +15,8 @@ env:
 jobs:
   release:
     name: Build Linux and Windows releases
-    runs-on: ubuntu-22.04
+    # The vendored Raylib archive references glibc 2.38+ __isoc23_* symbols.
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Check out source and submodules
