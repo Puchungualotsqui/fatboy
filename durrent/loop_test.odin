@@ -54,6 +54,31 @@ torrent_session_loop_tick_and_seeding_test :: proc(t: ^testing.T) {
 }
 
 @(test)
+torrent_session_loop_tracker_recovery_test :: proc(t: ^testing.T) {
+	torrent := tracker_test_torrent()
+	defer tracker_test_destroy_torrent(&torrent)
+	loop := Torrent_Session_Loop{Peer_Limit = 32}
+	defer Tracker_Manager_Destroy(&loop.Tracker)
+	testing.expect_value(t, Tracker_Manager_Init(&loop.Tracker, &torrent, tracker_test_request()), Tracker_Manager_Error.None)
+
+	now := time.now()
+	loop.Tracker.Next_Announce = time.time_add(now, time.Hour)
+	loop.Tracker.Has_Next = true
+	loop.Next_Tracker_Recovery_Announce = now
+	testing.expect(t, !Tracker_Manager_Announce_Due(&loop.Tracker, now))
+	testing.expect(t, loop_tracker_recovery_announce_due_locked(&loop, now))
+	testing.expect_value(t, Tracker_Manager_Request_Announce_Now(&loop.Tracker), Tracker_Manager_Error.None)
+	testing.expect(t, Tracker_Manager_Announce_Due(&loop.Tracker, now))
+
+	response: Tracker_Announce_Response
+	append(&response.Peers, Tracker_Peer{IP = [4]byte{127, 0, 0, 1}, Port = 6881})
+	loop_add_tracker_peers_locked(&loop, &response)
+	Destroy_Tracker_Response(&response)
+	testing.expect_value(t, len(loop.Pending_Peers), 1)
+	delete(loop.Pending_Peers)
+}
+
+@(test)
 torrent_session_loop_pause_and_resume_test :: proc(t: ^testing.T) {
 	base, base_error := os.make_directory_temp("", "durrent-loop-pause-*", context.allocator)
 	testing.expect_value(t, base_error, nil)

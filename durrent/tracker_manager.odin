@@ -130,6 +130,22 @@ Tracker_Manager_Set_Event :: proc(manager: ^Tracker_Manager, event: Tracker_Even
 	return .None
 }
 
+// Tracker_Manager_Request_Announce_Now makes the next regular announce due
+// without changing its event. It is intended for bounded recovery when a
+// session exhausts its peer candidates before the tracker-provided interval.
+Tracker_Manager_Request_Announce_Now :: proc(manager: ^Tracker_Manager) -> Tracker_Manager_Error {
+	if manager == nil {
+		return .Invalid_Manager
+	}
+	sync.mutex_lock(&manager.Mutex)
+	defer sync.mutex_unlock(&manager.Mutex)
+	if len(manager.Tiers) == 0 {
+		return .No_Trackers
+	}
+	manager.Has_Next = false
+	return .None
+}
+
 Tracker_Manager_Announce_Due :: proc(manager: ^Tracker_Manager, now: time.Time) -> bool {
 	if manager == nil {
 		return false

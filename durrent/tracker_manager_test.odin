@@ -72,6 +72,24 @@ tracker_manager_tiers_events_and_retry_test :: proc(t: ^testing.T) {
 }
 
 @(test)
+tracker_manager_request_announce_now_test :: proc(t: ^testing.T) {
+	torrent := tracker_test_torrent()
+	defer tracker_test_destroy_torrent(&torrent)
+	manager: Tracker_Manager
+	defer Tracker_Manager_Destroy(&manager)
+	testing.expect_value(t, Tracker_Manager_Init(&manager, &torrent, tracker_test_request()), Tracker_Manager_Error.None)
+
+	now := time.now()
+	manager.Event = .Completed
+	manager.Next_Announce = time.time_add(now, time.Hour)
+	manager.Has_Next = true
+	testing.expect(t, !Tracker_Manager_Announce_Due(&manager, now))
+	testing.expect_value(t, Tracker_Manager_Request_Announce_Now(&manager), Tracker_Manager_Error.None)
+	testing.expect(t, Tracker_Manager_Announce_Due(&manager, now))
+	testing.expect_value(t, manager.Event, Tracker_Event.Completed)
+}
+
+@(test)
 tracker_manager_no_trackers_test :: proc(t: ^testing.T) {
 	torrent: Torrent
 	manager: Tracker_Manager

@@ -30,6 +30,9 @@ Torrent_Loop_Error :: enum {
 	Out_Of_Memory,
 }
 
+Tracker_Recovery_Announce_Cooldown :: 60 * time.Second
+Choked_Peer_Replacement_Limit :: 8
+
 Torrent_Loop_Stats :: struct {
 	State:                       Torrent_Loop_State,
 	Peer_Count:                  u32,
@@ -114,6 +117,9 @@ Torrent_Session_Loop :: struct {
 	DHT_Result:              DHT_Lookup_Result,
 	DHT_Result_Ready:        bool,
 	Next_DHT_Lookup:         time.Time,
+	// Bounds recovery announces when the tracker interval is much longer than
+	// the lifetime of the session's current candidate pool.
+	Next_Tracker_Recovery_Announce: time.Time,
 	Pending_Peers:           [dynamic]PEX_Peer,
 	UPnP_IGD:                UPnP_IGD,
 	UPnP_TCP_Mapped:         bool,
@@ -216,6 +222,7 @@ Torrent_Session_Loop_Open :: proc(
 		) == .None
 	}
 	loop.Stats_Time = time.now()
+	loop.Next_Tracker_Recovery_Announce = time.time_add(loop.Stats_Time, Tracker_Recovery_Announce_Cooldown)
 	loop.Stats_Downloaded = 0
 	loop.Stats_Uploaded = 0
 	return .None
@@ -298,6 +305,19 @@ Torrent_Session_Loop_Tick :: proc(loop: ^Torrent_Session_Loop, now: time.Time) -
 	// Flush queued DHT requests before a potentially blocking tracker announce.
 	loop_pump_udp_locked(loop)
 	announce_due := Tracker_Manager_Announce_Due(&loop.Tracker, now)
+	if !announce_due && loop_tracker_recovery_announce_due_locked(loop, now) {
+		recovery_error := Tracker_Manager_Request_Announce_Now(&loop.Tracker)
+		if recovery_error == .None {
+			loop.Next_Tracker_Recovery_Announce = time.time_add(now, Tracker_Recovery_Announce_Cooldown)
+			announce_due = true
+			fmt.printf(
+				"[DURRENT-TRACKER] recovery announce requested active=%d pending=%d unchoked=%d\n",
+				len(loop.Peers),
+				len(loop.Pending_Peers),
+				loop_unchoked_peer_count_locked(loop),
+			)
+		}
+	}
 	if announce_due {
 		// Tracker HTTP/UDP operations can block for several seconds. Release
 		// the loop mutex so UI snapshots and lifecycle controls remain usable.
@@ -328,6 +348,7 @@ Torrent_Session_Loop_Tick :: proc(loop: ^Torrent_Session_Loop, now: time.Time) -
 			)
 		}
 		Destroy_Tracker_Response(&response)
+		loop.Next_Tracker_Recovery_Announce = time.time_add(now, Tracker_Recovery_Announce_Cooldown)
 	}
 	loop_pump_udp_locked(loop)
 	loop_accept_peers_locked(loop)
@@ -1443,7 +1464,7 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 			peer.Last_Choke_Log = time.now()
 		}
 		if peer.Registered && peer.Session.State == .Ready && peer.Session.Remote_Choking &&
-		   loop_unchoked_peer_count_locked(loop) >= 4 &&
+		   (loop_unchoked_peer_count_locked(loop) >= 4 || loop_should_replace_choked_peer_locked(loop, peer)) &&
 		   time.diff(peer.Interested_At, time.now()) >= 45*time.Second {
 			fmt.printf("[DURRENT-PEER] dropping long-choked peer address=%s score=%d waited=%v\n", peer.Address, peer.Quality_Score, time.diff(peer.Interested_At, time.now()))
 			loop_remove_peer_locked(loop, index)
@@ -1460,6 +1481,21 @@ loop_poll_peers_locked :: proc(loop: ^Torrent_Session_Loop) {
 	}
 }
 
+// loop_tracker_recovery_announce_due_locked limits forced tracker announces to
+// sessions that have exhausted their candidate queue and have too few live peers
+// to recover naturally through normal disconnects or DHT.
+loop_tracker_recovery_announce_due_locked :: proc(loop: ^Torrent_Session_Loop, now: time.Time) -> bool {
+	if loop == nil || len(loop.Pending_Peers) != 0 {
+		return false
+	}
+	low_peer_threshold := int(loop.Peer_Limit) / 4
+	if low_peer_threshold < 2 {
+		low_peer_threshold = 2
+	}
+	return len(loop.Peers) <= low_peer_threshold &&
+	       time.diff(loop.Next_Tracker_Recovery_Announce, now) >= 0
+}
+
 loop_unchoked_peer_count_locked :: proc(loop: ^Torrent_Session_Loop) -> int {
 	if loop == nil { return 0 }
 	count := 0
@@ -1469,6 +1505,22 @@ loop_unchoked_peer_count_locked :: proc(loop: ^Torrent_Session_Loop) -> int {
 		}
 	}
 	return count
+}
+
+// Retain the strongest choked peers, but do not let a full choked set prevent
+// newly announced candidates from being tried indefinitely.
+loop_should_replace_choked_peer_locked :: proc(loop: ^Torrent_Session_Loop, target: ^Torrent_Loop_Peer) -> bool {
+	if loop == nil || target == nil || len(loop.Pending_Peers) == 0 {
+		return false
+	}
+	retained := 0
+	for peer in loop.Peers {
+		if peer.Registered && peer.Session.State == .Ready && peer.Session.Remote_Choking &&
+		   peer.Quality_Score >= target.Quality_Score {
+			retained += 1
+		}
+	}
+	return retained > Choked_Peer_Replacement_Limit
 }
 
 loop_process_peer_events_locked :: proc(loop: ^Torrent_Session_Loop, peer: ^Torrent_Loop_Peer) {
