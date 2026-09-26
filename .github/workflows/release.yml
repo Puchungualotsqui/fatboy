@@ -11,6 +11,7 @@ permissions:
 env:
   # Keep CI on the same Odin version used during local development.
   ODIN_VERSION: dev-2026-08
+  WINE_RUNTIME_VERSION: wine-11.18-pipe
 
 jobs:
   release:
@@ -93,6 +94,43 @@ jobs:
       - name: Build Windows executable
         run: bash buildW.sh
 
+      - name: Download verified bundled Wine runtime
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          runtime_asset="${WINE_RUNTIME_VERSION}.tar.gz"
+          runtime_archive="$RUNNER_TEMP/$runtime_asset"
+          runtime_download_dir="$RUNNER_TEMP/fatboy-wine-runtime"
+          mkdir -p "$runtime_download_dir"
+
+          # releaseNewVersion.sh uploads the locally compiled runtime after
+          # pushing the tag. Wait for that asset instead of compiling Wine in CI.
+          for attempt in $(seq 1 60); do
+            if gh release download "$GITHUB_REF_NAME" \
+                --repo "$GITHUB_REPOSITORY" \
+                --pattern "$runtime_asset" \
+                --dir "$RUNNER_TEMP" \
+                --clobber; then
+              break
+            fi
+            if [[ "$attempt" == 60 ]]; then
+              echo "Timed out waiting for $runtime_asset on release $GITHUB_REF_NAME." >&2
+              exit 1
+            fi
+            sleep 10
+          done
+
+          test -s "$runtime_archive"
+          mkdir -p "release/linux/runtimes/$WINE_RUNTIME_VERSION"
+          tar --extract --gzip \
+            --file "$runtime_archive" \
+            --directory "release/linux/runtimes/$WINE_RUNTIME_VERSION"
+          test -x "release/linux/runtimes/$WINE_RUNTIME_VERSION/bin/wine"
+          test -x "release/linux/runtimes/$WINE_RUNTIME_VERSION/bin/wineboot"
+          test -x "release/linux/runtimes/$WINE_RUNTIME_VERSION/bin/wineserver"
+
       - name: Package release artifacts
         shell: bash
         run: |
@@ -123,7 +161,7 @@ jobs:
 
           tar --create --gzip \
             --file Fatboy-linux-x86_64.tar.gz \
-            --directory release/linux Fatboy Fatboy.bin lib
+            --directory release/linux Fatboy Fatboy.bin lib runtimes
           zip --quiet Fatboy-windows-x86_64.zip release/windows/Fatboy.exe
 
       - name: Publish GitHub release

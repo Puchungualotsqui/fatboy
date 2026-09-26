@@ -410,7 +410,7 @@ LaunchDownloadInstaller :: proc(
     archive_path: string,
 ) -> (DownloadInstallerResult, string) {
     when ODIN_OS == .Linux {
-        return LaunchGEProtonInstaller(manager, entry_index, archive_path)
+        return LaunchWineInstaller(manager, entry_index, archive_path)
     } else {
         return LaunchNativeDownloadInstaller(manager, entry_index, archive_path)
     }

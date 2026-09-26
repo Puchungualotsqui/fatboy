@@ -733,7 +733,7 @@ RenderLibraryScreen :: proc(
                                                 game_index,
                                             ),
                                         ),
-                                        "Installing through GE-Proton8-25...",
+                                        "Installing through bundled Wine...",
                                         {
                                             width = orui.grow(),
                                             font_size = 12,

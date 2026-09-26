@@ -672,7 +672,7 @@ DownloadStateText :: proc(state: DownloadState) -> string {
     case .Resolving:     return "PREPARING"
     case .Downloading:   return "DOWNLOADING"
     case .Extracting:    return "EXTRACTING"
-    case .Installing:    return "INSTALLING THROUGH GE-PROTON8-25"
+    case .Installing:  return "INSTALLING THROUGH WINE-11.18-PIPE"
     case .Installed:     return "INSTALLED"
     case .Extracted:     return "EXTRACTED - NOT INSTALLED"
     case .Cancelled:     return "CANCELLED"
@@ -743,15 +743,8 @@ download_resume_archive_entry :: proc(
         return
     }
 
-    // An old manifest could say "installing" after the process was killed.
-    // It is never safe to interpret that phase as permission to execute setup.exe
-    // directly; all resumes go through the current GE-Proton path.
-    if phase == "installing" {
-        fmt.printf("[DOWNLOAD] Migrating legacy installing phase to GE-Proton\n")
-        download_write_manifest(manager, entry_index, "extracted", "Legacy installer phase migrated; resume through GE-Proton.")
-    }
 
-    runtime_ready, runtime_message := EnsureGEProtonRuntime(manager, entry_index)
+    runtime_ready, runtime_message := EnsureWineRuntime(manager, entry_index)
     if !runtime_ready {
         if download_should_pause(manager, entry_index) {
             download_pause_entry(manager, entry_index, client)
@@ -769,9 +762,9 @@ download_resume_archive_entry :: proc(
     defer delete(extracted_directory)
     reuse_extracted_directory := phase == "extracted" || phase == "installing"
     if !reuse_extracted_directory && os.exists(extracted_directory) {
-        // Only an explicit extracted phase, or the legacy installing phase,
-        // proves that the extraction directory is complete. Every other phase
-        // must discard an existing tree before extracting again.
+        // Only an explicit extracted or installing phase proves that the
+        // extraction directory is complete. Every other phase must discard an
+        // existing tree before extracting again.
         if remove_err := os.remove_all(extracted_directory); remove_err != nil {
             message := fmt.aprintf("Could not reset extraction directory: %v", remove_err)
             download_fail_entry(manager, entry_index, message)
@@ -806,12 +799,12 @@ download_resume_archive_entry :: proc(
     }
 
     download_set_state(manager, entry_index, .Extracted)
-    download_set_message(manager, entry_index, "Archive extracted; preparing GE-Proton installer...")
+    download_set_message(manager, entry_index, "Archive extracted; preparing Wine installer...")
     download_write_manifest(manager, entry_index, "extracted", "Archive extracted; installer has not completed.")
 
     download_set_state(manager, entry_index, .Installing)
-    download_set_message(manager, entry_index, "Installing through GE-Proton8-25...")
-    download_write_manifest(manager, entry_index, "installing", "Installing through GE-Proton8-25.")
+    download_set_message(manager, entry_index, "Installing through bundled Wine...")
+    download_write_manifest(manager, entry_index, "installing", "Installing through bundled Wine.")
     install_result, install_message := LaunchDownloadInstaller(
         manager,
         entry_index,
@@ -878,8 +871,8 @@ download_resume_archive_entry :: proc(
         manager.entries[entry_index].archive_path = ""
     }
     sync.mutex_unlock(&manager.mutex)
-    download_set_message(manager, entry_index, "Installed through GE-Proton8-25; archive cleaned up.")
-    download_write_manifest(manager, entry_index, "completed", "Installed through GE-Proton8-25; archive and extraction cleaned up.")
+    download_set_message(manager, entry_index, "Installed through bundled Wine; archive cleaned up.")
+    download_write_manifest(manager, entry_index, "completed", "Installed through bundled Wine; archive and extraction cleaned up.")
 }
 
 
@@ -2112,7 +2105,7 @@ download_process_realdebrid_entry :: proc(manager: ^DownloadManager, entry_index
     }
 
     if DownloadPathIsArchive(first_output_path) {
-        fmt.printf("[DOWNLOAD] Archive detected; starting GE-Proton install flow %s\n", first_output_path)
+        fmt.printf("[DOWNLOAD] Archive detected; starting bundled Wine install flow %s\n", first_output_path)
         download_write_manifest(manager, entry_index, "archive_ready", "Archive downloaded; preparing extraction.")
         download_resume_archive_entry(
             manager,
@@ -2869,18 +2862,8 @@ download_remove_local_artifacts :: proc(manager: ^DownloadManager, entry_index: 
         }
     }
 
-    prefix_path := DownloadGamePrefixPath(download_directory, info_hash)
-    defer delete(prefix_path)
     install_path := DownloadGameInstallPath(download_directory, game_name, info_hash)
     defer delete(install_path)
-    if len(prefix_path) > 0 && os.exists(prefix_path) {
-        if remove_err := os.remove_all(prefix_path); remove_err != nil {
-            fmt.printf("[DOWNLOAD] WARNING: could not remove Proton prefix %s: %v\n", prefix_path, remove_err)
-        } else {
-            fmt.printf("[DOWNLOAD] Removed Proton prefix %s\n", prefix_path)
-        }
-    }
-
     if len(install_path) > 0 && os.exists(install_path) {
         if remove_err := os.remove_all(install_path); remove_err != nil {
             fmt.printf("[DOWNLOAD] WARNING: could not remove partial game installation %s: %v\n", install_path, remove_err)
@@ -3387,9 +3370,6 @@ download_cleanup_startup_game :: proc(manager: ^DownloadManager, game_index: int
     }
 
     if phase == "cancelled" || (no_resume_data && phase != "completed") {
-        prefix_path := DownloadGamePrefixPath(manager.app.download_path, info_hash)
-        defer delete(prefix_path)
-        download_remove_local_directory(prefix_path, "orphan Proton prefix")
         game_path := DownloadGameInstallPath(
             manager.app.download_path,
             manager.app.games[game_index].title,
