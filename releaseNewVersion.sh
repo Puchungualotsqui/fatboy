@@ -46,9 +46,10 @@ cd "$repo_root"
 
 wine_runtime_version="wine-11.18-pipe"
 wine_runtime_source="${FATBOY_WINE_RUNTIME_SOURCE:-${repo_root}/wine-build/install-pipe}"
-wine_runtime_archive="$(mktemp "${TMPDIR:-/tmp}/fatboy-${wine_runtime_version}.XXXXXX.tar.gz")"
+wine_runtime_archive_directory="$(mktemp -d "${TMPDIR:-/tmp}/fatboy-${wine_runtime_version}.XXXXXX")"
+wine_runtime_archive="${wine_runtime_archive_directory}/${wine_runtime_version}.tar.gz"
 cleanup_runtime_archive() {
-    rm -f -- "$wine_runtime_archive"
+    rm -rf -- "$wine_runtime_archive_directory"
 }
 trap cleanup_runtime_archive EXIT
 
@@ -177,7 +178,7 @@ if ! gh release view "$version" >/dev/null 2>&1; then
         --notes "" \
         --target "$release_commit"
 fi
-gh release upload "$version" "$wine_runtime_archive#$wine_runtime_version.tar.gz" --clobber
+gh release upload "$version" "$wine_runtime_archive" --clobber
 
 printf 'Release %s pushed successfully with the verified %s runtime asset.\n' "$version" "$wine_runtime_version"
 printf 'GitHub Actions will build Fatboy and publish the release assets without compiling Wine.\n'
