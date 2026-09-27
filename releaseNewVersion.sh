@@ -131,25 +131,42 @@ if [[ -n "$(git status --porcelain)" ]]; then
     exit 1
 fi
 
+commit="$(git rev-parse HEAD)"
+tag_commit=""
+remote_tag_commit=""
+tag_already_pushed=false
+release_commit="$commit"
 if git rev-parse --verify --quiet "refs/tags/${version}" >/dev/null; then
-    printf 'Error: local tag %s already exists.\n' "$version" >&2
-    exit 1
+    tag_commit="$(git rev-list -n 1 "refs/tags/${version}")"
+    release_commit="$tag_commit"
+    tag_already_pushed=true
 fi
 
 if git ls-remote --exit-code --tags origin "refs/tags/${version}" >/dev/null 2>&1; then
-    printf 'Error: remote tag %s already exists.\n' "$version" >&2
-    exit 1
+    remote_tag_commit="$(git ls-remote origin "refs/tags/${version}^{}" | awk '{print $1}')"
+    if [[ -z "$remote_tag_commit" ]]; then
+        remote_tag_commit="$(git ls-remote origin "refs/tags/${version}" | awk '{print $1}')"
+    fi
+    if [[ -n "$tag_commit" && "$remote_tag_commit" != "$tag_commit" ]]; then
+        printf 'Error: local and remote tag %s point to different commits.\n' "$version" >&2
+        exit 1
+    fi
+    release_commit="$remote_tag_commit"
+    tag_already_pushed=true
 fi
 
-commit="$(git rev-parse --short HEAD)"
-printf 'Preparing %s from %s at commit %s...\n' "$version" "$branch" "$commit"
+printf 'Preparing %s from %s at commit %s...\n' "$version" "$branch" "${commit:0:7}"
 
 printf 'Pushing branch %s...\n' "$branch"
 git push origin "$branch"
 
-git tag --annotate "$version" --message "Release ${version}"
-printf 'Pushing tag %s...\n' "$version"
-git push origin "$version"
+if [[ "$tag_already_pushed" == false ]]; then
+    git tag --annotate "$version" --message "Release ${version}"
+    printf 'Pushing tag %s...\n' "$version"
+    git push origin "$version"
+else
+    printf 'Tag %s is already pushed; resuming release asset upload for its tagged commit.\n' "$version"
+fi
 
 # Create the draft release early so the workflow can retrieve the runtime asset.
 # The workflow publishes the release after it has built Fatboy and packaged Linux.
@@ -157,7 +174,8 @@ if ! gh release view "$version" >/dev/null 2>&1; then
     gh release create "$version" \
         --draft \
         --title "Fatboy ${version}" \
-        --target "$version"
+        --notes "" \
+        --target "$release_commit"
 fi
 gh release upload "$version" "$wine_runtime_archive#$wine_runtime_version.tar.gz" --clobber
 
