@@ -1,4 +1,5 @@
 fatboy.exe
+fatboy
 Fatboy.exe
 Fatboy
 Fatboy.obj
@@ -6,6 +7,10 @@ fatboy.pdb
 Fatboy.pdb
 Fatboy-test*
 .xwin-cache/
+# Local custom Wine source and build trees are used by releaseNewVersion.sh
+# but are packaged separately as the bundled runtime asset.
+wine-build/
+wine-src/
 covers/
 rd_key.txt
 settings.bin

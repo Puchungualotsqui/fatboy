@@ -21,7 +21,7 @@ The script:
 
 The script does not create a commit. Commit and test your changes first.
 
-Set FATBOY_WINE_RUNTIME_SOURCE to override the default ../wine-build/install-pipe path.
+Set FATBOY_WINE_RUNTIME_SOURCE to override the default wine-build/install-pipe path.
 EOF
 }
 
@@ -45,7 +45,7 @@ repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
 wine_runtime_version="wine-11.18-pipe"
-wine_runtime_source="${FATBOY_WINE_RUNTIME_SOURCE:-${repo_root}/../wine-build/install-pipe}"
+wine_runtime_source="${FATBOY_WINE_RUNTIME_SOURCE:-${repo_root}/wine-build/install-pipe}"
 wine_runtime_archive="$(mktemp "${TMPDIR:-/tmp}/fatboy-${wine_runtime_version}.XXXXXX.tar.gz")"
 cleanup_runtime_archive() {
     rm -f -- "$wine_runtime_archive"
