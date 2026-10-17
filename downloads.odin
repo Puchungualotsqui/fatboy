@@ -124,11 +124,11 @@ DownloadManagerShutdown :: proc(manager: ^DownloadManager) {
     sync.mutex_lock(&manager.mutex)
     manager.stop_requested = true
     metadata_cancel := manager.metadata_cancel
-    manager.metadata_cancel = nil
-    sync.mutex_unlock(&manager.mutex)
     if metadata_cancel != nil {
         durrent.Metadata_Resolver_Cancel(metadata_cancel)
     }
+    manager.metadata_cancel = nil
+    sync.mutex_unlock(&manager.mutex)
 
     if manager.worker != nil {
         thread.destroy(manager.worker)
@@ -410,12 +410,10 @@ DownloadCancelGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
         case .Resolving, .Downloading, .Extracting, .Installing:
             entry.cancel_requested = true
             entry.pause_requested = false
-            metadata_cancel := manager.metadata_cancel
-            resolving_metadata := entry.state == .Resolving
-            sync.mutex_unlock(&manager.mutex)
-            if resolving_metadata && metadata_cancel != nil {
-                durrent.Metadata_Resolver_Cancel(metadata_cancel)
+            if entry.state == .Resolving && manager.metadata_cancel != nil {
+                durrent.Metadata_Resolver_Cancel(manager.metadata_cancel)
             }
+            sync.mutex_unlock(&manager.mutex)
             return true
         case .NotDownloaded, .Installed, .Extracted, .Cancelled, .Paused, .Failed:
             sync.mutex_unlock(&manager.mutex)
@@ -434,7 +432,6 @@ DownloadPauseGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
     }
 
     sync.mutex_lock(&manager.mutex)
-    metadata_cancel: ^durrent.Metadata_Resolver_Cancel_Token = nil
     for &entry in manager.entries {
         if entry.game_index != game_index {
             continue
@@ -445,13 +442,10 @@ DownloadPauseGame :: proc(manager: ^DownloadManager, game_index: int) -> bool {
            entry.state == .Installing {
             entry.pause_requested = true
             entry.cancel_requested = false
-            if entry.state == .Resolving {
-                metadata_cancel = manager.metadata_cancel
+            if entry.state == .Resolving && manager.metadata_cancel != nil {
+                durrent.Metadata_Resolver_Cancel(manager.metadata_cancel)
             }
             sync.mutex_unlock(&manager.mutex)
-            if metadata_cancel != nil {
-                durrent.Metadata_Resolver_Cancel(metadata_cancel)
-            }
             return true
         }
     }
@@ -1272,11 +1266,13 @@ download_resolve_durrent_torrent :: proc(
     download_set_resolver_status(manager, entry_index, 1, "")
     download_write_manifest(manager, entry_index, "metadata_resolving", "Resolving magnet metadata.")
 
-    cancel_token: durrent.Metadata_Resolver_Cancel_Token
-    download_set_metadata_cancel(manager, &cancel_token)
+    cancel_token := new(durrent.Metadata_Resolver_Cancel_Token, context.allocator)
+    defer free(cancel_token)
+    download_set_metadata_cancel(manager, cancel_token)
+    defer download_set_metadata_cancel(manager, nil)
     options := durrent.Metadata_Resolver_Default_Options()
     options.MSE_Policy = download_mse_policy(app.mse_mode)
-    options.Cancel = &cancel_token
+    options.Cancel = cancel_token
     state_directory := download_state_directory(app.download_path)
     defer delete(state_directory)
     if !os.exists(state_directory) {
@@ -1291,7 +1287,6 @@ download_resolve_durrent_torrent :: proc(
         download_durrent_peer_id(),
         options,
     )
-    download_set_metadata_cancel(manager, nil)
     fmt.printf(
         "[DOWNLOAD] Durrent metadata resolver finished entry=%d result=%v bytes=%d\n",
         entry_index,
