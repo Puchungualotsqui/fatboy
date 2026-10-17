@@ -328,11 +328,11 @@ LaunchWineInstaller :: proc(
             return .InstallerFailed, strings.clone("The bundled Wine runtime is unavailable.", context.allocator)
         }
 
+        installer_flags := download_installer_flags(manager)
         sync.mutex_lock(&manager.mutex)
         info_hash := ""
         game_name := ""
         download_directory := ""
-        use_ram_limit := false
         if entry_index >= 0 && entry_index < len(manager.entries) {
             info_hash = strings.clone(manager.entries[entry_index].info_hash, context.allocator)
             game_index := manager.entries[entry_index].game_index
@@ -340,7 +340,6 @@ LaunchWineInstaller :: proc(
                 game_name = strings.clone(manager.app.games[game_index].title, context.allocator)
             }
             download_directory = strings.clone(manager.app.download_path, context.allocator)
-            use_ram_limit = manager.app.use_ram_limit
         }
         sync.mutex_unlock(&manager.mutex)
         defer delete(info_hash)
@@ -405,25 +404,24 @@ LaunchWineInstaller :: proc(
         }
         append(&command, runtime_paths.wine)
         append(&command, installer_path)
-        append(&command, "/VERYSILENT")
-        append(&command, "/SILENT")
-        append(&command, "/NOMUSIC")
-        append(&command, "/SUPPRESSMSGBOXES")
-        if use_ram_limit {
-            append(&command, "/RAM=2")
-        }
-        append(&command, "/NOCANCEL")
-        append(&command, "/NORESTART")
-        append(&command, "/NOICONS")
+        append_download_installer_flags(&command, installer_flags)
         append(&command, dir_argument)
         append(&command, log_argument)
         defer delete(command)
         fmt.printf(
-            "[WINE] Starting unattended installer through bundled %s: %s %s /VERYSILENT /SILENT /NOMUSIC /SUPPRESSMSGBOXES /NORESTART /NOICONS%s\n",
+            "[WINE] Starting unattended installer through bundled %s: %s %s flags=(very_silent=%v silent=%v no_music=%v ram_limit=%v suppress_msgboxes=%v skip_crc=%v no_cancel=%v no_restart=%v no_icons=%v)\n",
             WINE_RUNTIME_VERSION,
             runtime_paths.wine,
             installer_path,
-            use_ram_limit ? " /RAM=2" : "",
+            installer_flags.Very_Silent,
+            installer_flags.Silent,
+            installer_flags.No_Music,
+            installer_flags.Ram_Limit,
+            installer_flags.Suppress_Msgboxes,
+            installer_flags.Skip_CRC,
+            installer_flags.No_Cancel,
+            installer_flags.No_Restart,
+            installer_flags.No_Icons,
         )
         fmt.printf(
             "[WINE] Child environment paths: runtime=%s prefix=%s tmp=%s\n",

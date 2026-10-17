@@ -9,14 +9,22 @@ import tinyfd "tinyfiledialogs"
 import rl "vendor:raylib"
 
 
-SETTINGS_FILE           :: "settings.bin"
-SETTINGS_VERSION             :: u32(5)
-SETTINGS_V2_HEADER_SIZE       :: 36
-SETTINGS_HEADER_SIZE          :: 40
-SETTINGS_RAM_LIMIT_FLAG       :: u32(1)
-SETTINGS_DURRENT_PROVIDER_FLAG :: u32(2)
-SETTINGS_MSE_PREFERRED_FLAG  :: u32(4)
-SETTINGS_MSE_REQUIRED_FLAG   :: u32(8)
+SETTINGS_FILE                    :: "settings.bin"
+SETTINGS_VERSION                 :: u32(6)
+SETTINGS_V2_HEADER_SIZE          :: 36
+SETTINGS_HEADER_SIZE             :: 40
+SETTINGS_RAM_LIMIT_FLAG          :: u32(1)
+SETTINGS_DURRENT_PROVIDER_FLAG   :: u32(2)
+SETTINGS_MSE_PREFERRED_FLAG      :: u32(4)
+SETTINGS_MSE_REQUIRED_FLAG       :: u32(8)
+SETTINGS_FITGIRL_VERY_SILENT_FLAG :: u32(16)
+SETTINGS_FITGIRL_SILENT_FLAG      :: u32(32)
+SETTINGS_FITGIRL_NO_MUSIC_FLAG    :: u32(64)
+SETTINGS_FITGIRL_SUPPRESS_MSGBOXES_FLAG :: u32(128)
+SETTINGS_FITGIRL_NO_CANCEL_FLAG   :: u32(256)
+SETTINGS_FITGIRL_NO_RESTART_FLAG  :: u32(512)
+SETTINGS_FITGIRL_NO_ICONS_FLAG    :: u32(1024)
+SETTINGS_FITGIRL_SKIP_CRC_FLAG    :: u32(2048)
 
 EnsureDownloadDirectory :: proc(path: string) -> bool {
     if len(path) == 0 {
@@ -138,6 +146,30 @@ SaveSettings :: proc(app: ^App) -> bool {
     } else if app.mse_mode == .Required {
         settings_flags |= SETTINGS_MSE_REQUIRED_FLAG
     }
+    if app.fitgirl_very_silent {
+        settings_flags |= SETTINGS_FITGIRL_VERY_SILENT_FLAG
+    }
+    if app.fitgirl_silent {
+        settings_flags |= SETTINGS_FITGIRL_SILENT_FLAG
+    }
+    if app.fitgirl_no_music {
+        settings_flags |= SETTINGS_FITGIRL_NO_MUSIC_FLAG
+    }
+    if app.fitgirl_suppress_msgboxes {
+        settings_flags |= SETTINGS_FITGIRL_SUPPRESS_MSGBOXES_FLAG
+    }
+    if app.fitgirl_no_cancel {
+        settings_flags |= SETTINGS_FITGIRL_NO_CANCEL_FLAG
+    }
+    if app.fitgirl_no_restart {
+        settings_flags |= SETTINGS_FITGIRL_NO_RESTART_FLAG
+    }
+    if app.fitgirl_no_icons {
+        settings_flags |= SETTINGS_FITGIRL_NO_ICONS_FLAG
+    }
+    if app.fitgirl_skip_crc {
+        settings_flags |= SETTINGS_FITGIRL_SKIP_CRC_FLAG
+    }
     endian.put_u32(settings_data[36:40], .Little, settings_flags)
 
     offset := SETTINGS_HEADER_SIZE
@@ -232,7 +264,7 @@ LoadSettings :: proc(app: ^App) -> bool {
     }
     if version == 2 {
         settings_header_size = SETTINGS_V2_HEADER_SIZE
-    } else if version != u32(4) && version != SETTINGS_VERSION {
+    } else if version != u32(4) && version != u32(5) && version != SETTINGS_VERSION {
         fmt.printf(
             "[SETTINGS] Unsupported settings version %d (expected %d)\n",
             version,
@@ -247,7 +279,7 @@ LoadSettings :: proc(app: ^App) -> bool {
 
     use_ram_limit := false
     download_provider := DownloadProvider(.RealDebrid)
-    settings_flags: u32
+    settings_flags: u32 = 0
     if version >= 3 {
         settings_flags_read, flags_ok := endian.get_u32(settings_data[36:40], .Little)
         if !flags_ok {
@@ -352,6 +384,16 @@ LoadSettings :: proc(app: ^App) -> bool {
     app.rd_client_secret = loaded_client_secret
     app.rd_token_expires_at = i64(expires_u64)
     app.use_ram_limit = use_ram_limit
+    if version >= 6 {
+        app.fitgirl_very_silent = (settings_flags & SETTINGS_FITGIRL_VERY_SILENT_FLAG) != 0
+        app.fitgirl_silent = (settings_flags & SETTINGS_FITGIRL_SILENT_FLAG) != 0
+        app.fitgirl_no_music = (settings_flags & SETTINGS_FITGIRL_NO_MUSIC_FLAG) != 0
+        app.fitgirl_suppress_msgboxes = (settings_flags & SETTINGS_FITGIRL_SUPPRESS_MSGBOXES_FLAG) != 0
+        app.fitgirl_no_cancel = (settings_flags & SETTINGS_FITGIRL_NO_CANCEL_FLAG) != 0
+        app.fitgirl_no_restart = (settings_flags & SETTINGS_FITGIRL_NO_RESTART_FLAG) != 0
+        app.fitgirl_no_icons = (settings_flags & SETTINGS_FITGIRL_NO_ICONS_FLAG) != 0
+        app.fitgirl_skip_crc = (settings_flags & SETTINGS_FITGIRL_SKIP_CRC_FLAG) != 0
+    }
     app.download_provider = download_provider
     app.mse_mode = mse_mode
 
@@ -835,6 +877,108 @@ RenderSetupScreen :: proc(
                     overflow = .Wrap,
                 },
             )
+
+            orui.label(
+                orui.id("installer_flags_label"),
+                "FitGirl installer flags",
+                {
+                    font_size = 12,
+                    color = TEXT_MUTED,
+                },
+            )
+            orui.label(
+                orui.id("installer_flags_help"),
+                "Choose which switches Fatboy passes to the next FitGirl installer. Changes apply when the next installer starts.",
+                {
+                    font_size = 12,
+                    color = TEXT_MUTED,
+                    overflow = .Wrap,
+                },
+            )
+            {
+                orui.container(
+                    orui.id("installer_flags_grid"),
+                    {
+                        layout = .Flex,
+                        direction = .LeftToRight,
+                        width = orui.grow(),
+                        height = orui.fit(),
+                        gap = 16,
+                    },
+                )
+                {
+                    orui.container(
+                        orui.id("installer_flags_left"),
+                        {
+                            layout = .Flex,
+                            direction = .TopToBottom,
+                            width = orui.grow(),
+                            height = orui.fit(),
+                            gap = 4,
+                        },
+                    )
+                    orui.checkbox(
+                        orui.id("flag_very_silent"),
+                        "Very silent (/VERYSILENT)",
+                        &app.fitgirl_very_silent,
+                        {width = orui.grow(), height = orui.fixed(30)},
+                    )
+                    orui.checkbox(
+                        orui.id("flag_silent"),
+                        "Silent (/SILENT)",
+                        &app.fitgirl_silent,
+                        {width = orui.grow(), height = orui.fixed(30)},
+                    )
+                    orui.checkbox(
+                        orui.id("flag_no_music"),
+                        "Disable installer music (/NOMUSIC)",
+                        &app.fitgirl_no_music,
+                        {width = orui.grow(), height = orui.fixed(30)},
+                    )
+                    orui.checkbox(
+                        orui.id("flag_no_icons"),
+                        "Do not create shortcuts (/NOICONS)",
+                        &app.fitgirl_no_icons,
+                        {width = orui.grow(), height = orui.fixed(30)},
+                    )
+                }
+                {
+                    orui.container(
+                        orui.id("installer_flags_right"),
+                        {
+                            layout = .Flex,
+                            direction = .TopToBottom,
+                            width = orui.grow(),
+                            height = orui.fit(),
+                            gap = 4,
+                        },
+                    )
+                    orui.checkbox(
+                        orui.id("flag_suppress_msgboxes"),
+                        "Suppress message boxes (/SUPPRESSMSGBOXES)",
+                        &app.fitgirl_suppress_msgboxes,
+                        {width = orui.grow(), height = orui.fixed(30)},
+                    )
+                    orui.checkbox(
+                        orui.id("flag_no_cancel"),
+                        "Hide installer cancel button (/NOCANCEL)",
+                        &app.fitgirl_no_cancel,
+                        {width = orui.grow(), height = orui.fixed(30)},
+                    )
+                    orui.checkbox(
+                        orui.id("flag_no_restart"),
+                        "Prevent restart (/NORESTART)",
+                        &app.fitgirl_no_restart,
+                        {width = orui.grow(), height = orui.fixed(30)},
+                    )
+                    orui.checkbox(
+                        orui.id("flag_skip_crc"),
+                        "Skip archive CRC check (/NCRC) — not recommended",
+                        &app.fitgirl_skip_crc,
+                        {width = orui.grow(), height = orui.fixed(30)},
+                    )
+                }
+            }
 
             download_path_text := strings.trim_space(app.download_path)
             auth_ready := app.download_provider == .Durrent ||

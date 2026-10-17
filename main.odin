@@ -61,6 +61,18 @@ main :: proc() {
 
     app: App
     app.download_provider = .RealDebrid
+    // Preserve the installer behavior used before installer flags became
+    // configurable. These are overridden by version 6 settings when present.
+    app.fitgirl_no_music = true
+    when ODIN_OS == .Linux {
+        app.fitgirl_very_silent = true
+        app.fitgirl_silent = true
+        app.fitgirl_suppress_msgboxes = true
+        app.fitgirl_no_cancel = true
+        app.fitgirl_no_restart = true
+        app.fitgirl_no_icons = true
+    }
+    app.fitgirl_skip_crc = false
     app.games = make([dynamic]GameRelease, 0, CATALOG_GAME_RESERVE)
     app.cover_cache_needs_enforcement = true
 

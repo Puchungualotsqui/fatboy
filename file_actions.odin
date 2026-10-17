@@ -404,6 +404,90 @@ DownloadInstallerResult :: enum {
 }
 
 
+DownloadInstallerFlags :: struct {
+    Very_Silent:       bool,
+    Silent:            bool,
+    Ram_Limit:         bool,
+    No_Music:          bool,
+    Suppress_Msgboxes: bool,
+    No_Cancel:         bool,
+    No_Restart:        bool,
+    No_Icons:          bool,
+    Skip_CRC:          bool,
+}
+
+
+download_installer_flags :: proc(manager: ^DownloadManager) -> DownloadInstallerFlags {
+    // These defaults preserve the unattended Linux installer behavior for
+    // callers created without a fully initialized App.
+    result := DownloadInstallerFlags{
+        Very_Silent = true,
+        Silent = true,
+        No_Music = true,
+        Ram_Limit = false,
+        Suppress_Msgboxes = true,
+        No_Cancel = true,
+        No_Restart = true,
+        No_Icons = true,
+    }
+    if manager == nil || manager.app == nil {
+        return result
+    }
+
+    sync.mutex_lock(&manager.mutex)
+    result = DownloadInstallerFlags{
+        Very_Silent = manager.app.fitgirl_very_silent,
+        Silent = manager.app.fitgirl_silent,
+        Ram_Limit = manager.app.use_ram_limit,
+        No_Music = manager.app.fitgirl_no_music,
+        Suppress_Msgboxes = manager.app.fitgirl_suppress_msgboxes,
+        No_Cancel = manager.app.fitgirl_no_cancel,
+        No_Restart = manager.app.fitgirl_no_restart,
+        No_Icons = manager.app.fitgirl_no_icons,
+        Skip_CRC = manager.app.fitgirl_skip_crc,
+    }
+    sync.mutex_unlock(&manager.mutex)
+    return result
+}
+
+
+append_download_installer_flags :: proc(
+    command: ^[dynamic]string,
+    flags: DownloadInstallerFlags,
+) {
+    if command == nil {
+        return
+    }
+    if flags.Very_Silent {
+        append(command, "/VERYSILENT")
+    }
+    if flags.Silent {
+        append(command, "/SILENT")
+    }
+    if flags.No_Music {
+        append(command, "/NOMUSIC")
+    }
+    if flags.Ram_Limit {
+        append(command, "/RAM=2")
+    }
+    if flags.Suppress_Msgboxes {
+        append(command, "/SUPPRESSMSGBOXES")
+    }
+    if flags.Skip_CRC {
+        append(command, "/NCRC")
+    }
+    if flags.No_Cancel {
+        append(command, "/NOCANCEL")
+    }
+    if flags.No_Restart {
+        append(command, "/NORESTART")
+    }
+    if flags.No_Icons {
+        append(command, "/NOICONS")
+    }
+}
+
+
 LaunchDownloadInstaller :: proc(
     manager: ^DownloadManager,
     entry_index: int,
@@ -517,18 +601,10 @@ LaunchNativeDownloadInstaller :: proc(
     }
     defer delete(installer_path)
 
-    use_ram_limit := false
-    if manager != nil && manager.app != nil {
-        sync.mutex_lock(&manager.mutex)
-        use_ram_limit = manager.app.use_ram_limit
-        sync.mutex_unlock(&manager.mutex)
-    }
+    installer_flags := download_installer_flags(manager)
     command: [dynamic]string
     append(&command, installer_path)
-    append(&command, "/NOMUSIC")
-    if use_ram_limit {
-        append(&command, "/RAM=2")
-    }
+    append_download_installer_flags(&command, installer_flags)
     defer delete(command)
 
     process, start_err := os.process_start(
